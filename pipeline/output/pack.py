@@ -45,6 +45,7 @@ def _format_trends_section(trends_data: dict[str, Any]) -> str:
     seasonal = trends_data.get("seasonal", False)
     peak = trends_data.get("peak")
     top_geos = trends_data.get("top_geos", [])
+    related_queries = trends_data.get("related_queries", [])
 
     lines = [
         f"- Direção 90 dias: {direction} ({slope:+.1f}%)",
@@ -60,6 +61,15 @@ def _format_trends_section(trends_data: dict[str, Any]) -> str:
         lines.append(f"- Geos quentes: {geos_str}")
     else:
         lines.append("- Geos quentes: sem dados")
+
+    if related_queries:
+        lines.append("- Queries relacionadas em subida:")
+        for rq in related_queries[:5]:
+            kw = rq.get("keyword", "?")
+            sc = rq.get("score", 0)
+            lines.append(f"  - {kw} (+{sc})")
+    else:
+        lines.append("- Queries relacionadas em subida: sem dados")
 
     return "\n".join(lines)
 
@@ -124,6 +134,54 @@ def _format_ads_section(ads_data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_seo_section(seo_data: dict[str, Any]) -> str:
+    if "error" in seo_data:
+        return f"- sem dados: {seo_data['error']}"
+
+    organic = seo_data.get("organic_results", [])
+    ads_count = seo_data.get("ads_count", 0)
+    paa = seo_data.get("paa_questions", [])
+    opportunity = seo_data.get("seo_opportunity", "?")
+
+    lines = []
+
+    # Top 10 orgânicos — resumo de domínios
+    if organic:
+        # Agrupar por domínio para mostrar quem domina
+        domain_positions: dict[str, list[int]] = {}
+        for r in organic:
+            domain = r.get("domain", "?")
+            pos = r.get("position", 0)
+            if domain not in domain_positions:
+                domain_positions[domain] = []
+            domain_positions[domain].append(pos)
+
+        # Mostrar domínios com posições
+        lines.append("- Top 10 orgânicos:")
+        for domain, positions in domain_positions.items():
+            pos_str = ", ".join(f"#{p}" for p in sorted(positions))
+            first_title = next((r.get("title", "")[:60] for r in organic if r.get("domain") == domain), "")
+            lines.append(f"  - {domain} ({pos_str}) — {first_title}")
+    else:
+        lines.append("- Top 10 orgânicos: sem dados")
+
+    # Ads no SERP
+    lines.append(f"- Ads no SERP: {ads_count} (proxy de competição paga)")
+
+    # PAA questions
+    if paa:
+        lines.append("- PAA questions (matéria-prima para conteúdo):")
+        for i, q in enumerate(paa, 1):
+            lines.append(f"  {i}. {q}")
+    else:
+        lines.append("- PAA questions: sem dados")
+
+    # Oportunidade SEO
+    lines.append(f"- Oportunidade SEO: {opportunity}")
+
+    return "\n".join(lines)
+
+
 def _format_feedback_section(feedback_data: dict[str, Any] | None = None) -> str:
     """Fase 2. Por agora, sempre sem dados."""
     return "- sem dados: Fase 2 (Reddit/YouTube) ainda não implementada"
@@ -173,6 +231,7 @@ def generate(
     csv_data: dict[str, Any],
     ads_data: dict[str, Any],
     score_result: dict[str, Any],
+    seo_data: dict[str, Any] | None = None,
     feedback_data: dict[str, Any] | None = None,
     run_date: date | None = None,
 ) -> str:
@@ -185,6 +244,7 @@ def generate(
         csv_data: dict do adapter keyword_csv.py
         ads_data: dict do adapter meta_ads.py
         score_result: dict do scoring/score.py
+        seo_data: dict do adapter serp_seo.py, ou None
         feedback_data: dados de Reddit/YouTube (Fase 2), ou None
         run_date: data do run (default: hoje)
 
@@ -194,6 +254,9 @@ def generate(
     if run_date is None:
         run_date = date.today()
 
+    if seo_data is None:
+        seo_data = {"error": "SEO não executado — modo reduzido (ex: --wednesday, --monthly)"}
+
     md_path, json_path = _pack_paths(keyword, run_date)
 
     # --- Gerar .md ---
@@ -201,6 +264,7 @@ def generate(
     trends_text = _format_trends_section(trends_data)
     volume_text = _format_volume_section(csv_data)
     ads_text = _format_ads_section(ads_data)
+    seo_text = _format_seo_section(seo_data)
     feedback_text = _format_feedback_section(feedback_data)
     bd = score_result["breakdown"]
     next_step = _format_next_step(score_result["label"])
@@ -218,6 +282,9 @@ def generate(
 
 ## Ads Ativos (Meta Ad Library)
 {ads_text}
+
+## SEO snapshot (SerpAPI engine google, PT)
+{seo_text}
 
 ## Feedback (Fase 2 — Reddit/YouTube)
 {feedback_text}
@@ -241,6 +308,7 @@ Fórmula determinística. Sem LLM no score.
         "trends": trends_data,
         "keyword_planner": csv_data,
         "meta_ads": ads_data,
+        "seo": seo_data,
         "feedback": feedback_data,
     }
 

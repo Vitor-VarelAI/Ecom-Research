@@ -32,7 +32,7 @@ UI só se doer, e nesse caso: página Next.js estática a ler os JSONs do VPS. S
 | Fonte | Via | Custo | Nota |
 |---|---|---|---|
 | Meta Ad Library | API oficial | Grátis | **Fonte central.** Na UE, o DSA obriga a Meta a expor TODOS os ads (comerciais incluídos) com alcance por país. Para mercado PT/ES é a fonte mais rica que existe. Requer app FB + token. |
-| Google Trends | SerpAPI | 100 searches/mês grátis | Cache agressiva (1 keyword = 1 call, guardar 7 dias). Se apertar: Glimpse ou scraping com cache. |
+| Google Trends | SerpAPI | 250 searches/mês grátis | Cache agressiva (1 keyword = 1 call, guardar 30 dias). Se apertar: Glimpse ou scraping com cache. |
 | Keyword Planner | CSV manual | Grátis | Vitor exporta, pipeline faz parse. |
 | Reddit | PRAW | Grátis (<100 QPM) | Fase 2. |
 | YouTube | Data API v3 | Grátis (10k unid/dia) | Fase 2. |
@@ -66,6 +66,12 @@ Score: {0-100} | {AVANÇAR / OBSERVAR / DESCARTAR}
 - Ângulos de copy dominantes: {2-3 bullets}
 - Saturação: {baixa <10 ads / média 10-50 / alta >50}
 
+## SEO snapshot (SerpAPI engine google, PT)
+- Top 10 orgânicos: {domínio + título, quem domina}
+- Ads no SERP: {n} (proxy de competição paga)
+- PAA questions: {top 3, matéria-prima para conteúdo}
+- Oportunidade SEO: {alta se top 10 fraco / baixa se dominado por marketplaces}
+
 ## Feedback (Fase 2 — Reddit/YouTube)
 - Clusters de dor/desejo: {bullets}
 - Red flags: {queixas recorrentes}
@@ -83,22 +89,94 @@ Regras do schema:
 2. Score determinístico e reproduzível. LLM só entra na Fase 3 (clustering de comentários), delegado ao DeepSeek.
 3. Secções sem dados escrevem "sem dados: {razão}", nunca inventam.
 
+## Cadência e quota (regime 80/20)
+
+Contexto: projeto side, 2 pontos de contacto por semana. O cron corre diário no sentido técnico (verifica o dia, decide o que fazer), mas o Vitor só interage domingo e quarta.
+
+### Quotas confirmadas (julho 2026)
+
+| Fonte | Free tier | Binding? |
+|---|---|---|
+| SerpAPI | **250 searches/mês**, 50/hora | SIM — única quota que morde |
+| Meta Ad Library | Grátis, rate limits Graph API standard | Não |
+| YouTube Data v3 | 10.000 units/dia (search=100, comments=1) | Não |
+| Reddit PRAW | 100 queries/min | Não |
+| Keyword Planner | CSV manual | Não |
+
+### Custo SerpAPI por keyword (modo Full)
+
+Cada `data_type` do engine google_trends é 1 search separado:
+1. Trends timeseries (90 dias) = 1 call
+2. Related queries = 1 call
+3. SEO SERP orgânico (engine google: quem ranka, ads no SERP, PAA) = 1 call
+
+**Total: 3 calls por keyword novo.**
+
+### Regime semanal
+
+**Domingo — deep run (dia caro):**
+- 8-10 keywords novos em modo Full = 24-30 calls SerpAPI
+- Meta Ad Library para todos (grátis)
+- Digest completo no Telegram ao fim do run: veredicto em 3 linhas por keyword, para planear a semana
+
+**Quarta — pulse (dia grátis, 0 calls SerpAPI):**
+- Refresh Meta Ad Library APENAS nos keywords com veredicto AVANÇAR/OBSERVAR da semana
+- Detetar: ads novos a entrar no nicho, ads antigos que morreram, longevidade atualizada
+- Digest curto no Telegram: "os ads mexeram?"
+- Racional: Trends/SEO quase não mudam em 3 dias; ads na Meta mudam depressa e a fonte é grátis
+
+**Dia 1 do mês — watchlist re-score:**
+- Keywords em OBSERVAR: re-score com 1 call cada (timeseries só)
+- Watchlist máx 20 keywords = 20 calls/mês
+
+### Orçamento mensal
+
+| Rubrica | Calls |
+|---|---|
+| 4 domingos × ~30 | 120 |
+| Watchlist mensal | 20 |
+| **Buffer livre** (curiosidade manual, falhas, re-runs) | **110** |
+| **Total** | **250** |
+
+Capacidade: ~35-40 nichos novos analisados a fundo/mês + 20 em observação contínua. Custo €0.
+
+### Regras de proteção do budget (implementar no pipeline)
+
+1. **Cache 30 dias.** Re-run da mesma keyword dentro de 30 dias = zero calls SerpAPI (Trends não muda o suficiente em 7 dias).
+2. **Contador local de quota** em `data/quota.json` (calls do mês corrente, reset dia 1). Aos 230 calls, o pipeline recusa keywords novos e avisa no Telegram. Nunca deixar a SerpAPI devolver 429 às cegas.
+3. **Meta como pre-filter.** Ordem de execução: Meta Ad Library PRIMEIRO (grátis). Se a keyword tem 0 ads ativos, gravar pack com veredicto DESCARTAR (razão: "sem mercado de ads ativo") e NÃO gastar as 3 calls de SerpAPI. Poupa 30-40% da quota.
+4. **Watchlist refresh mensal, não semanal.**
+
+### Lógica de dias no cron
+
+```
+cron diário →
+  se domingo: deep_run(config/keywords.txt, modo=full)
+  se quarta:  meta_pulse(packs com veredicto AVANÇAR|OBSERVAR, <14 dias)
+  se dia 1:   watchlist_rescore(packs OBSERVAR, 1 call/kw)
+  senão:      exit 0
+```
+
 ## Fases
 
 ### Fase 0 — Setup (1 sessão, Vitor)
 - [ ] Criar app FB + token Meta Ad Library API
 - [ ] Conta SerpAPI (free tier)
-- [ ] Repo limpo: arquivar o atual ou branch `legacy`, começar `main` novo
-- [ ] Estrutura: `/pipeline` (Python), `/packs`, `/data`, `/config/keywords.txt`
+- [x] Repo limpo: branch legacy, main novo
+- [x] Estrutura: `/pipeline` (Python), `/packs`, `/data`, `/config/keywords.txt`
 
 ### Fase 1 — Pipeline mínimo (1 fim de semana, delegável ao DeepSeek)
-- [ ] Adapter Meta Ad Library (interface comum: `fetch(keyword) -> dict`)
-- [ ] Adapter SerpAPI Trends com cache em disco (7 dias)
+- [x] Adapter Meta Ad Library (interface comum: `fetch(keyword) -> dict`)
+- [ ] Adapter SerpAPI Trends com cache em disco (30 dias) + related queries
+- [ ] Adapter SerpAPI SEO (engine google, SERP snapshot)
 - [ ] Parser CSV Keyword Planner
 - [ ] Scoring determinístico (pesos no schema acima)
 - [ ] Gerador de research-pack.md a partir dos dicts
+- [ ] Quota counter (data/quota.json, hard stop 230)
+- [ ] Pre-filter Meta (Meta primeiro, 0 ads = DESCARTAR sem SerpAPI)
+- [ ] CLI modos: --sunday, --wednesday, --monthly, --auto
 - [ ] Cron diário no Contabo + push do Veredicto para o Telegram bridge
-- Critério de feito: `python pipeline/run.py "mochila personalizada"` produz pack completo e chega ao Telegram
+- Critério de feito: `python run.py "mochila personalizada"` produz pack completo e chega ao Telegram
 
 ### Fase 2 — Fontes secundárias (só após Fase 1 provar valor)
 - [ ] PRAW Reddit adapter
@@ -111,7 +189,7 @@ Regras do schema:
 
 ## Skill no vault (paralelo à Fase 1)
 - [ ] `ecom-research` skill: triggers "research de nicho", "vale a pena este produto", "pack de {keyword}"
-- [ ] A skill lê os packs existentes primeiro; só dispara run novo se o pack tiver >7 dias
+- [ ] A skill lê os packs existentes primeiro; só dispara run novo se o pack tiver >30 dias
 - [ ] Handoff direto para `ad-machine` quando veredicto = AVANÇAR
 
 ## Kill criteria
@@ -120,54 +198,7 @@ Se após **2 semanas de digests diários** nenhum pack alimentar o ad-machine ne
 
 ## Custo estimado
 
-- SerpAPI free tier: €0 (até ~3 keywords novas/dia com cache)
+- SerpAPI free tier: €0 (250 searches/mês com cache 30 dias)
 - Meta Ad Library: €0
 - Compute: já pago (Contabo)
 - LLM: €0 na Fase 1-2; centavos na Fase 3 via DeepSeek
-
----
-
-# DELEGATION BRIEF — ecom-research Fase 1 — 2026-07-14
-
-## Objetivo
-Pipeline Python no Contabo que recebe uma keyword e produz um research-pack.md com trend signal, dados de ads da Meta Ad Library, volume/CPC de CSV, e score determinístico. Entrega diária do veredicto via Telegram.
-
-## Contexto mínimo
-- Repo: github.com/Vitor-VarelAI/Ecom-Research (ignorar código existente em app/ e components/, é placeholder)
-- Schema do pack e pesos do score: ver secção "Schema do research-pack" neste ficheiro (PLAN.md)
-- VPS: Contabo, Ubuntu 24.04, Python 3.12
-- Credenciais (Meta token, SerpAPI key, Telegram bot token) chegam via .env; NUNCA hardcoded
-- Telegram bridge já existe no VPS; expor apenas uma função `send_digest(text)` que o Vitor liga depois
-
-## Tarefa
-1. Criar estrutura: `/pipeline/{adapters,scoring,output}`, `/packs`, `/data`, `/config/keywords.txt`, `.env.example`
-2. Adapter `adapters/meta_ads.py`: dado keyword, query à Meta Ad Library API (endpoint `ads_archive`, filtro país PT+ES+BR), devolve dict com total ads ativos, top 3 por longevidade (dias ativo, alcance UE, advertiser, link), link), lista de ad copies
-3. Adapter `adapters/trends.py`: SerpAPI Google Trends, 90 dias, devolve slope %, direção, top geos. Cache em `/data/cache/` com TTL 7 dias; se cache válida, ZERO calls
-4. Adapter `adapters/keyword_csv.py`: parse do export do Google Keyword Planner (formato standard PT), devolve volume, CPC, top 5 related
-5. `scoring/score.py`: fórmula determinística com pesos trend 0.3, volume 0.2, ad_longevity 0.3, saturação_invertida 0.2. Normalização documentada em docstring. Output 0-100 + label (AVANÇAR ≥70, OBSERVAR 40-69, DESCARTAR <40)
-6. `output/pack.py`: gera o .md exatamente no schema definido, mais o .json bruto em /data. Secções sem dados escrevem "sem dados: {razão}"
-7. `run.py`: CLI (`python run.py "keyword"` e `python run.py --all` para keywords.txt). No fim de --all, chama `send_digest()` com os veredictos do dia (3 linhas por keyword)
-8. Cron entry documentada no README (não instalar; o Vitor instala)
-9. Testes: 1 teste por adapter com fixture JSON gravada (sem calls reais), 1 teste do scoring com valores conhecidos
-
-Critérios de feito verificáveis:
-- `python run.py "mochila personalizada"` produz `/packs/2026-MM-DD--mochila-personalizada.md` com todas as secções do schema
-- `pytest` verde sem network
-- `.env.example` lista todas as variáveis necessárias
-- README com setup em <10 passos
-
-## Restrições
-- Escrever APENAS dentro do repo
-- Zero LLM calls nesta fase; o score é matemática pura
-- Zero scraping de TikTok/Reddit/YouTube nesta fase
-- Rate limits: máx 1 call SerpAPI por keyword por run; respeitar cache
-- Sem frameworks web (nada de FastAPI/Flask); isto é CLI + cron
-- Se a Meta Ad Library API exigir campo/permissão não documentada aqui, não improvisar: registar como bloqueio
-
-## Formato de entrega
-Quando terminares, usa o skill review-pack para comprimir o resultado.
-Foco do review: schema do pack respeitado à letra, lógica de cache do SerpAPI, normalização do score, e que nenhum adapter parte o run inteiro quando falha (degradação graciosa por secção).
-
-## Se ficares bloqueado
-Para e regista no review-pack em "Pendente / bloqueado".
-Não improvises workarounds sem os declarar em "Desvios e anomalias".

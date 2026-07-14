@@ -4,8 +4,10 @@ Adapter: Google Trends via SerpAPI.
 Endpoint: GET https://serpapi.com/search
 Parâmetros: engine=google_trends, q=keyword, date=today+3-m (90 dias)
 
-Cache: /data/cache/{keyword_slug}.json com TTL de 7 dias.
+Cache: /data/cache/{keyword_slug}.json com TTL de 30 dias.
 Se cache válida, ZERO chamadas à API.
+
+Toda chamada à SerpAPI passa pelo quota.py: can_spend() antes, spend() depois.
 
 Interface comum: fetch(keyword) -> dict
 Em caso de erro, devolve {"error": "razão"} — nunca levanta excepção.
@@ -21,11 +23,13 @@ from typing import Any
 
 import requests
 
+from pipeline import quota
+
 logger = logging.getLogger(__name__)
 
 SERPAPI_URL = "https://serpapi.com/search"
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "cache")
-CACHE_TTL = 7 * 24 * 3600  # 7 dias em segundos
+CACHE_TTL = 30 * 24 * 3600  # 30 dias em segundos
 REQUEST_TIMEOUT = 15
 
 
@@ -166,13 +170,14 @@ def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
 
 def fetch(keyword: str) -> dict[str, Any]:
     """
-    Dado uma keyword, consulta Google Trends via SerpAPI (com cache 7 dias) e devolve:
+    Dado uma keyword, consulta Google Trends via SerpAPI (com cache 30 dias) e devolve:
     {
         "direction": "subida" | "estável" | "queda",
         "slope_pct": float,
         "seasonal": bool,
         "peak": str | None,
         "top_geos": [ {geo, value}, ... ],
+        "related_queries": [ {keyword, score}, ... ],  # queries em subida
     }
     Em caso de erro:
     {
@@ -186,12 +191,16 @@ def fetch(keyword: str) -> dict[str, Any]:
         result = {k: v for k, v in cached.items() if k != "_cached_at"}
         return result
 
-    # 2. Cache miss — chamar API
+    # 2. Cache miss — verificar quota (2 calls: timeseries + related_queries)
+    if not quota.can_spend(2):
+        return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
+
     api_key = _get_api_key()
     if not api_key:
         return {"error": "SERPAPI_KEY não definida em .env"}
 
-    params = {
+    # --- Call 1: TIMESERIES ---
+    params_ts = {
         "engine": "google_trends",
         "q": keyword,
         "date": "today+3-m",  # últimos 90 dias
@@ -199,26 +208,68 @@ def fetch(keyword: str) -> dict[str, Any]:
     }
 
     try:
-        resp = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
+        resp_ts = requests.get(SERPAPI_URL, params=params_ts, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
-        logger.warning("SerpAPI: erro de rede — %s", e)
+        logger.warning("SerpAPI Trends: erro de rede — %s", e)
         return {"error": f"Erro de rede na SerpAPI: {e}"}
 
-    if resp.status_code == 403:
-        return {"error": "SerpAPI: chave inválida ou quota esgotada (HTTP 403)"}
-    if resp.status_code != 200:
-        logger.warning("SerpAPI: HTTP %s — %s", resp.status_code, resp.text[:300])
-        return {"error": f"SerpAPI: HTTP {resp.status_code}"}
+    if resp_ts.status_code == 403:
+        return {"error": "SerpAPI Trends: chave inválida ou quota esgotada (HTTP 403)"}
+    if resp_ts.status_code != 200:
+        logger.warning("SerpAPI Trends: HTTP %s — %s", resp_ts.status_code, resp_ts.text[:300])
+        return {"error": f"SerpAPI Trends: HTTP {resp_ts.status_code}"}
 
     try:
-        raw = resp.json()
+        raw_ts = resp_ts.json()
     except ValueError:
-        return {"error": "SerpAPI: resposta não é JSON válido"}
+        return {"error": "SerpAPI Trends: resposta não é JSON válido"}
 
-    # Verificar erro da própria SerpAPI
-    if "error" in raw:
-        return {"error": f"SerpAPI: {raw['error']}"}
+    if "error" in raw_ts:
+        return {"error": f"SerpAPI Trends: {raw_ts['error']}"}
 
-    result = _parse_serpapi_response(raw)
+    # 1 call gasta
+    quota.spend(1)
+
+    # --- Call 2: RELATED_QUERIES ---
+    params_rq = {
+        "engine": "google_trends",
+        "q": keyword,
+        "data_type": "RELATED_QUERIES",
+        "api_key": api_key,
+    }
+
+    related_queries: list[dict[str, Any]] = []
+    try:
+        resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        logger.warning("SerpAPI RELATED_QUERIES: erro de rede — %s", e)
+        # Degradação graciosa: prosseguir sem related_queries
+    else:
+        if resp_rq.status_code == 200:
+            try:
+                raw_rq = resp_rq.json()
+            except ValueError:
+                logger.warning("SerpAPI RELATED_QUERIES: resposta não é JSON válido")
+            else:
+                if "error" not in raw_rq:
+                    rq_data = raw_rq.get("related_queries", {})
+                    rising_list = rq_data.get("rising", [])
+                    if isinstance(rising_list, list):
+                        for item in rising_list:
+                            if isinstance(item, dict):
+                                related_queries.append({
+                                    "keyword": item.get("query", item.get("keyword", "")),
+                                    "score": item.get("extracted_value", item.get("value", 0)),
+                                })
+                        related_queries.sort(key=lambda x: x["score"], reverse=True)
+        else:
+            logger.warning("SerpAPI RELATED_QUERIES: HTTP %s", resp_rq.status_code)
+
+    # 2ª call gasta (mesmo se falhou — a SerpAPI conta sempre)
+    quota.spend(1)
+
+    # Parse e cache
+    result = _parse_serpapi_response(raw_ts)
+    result["related_queries"] = related_queries
     _write_cache(keyword, result)
     return result

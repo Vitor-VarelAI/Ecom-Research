@@ -174,35 +174,36 @@ class TestTrendsCache:
             return MockResp()
 
         monkeypatch.setattr(trends.requests, "get", mock_get)
+        # Mock quota
+        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
+        monkeypatch.setattr(trends.quota, "spend", lambda n=1: None)
 
-        # Primeira chamada — deve ir à API
+        # Primeira chamada — deve ir à API (2 calls: timeseries + related)
         result1 = trends.fetch("cache-test-1")
-        assert call_count == 1
+        assert call_count == 2  # 2 API calls (timeseries + related_queries)
         # Dados planos → direção "estável"
         assert result1["direction"] == "estável"
 
         # Segunda chamada — deve vir da cache, zero chamadas adicionais
         result2 = trends.fetch("cache-test-1")
-        assert call_count == 1  # não aumentou
+        assert call_count == 2  # não aumentou
         assert result2["direction"] == "estável"
         assert "_cached_at" not in result2  # metadados internos removidos
 
     def test_cache_expired(self, monkeypatch, tmp_path):
-        """Cache expirada (>7 dias) deve forçar nova chamada."""
+        """Cache expirada (>30 dias) deve forçar nova chamada."""
         monkeypatch.setenv("SERPAPI_KEY", "fake-key")
         monkeypatch.setattr(trends, "CACHE_DIR", str(tmp_path))
 
         # Escrever cache antiga
         cache_path = trends._cache_path("cache-expired-test")
-        trends._write_cache("cache-expired-test", {"direction": "queda", "slope_pct": -10.0})
-        # Alterar timestamp para 8 dias atrás
+        trends._write_cache("cache-expired-test", {"direction": "queda", "slope_pct": -10.0, "related_queries": []})
+        # Alterar timestamp para 35 dias atrás (>30d TTL)
         with open(cache_path, "r") as f:
             cached = json.load(f)
-        cached["_cached_at"] = time.time() - 8 * 24 * 3600
+        cached["_cached_at"] = time.time() - 35 * 24 * 3600
         with open(cache_path, "w") as f:
             json.dump(cached, f)
-
-        import requests as req_lib
 
         class MockResp:
             status_code = 200
@@ -210,13 +211,9 @@ class TestTrendsCache:
             def json():
                 return SERPAPI_RESPONSE_JSON
 
-        # Usar mock que aceita kwargs arbitrários
-        class MockSession:
-            @staticmethod
-            def get(url, params=None, timeout=None, **kwargs):
-                return MockResp()
-
-        monkeypatch.setattr(trends.requests, "get", MockSession.get)
+        monkeypatch.setattr(trends.requests, "get", lambda url, params=None, timeout=None, **kwargs: MockResp())
+        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
+        monkeypatch.setattr(trends.quota, "spend", lambda n=1: None)
 
         result = trends.fetch("cache-expired-test")
         # Cache expirada → foi buscar dados frescos com direção "estável"
