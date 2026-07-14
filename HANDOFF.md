@@ -14,6 +14,30 @@ Testes: 120/120 verdes, zero network
 
 Fase 1 + Delta 2 completos e shipped. O pipeline está funcional mas sem credenciais (Fase 0 pendente — o Vitor tem de criar as apps).
 
+### Veredicto das 4 correções do review de 2026-07-14: APLICADAS (commit bd70f5a)
+
+1. --monthly gasta 1x quota — APLICADO. trends.fetch(kw, timeseries_only=True) faz 1 call, salta RELATED_QUERIES. Teste confirma spend_count == 1.
+2. Re-score mensal não apanha cache — APLICADO. trends.fetch(kw, force_refresh=True) ignora cache. Teste confirma 3ª call com force_refresh faz +2 API calls.
+3. Pre-filter Meta força DESCARTAR — APLICADO. Score forçado {score:0, label:"DESCARTAR", reason:"sem mercado de ads ativo (pre-filter Meta)"} em vez de score.compute(). pack.py mostra reason no DECISÃO. 0 ads + CSV com volume não dá OBSERVAR.
+4. Pulse quarta reutiliza pack anterior — APLICADO. Em vez de "sem dados", carrega _load_previous_pack() e reutiliza trends/csv/seo. O pack mais recente é o mais completo.
+
+### Delta 2 (decisão de produto + Firecrawl): APLICADO (commit 90945c7)
+
+- Delta A (advertisers + market_proven): APLICADO em meta_ads.py
+- Delta B (landing_price.py hybrid HTTP→Firecrawl): APLICADO, com contador firecrawl_credits no quota.py
+- Delta C (tabela Onde vender): APLICADO em pack.py
+- Delta D (bloco DECISÃO): APLICADO em pack.py, substitui Veredicto
+- Firecrawl upgrade: APLICADO por cima do Delta B do subagent (nível 2, pausa 6s, soft warning 800)
+
+### Pendente
+
+- Fase 0: credenciais (Vitor cria apps FB, SerpAPI, Firecrawl já tem chave)
+- Fase 2: Reddit/YouTube/TikTok (não iniciada)
+- Fase 3: Clustering IA (não iniciada)
+- Skill no vault: ecom-research skill (não iniciada)
+- Cron: não instalado (Vitor instala após Fase 0)
+- send_digest(): stub, liga ao Telegram bridge
+
 O que falta para o pipeline ficar live:
 1. Vitor cria app FB + token Meta Ad Library (developers.facebook.com, permissão ads_read)
 2. Vitor cria conta SerpAPI free tier (serpapi.com, 250 searches/mês)
