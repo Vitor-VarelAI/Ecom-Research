@@ -40,7 +40,7 @@ try:
 except ImportError:
     pass  # python-dotenv não instalado; o user tem de exportar as vars manualmente
 
-from pipeline.adapters import meta_ads, trends, keyword_csv, serp_seo
+from pipeline.adapters import meta_ads, trends, keyword_csv, serp_seo, landing_price
 from pipeline.scoring import score
 from pipeline.output import pack
 from pipeline import quota
@@ -252,6 +252,13 @@ def run_keyword(
     else:
         logger.info("Meta Ads: total=%d saturação=%s", ads_data.get("total_ads", 0), ads_data.get("saturation"))
 
+    # Delta B: fetch de preços das landings (máx 3, grátis, nunca bloqueia)
+    landing_price_data = landing_price.fetch_prices_from_ads(ads_data)
+    if "error" in landing_price_data:
+        logger.info("Landing price: %s", landing_price_data["error"])
+    else:
+        logger.info("Landing price: %s", landing_price_data.get("price_range", {}))
+
     # Modo meta_only (--wednesday pulse): reutilizar dados do pack anterior
     if meta_only:
         prev = _load_previous_pack(keyword)
@@ -277,6 +284,7 @@ def run_keyword(
             ads_data=ads_data,
             score_result=score_result,
             seo_data=seo_data,
+            landing_price_data=landing_price_data,
             run_date=date.today(),
         )
         logger.info("Pack gerado (pulse): %s", md_path)
@@ -288,6 +296,7 @@ def run_keyword(
             "csv_data": csv_data,
             "ads_data": ads_data,
             "seo_data": seo_data,
+            "landing_price_data": landing_price_data,
         }
 
     # Pre-filter Meta: se 0 ads ativos → DESCARTAR forçado sem gastar SerpAPI
@@ -323,6 +332,7 @@ def run_keyword(
             ads_data=ads_data,
             score_result=score_result,
             seo_data=seo_data,
+            landing_price_data=landing_price_data,
             run_date=date.today(),
         )
         logger.info("Pack DESCARTAR (pre-filter) gerado: %s", md_path)
@@ -334,6 +344,7 @@ def run_keyword(
             "csv_data": csv_data,
             "ads_data": ads_data,
             "seo_data": seo_data,
+            "landing_price_data": landing_price_data,
         }
 
     # 2. Trends
@@ -390,6 +401,7 @@ def run_keyword(
         ads_data=ads_data,
         score_result=score_result,
         seo_data=seo_data,
+        landing_price_data=landing_price_data,
         run_date=date.today(),
     )
     logger.info("Pack gerado: %s", md_path)
@@ -402,6 +414,7 @@ def run_keyword(
         "csv_data": csv_data,
         "ads_data": ads_data,
         "seo_data": seo_data,
+        "landing_price_data": landing_price_data,
     }
 
 
@@ -434,7 +447,9 @@ def _run_sunday(csv_path: str | None = None, send: bool = True) -> list[dict]:
     for r in results:
         kw = r.get("keyword", "?")
         sr = r.get("score_result", {"score": 0, "label": "ERRO"})
-        digest_lines.append(pack.generate_digest_line(kw, sr))
+        ads = r.get("ads_data", {})
+        trends = r.get("trends_data", {})
+        digest_lines.append(pack.generate_digest_line(kw, sr, ads_data=ads, trends_data=trends))
     digest_text = "\n".join(digest_lines)
 
     if send:
@@ -453,7 +468,7 @@ def _run_sunday(csv_path: str | None = None, send: bool = True) -> list[dict]:
 def _run_wednesday(send: bool = True) -> list[dict]:
     """
     Modo --wednesday: pulse Meta nos packs AVANÇAR/OBSERVAR com <14 dias.
-    Detecta ads novos/mortos vs pack anterior.
+    Detecta ads novos/mortos vs pack anterior + delta de variantes por advertiser.
     0 calls SerpAPI.
     """
     keywords = _find_packs_by_label(["AVANÇAR", "OBSERVAR"], max_age_days=14)
@@ -468,12 +483,17 @@ def _run_wednesday(send: bool = True) -> list[dict]:
             prev = _load_previous_pack(kw)
             prev_ads = prev.get("meta_ads", {}) if prev else {}
             prev_total = prev_ads.get("total_ads", 0)
+            prev_advertisers = prev_ads.get("advertisers", [])
 
             # Re-fetch Meta (grátis)
             ads_data = meta_ads.fetch(kw)
             new_total = ads_data.get("total_ads", 0)
+            new_advertisers = ads_data.get("advertisers", [])
 
-            # Detectar mudanças
+            # Delta B: landing price (grátis, sem JS)
+            landing_price_data = landing_price.fetch_prices_from_ads(ads_data)
+
+            # Detectar mudanças globais
             changes: list[str] = []
             if prev_total > 0:
                 diff = new_total - prev_total
@@ -486,6 +506,23 @@ def _run_wednesday(send: bool = True) -> list[dict]:
             else:
                 changes.append(f"{new_total} ads (primeira leitura)")
 
+            # ── Delta A: delta de variantes por advertiser ──
+            advertiser_deltas: list[str] = []
+            prev_adv_map = {a.get("page_name", ""): a.get("active_ads", 0) for a in prev_advertisers}
+            new_adv_map = {a.get("page_name", ""): a.get("active_ads", 0) for a in new_advertisers}
+
+            all_names = set(list(prev_adv_map.keys()) + list(new_adv_map.keys()))
+            for name in all_names:
+                prev_count = prev_adv_map.get(name, 0)
+                new_count = new_adv_map.get(name, 0)
+                if prev_count > 0 and new_count != prev_count:
+                    direction = "a escalar" if new_count > prev_count else "a morrer"
+                    advertiser_deltas.append(f"{name}: {prev_count}→{new_count} ads ({direction})")
+                elif prev_count == 0 and new_count > 0:
+                    advertiser_deltas.append(f"{name}: novo → {new_count} ads")
+
+            if advertiser_deltas:
+                logger.info("Pulse %s: %s", kw, "; ".join(advertiser_deltas[:3]))
             logger.info("Pulse %s: %d → %d ads (%s)", kw, prev_total, new_total, ", ".join(changes))
 
             # Reutilizar trends/csv/seo do pack anterior — o pulse só atualiza Meta
@@ -508,6 +545,7 @@ def _run_wednesday(send: bool = True) -> list[dict]:
                 ads_data=ads_data,
                 score_result=score_result,
                 seo_data=seo_data,
+                landing_price_data=landing_price_data,
                 run_date=date.today(),
             )
             logger.info("Pack pulse gerado: %s", md_path)
@@ -517,7 +555,9 @@ def _run_wednesday(send: bool = True) -> list[dict]:
                 "md_path": md_path,
                 "score_result": score_result,
                 "ads_data": ads_data,
+                "trends_data": trends_data,
                 "changes": changes,
+                "advertiser_deltas": advertiser_deltas,
             })
         except Exception as e:
             logger.error("Erro fatal em keyword=%r: %s", kw, e, exc_info=True)
@@ -533,7 +573,11 @@ def _run_wednesday(send: bool = True) -> list[dict]:
     for r in results:
         kw = r.get("keyword", "?")
         changes = r.get("changes", ["erro"])
-        digest_lines.append(f"• *{kw}*: {', '.join(changes)}")
+        advertiser_deltas = r.get("advertiser_deltas", [])
+        line = f"• *{kw}*: {', '.join(changes)}"
+        if advertiser_deltas:
+            line += f" | {', '.join(advertiser_deltas[:2])}"
+        digest_lines.append(line)
     digest_text = "\n".join(digest_lines)
 
     if send:
@@ -578,7 +622,9 @@ def _run_monthly(send: bool = True) -> list[dict]:
     for r in results:
         kw = r.get("keyword", "?")
         sr = r.get("score_result", {"score": 0, "label": "ERRO"})
-        digest_lines.append(pack.generate_digest_line(kw, sr))
+        ads = r.get("ads_data", {})
+        trends = r.get("trends_data", {})
+        digest_lines.append(pack.generate_digest_line(kw, sr, ads_data=ads, trends_data=trends))
     digest_text = "\n".join(digest_lines)
 
     if send:
@@ -721,7 +767,9 @@ def main():
         for r in results:
             kw = r.get("keyword", "?")
             sr = r.get("score_result", {"score": 0, "label": "ERRO"})
-            digest_lines.append(pack.generate_digest_line(kw, sr))
+            ads = r.get("ads_data", {})
+            trends = r.get("trends_data", {})
+            digest_lines.append(pack.generate_digest_line(kw, sr, ads_data=ads, trends_data=trends))
         digest_text = "\n".join(digest_lines)
 
         if should_send:
@@ -747,7 +795,9 @@ def main():
     print(f"Score: {sr['score']}/100 ({sr['label']})")
     print(f"Pack: {result['md_path']}")
     if should_send:
-        digest_line = pack.generate_digest_line(args.keyword, sr)
+        ads = result.get("ads_data", {})
+        trends = result.get("trends_data", {})
+        digest_line = pack.generate_digest_line(args.keyword, sr, ads_data=ads, trends_data=trends)
         send_digest(digest_line)
 
 

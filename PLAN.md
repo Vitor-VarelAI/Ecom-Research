@@ -202,3 +202,46 @@ Se após **2 semanas de digests diários** nenhum pack alimentar o ad-machine ne
 - Meta Ad Library: €0
 - Compute: já pago (Contabo)
 - LLM: €0 na Fase 1-2; centavos na Fase 3 via DeepSeek
+
+---
+
+## Delta 2 — Decisão de produto (2026-07-14)
+
+O pack passa a responder "vendo este produto ou não, e onde" em 5 linhas. Três adições: sinal de escala por advertiser, preço praticado nas landings dos concorrentes, e tabela procura×concorrência por país. Novo bloco DECISÃO no topo do pack.
+
+Tudo usa dados que a Meta Ad Library já devolve mais fetch de landings — zero calls SerpAPI novas, zero impacto na quota. Score determinístico NÃO muda: os deltas são camada de decisão, não de scoring.
+
+### Delta A — Sinal de escala por advertiser (meta_ads.py)
+- Agrupar ads por page_id/page_name
+- Devolver campo `advertisers`: top 5 ordenados desc por nº de ads ativos, cada um com {page_name, active_ads, oldest_ad_days}
+- Flag `market_proven: true` quando qualquer advertiser tem ≥5 ads ativos
+- Pulse de quarta: delta de variantes por advertiser
+
+### Delta B — Preço praticado (novo: adapters/landing_price.py)
+- Dos top 3 ads por longevidade, extrair link da landing
+- Estratégia HYBRID em 2 níveis por landing:
+  - Nível 1 (grátis): GET com requests, timeout 10s, User-Agent browser, sem JS. Parse do HTML.
+  - Nível 2 (Firecrawl, só se nível 1 não encontrar preço): POST /v2/scrape (FIRECRAWL_KEY via .env), formato html+markdown. 1 credit/página. Nunca modo JSON extraction (5 credits).
+- Parser comum aos 2 níveis: JSON-LD schema.org Product/Offer PRIMEIRO, depois regex €XX/XX€/XX,XX EUR
+- Devolver price_range: {min, max, currency, sources, via: "http"|"firecrawl"}
+- Máx 3 landings por keyword, sem retries. Firecrawl: fetches sequenciais com pausa ≥6s entre calls
+- Contador de credits Firecrawl em data/quota.json (campo firecrawl_credits), soft warning no digest aos 800. Free tier: 1.000/mês, 10 req/min, 2 concurrent
+- Falha em todas as landings = "sem dados: landings não legíveis". NUNCA bloquear o run
+
+### Delta C — Tabela "Onde vender" (pack.py)
+- Cruzar top_geos do Trends com alcance por país dos ads (breakdown DSA)
+- Secção: | País | Procura (Trends 0-100) | Advertisers ativos | Alcance ads |
+- Linhas: PT, ES, FR + top 3 geos do Trends
+- Sem dados = "—", nunca omitir linha
+
+### Delta D — Bloco DECISÃO (pack.py)
+Substitui "Veredicto" no topo do pack:
+```
+{KEYWORD} — DECISÃO
+Vender?    {SIM/NÃO/OBSERVAR} {+ nota sazonal se seasonal=true}
+Onde?      {melhor país: procura alta + advertisers moderados}
+Preço:     {price_range} → sourcing manual: margem ok se custo < {min/3}
+Prova:     {advertiser líder: nome + variantes + dias} {ou "sem escala detetada"}
+Risco:     {saturação + 1 linha derivada dos dados}
+```
+Cada linha deriva de dados do pack, zero adjetivos. Digest do Telegram usa Vender?/Onde?/Prova como 3 linhas.

@@ -164,3 +164,74 @@ class TestQuotaPersists:
 
         quota.spend(15)
         assert quota.get_usage()["calls"] == 25
+
+
+class TestFirecrawlQuota:
+    """Testa o contador de credits Firecrawl."""
+
+    def test_initial_firecrawl_state(self, monkeypatch, tmp_path):
+        """Estado inicial: zero credits."""
+        quota_file = _reset_quota_file(str(tmp_path), calls=0)
+        monkeypatch.setattr(quota, "QUOTA_FILE", quota_file)
+
+        assert quota.can_spend_firecrawl(1) is True
+        usage = quota.get_firecrawl_usage()
+        assert usage["credits"] == 0
+        assert usage["limit"] == 1000
+        assert usage["near_warning"] is False
+
+    def test_spend_firecrawl_increments(self, monkeypatch, tmp_path):
+        """spend_firecrawl() incrementa o contador separado."""
+        quota_file = _reset_quota_file(str(tmp_path), calls=0)
+        monkeypatch.setattr(quota, "QUOTA_FILE", quota_file)
+
+        quota.spend_firecrawl(1)
+        assert quota.get_firecrawl_usage()["credits"] == 1
+
+        quota.spend_firecrawl(3)
+        assert quota.get_firecrawl_usage()["credits"] == 4
+
+    def test_firecrawl_independent_from_serpapi(self, monkeypatch, tmp_path):
+        """Gastar Firecrawl não afeta SerpAPI e vice-versa."""
+        quota_file = _reset_quota_file(str(tmp_path), calls=0)
+        monkeypatch.setattr(quota, "QUOTA_FILE", quota_file)
+
+        quota.spend(5)
+        quota.spend_firecrawl(3)
+
+        assert quota.get_usage()["calls"] == 5
+        assert quota.get_firecrawl_usage()["credits"] == 3
+
+    def test_firecrawl_warning_threshold(self, monkeypatch, tmp_path):
+        """Soft warning aos 800 credits."""
+        quota_file = _reset_quota_file(str(tmp_path), calls=0)
+        # Escrever credits manualmente
+        import json as j
+        with open(quota_file, "r") as f:
+            data = j.load(f)
+        data["firecrawl_credits"] = 799
+        with open(quota_file, "w") as f:
+            j.dump(data, f)
+        monkeypatch.setattr(quota, "QUOTA_FILE", quota_file)
+
+        assert quota.firecrawl_near_warning() is False
+
+        quota.spend_firecrawl(1)
+        assert quota.get_firecrawl_usage()["credits"] == 800
+        assert quota.firecrawl_near_warning() is True
+
+    def test_firecrawl_month_reset(self, monkeypatch, tmp_path):
+        """Reset de mês zera Firecrawl credits também."""
+        quota_file = _reset_quota_file(str(tmp_path), calls=200, month="2020-01")
+        import json as j
+        with open(quota_file, "r") as f:
+            data = j.load(f)
+        data["firecrawl_credits"] = 500
+        with open(quota_file, "w") as f:
+            j.dump(data, f)
+        monkeypatch.setattr(quota, "QUOTA_FILE", quota_file)
+
+        # Ler → deve resetar
+        usage = quota.get_firecrawl_usage()
+        assert usage["credits"] == 0
+        assert usage["limit"] == 1000

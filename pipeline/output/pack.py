@@ -188,7 +188,7 @@ def _format_feedback_section(feedback_data: dict[str, Any] | None = None) -> str
 
 
 def _format_verdict(score_result: dict[str, Any], keyword: str) -> str:
-    """Gera 1-2 linhas de veredicto em linguagem de decisão."""
+    """Gera 1-2 linhas de veredicto em linguagem de decisão. (mantida para compatibilidade)"""
     score_val = score_result["score"]
     label = score_result["label"]
     bd = score_result["breakdown"]
@@ -220,6 +220,217 @@ def _format_verdict(score_result: dict[str, Any], keyword: str) -> str:
     return verdict
 
 
+def _build_onde_vender_rows(
+    trends_data: dict[str, Any],
+    ads_data: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Constrói as linhas da tabela 'Onde vender' cruzando top_geos do Trends
+    com delivery_by_region dos ads da Meta.
+
+    Linhas: PT, ES, FR + qualquer país no top 3 do Trends.
+
+    Returns:
+        Lista de dicts com {pais, procura_val, procura_str, advertisers_ativos, alcance_ads_str}
+    """
+    # Países base sempre presentes
+    base_countries = ["PT", "ES", "FR"]
+
+    # Extrair top_geos do trends
+    top_geos = []
+    if "error" not in trends_data:
+        top_geos = trends_data.get("top_geos", [])
+
+    # Extrair delivery_by_region agregado de todos os ads
+    # Agregar alcance (%) por país
+    country_reach: dict[str, float] = {}
+    country_advertisers: dict[str, set[str]] = {}
+
+    if "error" not in ads_data:
+        top_ads = ads_data.get("top_ads", [])
+        for ad in top_ads:
+            advertiser = ad.get("advertiser", "?")
+            regions = ad.get("delivery_by_region", [])
+            if isinstance(regions, list):
+                for r in regions:
+                    if isinstance(r, dict):
+                        region_name = r.get("region", "").upper().strip()
+                        if region_name and len(region_name) <= 3:  # só códigos de país
+                            pct = r.get("percentage", 0)
+                            country_reach[region_name] = country_reach.get(region_name, 0) + pct
+                            if region_name not in country_advertisers:
+                                country_advertisers[region_name] = set()
+                            country_advertisers[region_name].add(advertiser)
+
+    # Construir lookup de procura por país a partir dos top_geos
+    geo_values: dict[str, int] = {}
+    for g in top_geos:
+        geo = g.get("geo", "").upper().strip()
+        val = g.get("value", 0)
+        if geo:
+            geo_values[geo] = val
+
+    # Determinar o conjunto de países a mostrar
+    # PT, ES, FR + top 3 geos que não sejam já os base
+    countries_order: list[str] = list(dict.fromkeys(base_countries))  # preserve order, dedupe
+
+    for g in top_geos[:3]:
+        geo = g.get("geo", "").upper().strip()
+        if geo and geo not in countries_order:
+            countries_order.append(geo)
+
+    rows = []
+    for country in countries_order:
+        procura_val = geo_values.get(country)
+        procura_str = str(procura_val) if procura_val is not None else "—"
+        alcance = country_reach.get(country)
+        alcance_str = f"{alcance:.0f}%" if alcance is not None else "—"
+        n_adv = len(country_advertisers.get(country, set()))
+        adv_str = str(n_adv) if n_adv > 0 else "—"
+
+        rows.append({
+            "pais": country,
+            "procura_str": procura_str,
+            "procura_val": procura_val,
+            "advertisers_ativos_str": adv_str,
+            "advertisers_ativos_val": n_adv,
+            "alcance_ads_str": alcance_str,
+        })
+
+    return rows
+
+
+def _format_onde_vender(rows: list[dict[str, Any]]) -> str:
+    """Formata a secção 'Onde vender' como tabela markdown."""
+    if not rows:
+        return "- sem dados: zero países para cruzar (Trends e Ads sem dados)"
+
+    lines = [
+        "| País | Procura (Trends 0-100) | Advertisers ativos | Alcance ads |",
+        "|------|-------------------------|-------------------|-------------|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['pais']} | {r['procura_str']} | {r['advertisers_ativos_str']} | {r['alcance_ads_str']} |"
+        )
+    return "\n".join(lines)
+
+
+def _pick_best_country(rows: list[dict[str, Any]]) -> str:
+    """
+    Escolhe o melhor país da tabela 'Onde vender':
+    procura alta + advertisers moderados.
+    Heurística: país com maior procura que tenha advertisers_ativos > 0 mas não excessivos.
+    """
+    if not rows:
+        return "sem dados"
+
+    # Filtrar países com dados de procura
+    with_data = [r for r in rows if r["procura_val"] is not None]
+    if not with_data:
+        return rows[0]["pais"] if rows else "sem dados"
+
+    # Ordenar por procura desc, e entre os de alta procura preferir advertisers moderados (1-5)
+    def score_row(r: dict) -> tuple:
+        procura = r.get("procura_val", 0) or 0
+        adv = r.get("advertisers_ativos_val", 0) or 0
+        # Penalizar muitos advertisers (> 10) e zero advertisers
+        if adv == 0:
+            adv_penalty = -50
+        elif adv > 10:
+            adv_penalty = -(adv - 10) * 2
+        else:
+            adv_penalty = 0
+        return (-procura, adv_penalty)
+
+    with_data.sort(key=score_row)
+    return with_data[0]["pais"]
+
+
+def _format_decision(
+    keyword: str,
+    score_result: dict[str, Any],
+    trends_data: dict[str, Any],
+    ads_data: dict[str, Any],
+    landing_price_data: dict[str, Any] | None,
+    onde_vender_rows: list[dict[str, Any]],
+) -> str:
+    """
+    Gera o bloco DECISÃO no topo do pack (substitui Veredicto).
+
+    Formato fixo de 5 linhas, cada uma derivada de dados, zero adjetivos.
+    """
+    label = score_result["label"]
+
+    # ── Vender? ──
+    vender_map = {"AVANÇAR": "SIM", "OBSERVAR": "OBSERVAR", "DESCARTAR": "NÃO"}
+    vender = vender_map.get(label, label)
+
+    seasonal_note = ""
+    if "error" not in trends_data:
+        if trends_data.get("seasonal"):
+            peak = trends_data.get("peak", "pico")
+            seasonal_note = f" — lançar antes de {peak}"
+
+    vender_line = f"Vender?    {vender}{seasonal_note}"
+
+    # ── Onde? ──
+    best_country = _pick_best_country(onde_vender_rows)
+    onde_line = f"Onde?      {best_country}"
+
+    # ── Preço ──
+    if landing_price_data and "price_range" in landing_price_data:
+        pr = landing_price_data["price_range"]
+        price_min = pr["min"]
+        price_max = pr["max"]
+        sourcing_target = round(price_min / 3, 2)
+        preco_line = (
+            f"Preço:     €{price_min:.2f}–€{price_max:.2f} "
+            f"→ sourcing manual: margem ok se custo < €{sourcing_target:.2f}"
+        )
+    elif landing_price_data and "error" in landing_price_data:
+        preco_line = f"Preço:     sem dados ({landing_price_data['error']})"
+    else:
+        preco_line = "Preço:     sem dados"
+
+    # ── Prova ──
+    advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
+    if advertisers:
+        top = advertisers[0]
+        name = top.get("page_name", "Desconhecido")
+        variants = top.get("active_ads", 0)
+        days = top.get("oldest_ad_days", 0)
+        prova_line = f"Prova:     {name}: {variants} variantes ativas, anúncio mais antigo com {days} dias"
+    else:
+        prova_line = "Prova:     sem escala detetada"
+
+    # ── Risco ──
+    saturation = ads_data.get("saturation", "?") if "error" not in ads_data else "?"
+    # Derivar 1 linha adicional dos dados
+    if "error" not in ads_data:
+        total_ads = ads_data.get("total_ads", 0)
+        market_proven = ads_data.get("market_proven", False)
+        if not market_proven and total_ads > 0:
+            risco_extra = "nenhum advertiser com ≥5 variantes ativas — validação de mercado incerta"
+        elif total_ads == 0:
+            risco_extra = "zero ads ativos — sem sinal de mercado"
+        elif saturation == "alta":
+            risco_extra = "mercado com competição publicitária intensa — diferenciação obrigatória"
+        elif saturation == "baixa":
+            risco_extra = "mercado pouco disputado — janela de oportunidade aberta"
+        else:
+            risco_extra = "competição moderada — monitorizar evolução"
+    else:
+        risco_extra = "sem dados de ads para avaliar risco"
+
+    # Saturação já está em português no ads_data
+    risco_line = f"Risco:     saturação {saturation} — {risco_extra}"
+
+    decision_block = f"{keyword} — DECISÃO\n{vender_line}\n{onde_line}\n{preco_line}\n{prova_line}\n{risco_line}"
+
+    return decision_block
+
+
 def _format_next_step(label: str) -> str:
     if label == "AVANÇAR":
         return "alimentar ad-machine com este pack"
@@ -237,6 +448,7 @@ def generate(
     score_result: dict[str, Any],
     seo_data: dict[str, Any] | None = None,
     feedback_data: dict[str, Any] | None = None,
+    landing_price_data: dict[str, Any] | None = None,
     run_date: date | None = None,
 ) -> str:
     """
@@ -250,6 +462,7 @@ def generate(
         score_result: dict do scoring/score.py
         seo_data: dict do adapter serp_seo.py, ou None
         feedback_data: dados de Reddit/YouTube (Fase 2), ou None
+        landing_price_data: dict do adapter landing_price.py, ou None (Delta B)
         run_date: data do run (default: hoje)
 
     Returns:
@@ -263,11 +476,20 @@ def generate(
 
     md_path, json_path = _pack_paths(keyword, run_date)
 
+    # ── Construir tabela Onde vender ──
+    onde_vender_rows = _build_onde_vender_rows(trends_data, ads_data)
+
+    # ── Bloco DECISÃO (substitui Veredicto) ──
+    decision_text = _format_decision(
+        keyword, score_result, trends_data, ads_data,
+        landing_price_data, onde_vender_rows,
+    )
+
     # --- Gerar .md ---
-    verdict_text = _format_verdict(score_result, keyword)
     trends_text = _format_trends_section(trends_data)
     volume_text = _format_volume_section(csv_data)
     ads_text = _format_ads_section(ads_data)
+    onde_vender_text = _format_onde_vender(onde_vender_rows)
     seo_text = _format_seo_section(seo_data)
     feedback_text = _format_feedback_section(feedback_data)
     bd = score_result["breakdown"]
@@ -275,8 +497,8 @@ def generate(
 
     md_content = f"""# RESEARCH PACK — {keyword} — {run_date.isoformat()}
 
-## Veredicto
-{verdict_text}
+## DECISÃO
+{decision_text}
 
 ## Trend Signal (Google Trends via SerpAPI)
 {trends_text}
@@ -286,6 +508,9 @@ def generate(
 
 ## Ads Ativos (Meta Ad Library)
 {ads_text}
+
+## Onde vender
+{onde_vender_text}
 
 ## SEO snapshot (SerpAPI engine google, PT)
 {seo_text}
@@ -314,6 +539,7 @@ Fórmula determinística. Sem LLM no score.
         "meta_ads": ads_data,
         "seo": seo_data,
         "feedback": feedback_data,
+        "landing_price": landing_price_data,
     }
 
     with open(json_path, "w", encoding="utf-8") as f:
@@ -322,12 +548,70 @@ Fórmula determinística. Sem LLM no score.
     return md_path
 
 
-def generate_digest_line(keyword: str, score_result: dict[str, Any]) -> str:
+def generate_digest_line(
+    keyword: str,
+    score_result: dict[str, Any],
+    ads_data: dict[str, Any] | None = None,
+    landing_price_data: dict[str, Any] | None = None,
+    trends_data: dict[str, Any] | None = None,
+) -> str:
     """
-    Gera uma linha de digest para o Telegram (3 linhas por keyword).
-    Usada pelo send_digest() no final de --all.
+    Gera uma linha de digest para o Telegram usando o formato DECISÃO.
+    Usa as linhas Vender?/Onde?/Prova do bloco DECISÃO como 3 linhas.
+
+    Com dados completos, devolve formato rico. Sem dados, fallback ao formato simples.
     """
     score = score_result["score"]
     label = score_result["label"]
     emoji = {"AVANÇAR": "🟢", "OBSERVAR": "🟡", "DESCARTAR": "🔴"}.get(label, "⚪")
-    return f"{emoji} *{keyword}* — Score: {score}/100 ({label})"
+
+    # Fallback simples quando não há dados adicionais
+    if ads_data is None:
+        return f"{emoji} *{keyword}* — Score: {score}/100 ({label})"
+
+    lines: list[str] = []
+
+    # ── Vender? ──
+    vender_map = {"AVANÇAR": "SIM", "OBSERVAR": "OBSERVAR", "DESCARTAR": "NÃO"}
+    vender = vender_map.get(label, label)
+
+    seasonal_note = ""
+    if trends_data and "error" not in trends_data and trends_data.get("seasonal"):
+        peak = trends_data.get("peak", "pico")
+        seasonal_note = f" (lançar antes de {peak})"
+
+    lines.append(f"Vender? {vender}{seasonal_note}")
+
+    # ── Onde? ──
+    # Simplificado: usa os advertisers como proxy
+    advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
+    if advertisers:
+        # Usar delivery_by_region dos top ads para escolher o melhor país
+        top_ads = ads_data.get("top_ads", [])
+        country_count: dict[str, int] = {}
+        for ad in top_ads:
+            regions = ad.get("delivery_by_region", [])
+            if isinstance(regions, list):
+                for r in regions:
+                    region = r.get("region", "").upper().strip()
+                    if region and len(region) <= 3:
+                        country_count[region] = country_count.get(region, 0) + 1
+        if country_count:
+            best = max(country_count, key=lambda k: country_count[k])
+            lines.append(f"Onde? {best}")
+        else:
+            lines.append("Onde? sem dados")
+    else:
+        lines.append("Onde? sem dados")
+
+    # ── Prova ──
+    if advertisers:
+        top = advertisers[0]
+        name = top.get("page_name", "?")
+        variants = top.get("active_ads", 0)
+        lines.append(f"Prova: {name} ({variants} variantes)")
+    else:
+        lines.append(f"Prova: sem escala detetada")
+
+    header = f"{emoji} *{keyword}* — Score: {score}/100 ({label})"
+    return header + "\n" + " | ".join(lines)

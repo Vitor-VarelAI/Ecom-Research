@@ -31,6 +31,8 @@ def fetch(keyword: str) -> dict[str, Any]:
     {
         "total_ads": int,
         "top_ads": [ {advertiser, days_active, reach_eu, link}, ... ] (top 3 por longevidade),
+        "advertisers": [ {page_name, active_ads, oldest_ad_days}, ... ] (top 5 por nº de ads ativos),
+        "market_proven": bool,  # True se qualquer advertiser tem ≥5 ads ativos
         "copy_angles": [str, ...],       # ângulos de copy dominantes (max 5)
         "saturation": "baixa" | "média" | "alta",
     }
@@ -77,6 +79,8 @@ def fetch(keyword: str) -> dict[str, Any]:
         return {
             "total_ads": 0,
             "top_ads": [],
+            "advertisers": [],
+            "market_proven": False,
             "copy_angles": [],
             "saturation": "baixa",
             "error": "Meta API: zero ads encontrados para esta keyword",
@@ -113,16 +117,47 @@ def fetch(keyword: str) -> dict[str, Any]:
                 if isinstance(region, dict) and region.get("region", "").upper() in ("EU", "PT", "ES", "BR"):
                     reach_eu += region.get("percentage", 0)
 
+        # page_id para agrupamento (fallback para page_name)
+        page_id = ad.get("page_id", "")
+
         ads_with_longevity.append({
             "advertiser": ad.get("page_name", "Desconhecido"),
+            "page_id": page_id,
             "days_active": days_active,
             "reach_eu": reach_eu,
             "link": ad.get("ad_snapshot_url", ""),
+            "ad_creation_time": created,
+            "delivery_by_region": delivery_regions,
         })
 
     # Top 3 por longevidade
     ads_with_longevity.sort(key=lambda x: x["days_active"], reverse=True)
     top_ads = ads_with_longevity[:3]
+
+    # ── Delta A: Agrupar ads por advertiser ──
+    # Usar page_id como key se disponível, senão page_name
+    advertiser_groups: dict[str, dict[str, Any]] = {}
+    for ad in ads_with_longevity:
+        key = ad["page_id"] if ad.get("page_id") else ad["advertiser"]
+        if key not in advertiser_groups:
+            advertiser_groups[key] = {
+                "page_name": ad["advertiser"],
+                "active_ads": 0,
+                "oldest_ad_days": 0,
+            }
+        advertiser_groups[key]["active_ads"] += 1
+        if ad["days_active"] > advertiser_groups[key]["oldest_ad_days"]:
+            advertiser_groups[key]["oldest_ad_days"] = ad["days_active"]
+
+    # Top 5 advertisers ordenados desc por nº de ads ativos
+    advertisers_sorted = sorted(
+        advertiser_groups.values(),
+        key=lambda x: x["active_ads"],
+        reverse=True,
+    )[:5]
+
+    # Flag: market_proven = True quando qualquer advertiser tem ≥5 ads ativos
+    market_proven = any(a["active_ads"] >= 5 for a in advertisers_sorted)
 
     # Ângulos de copy dominantes (limpar, deduplicar, max 5)
     unique_copies: list[str] = []
@@ -146,6 +181,8 @@ def fetch(keyword: str) -> dict[str, Any]:
     return {
         "total_ads": total,
         "top_ads": top_ads,
+        "advertisers": advertisers_sorted,
+        "market_proven": market_proven,
         "copy_angles": copy_angles,
         "saturation": saturation,
     }
