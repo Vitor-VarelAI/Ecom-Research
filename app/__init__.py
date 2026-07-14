@@ -1,1 +1,0 @@
-# Ecom-Research App Package
