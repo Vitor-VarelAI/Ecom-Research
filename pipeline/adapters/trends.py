@@ -51,7 +51,7 @@ def _cache_path(keyword: str) -> str:
 
 
 def _read_cache(keyword: str) -> dict[str, Any] | None:
-    """Lê cache se existir e for válida (< 7 dias)."""
+    """Lê cache se existir e for válida (< 30 dias)."""
     path = _cache_path(keyword)
     if not os.path.exists(path):
         return None
@@ -168,7 +168,7 @@ def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def fetch(keyword: str) -> dict[str, Any]:
+def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = False) -> dict[str, Any]:
     """
     Dado uma keyword, consulta Google Trends via SerpAPI (com cache 30 dias) e devolve:
     {
@@ -183,16 +183,24 @@ def fetch(keyword: str) -> dict[str, Any]:
     {
         "error": "razão do erro"
     }
-    """
-    # 1. Tentar cache
-    cached = _read_cache(keyword)
-    if cached is not None:
-        # Remove metadados internos antes de devolver
-        result = {k: v for k, v in cached.items() if k != "_cached_at"}
-        return result
 
-    # 2. Cache miss — verificar quota (2 calls: timeseries + related_queries)
-    if not quota.can_spend(2):
+    Args:
+        timeseries_only: se True, faz só a call TIMESERIES (1 quota), salta RELATED_QUERIES.
+                         Usado no --monthly re-score. Default False.
+        force_refresh: se True, ignora a cache e força nova chamada à API.
+                       Usado no --monthly para garantir dados frescos. Default False.
+    """
+    # 1. Tentar cache (a menos que force_refresh)
+    if not force_refresh:
+        cached = _read_cache(keyword)
+        if cached is not None:
+            # Remove metadados internos antes de devolver
+            result = {k: v for k, v in cached.items() if k != "_cached_at"}
+            return result
+
+    # 2. Cache miss — verificar quota
+    calls_needed = 1 if timeseries_only else 2
+    if not quota.can_spend(calls_needed):
         return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
 
     api_key = _get_api_key()
@@ -230,45 +238,47 @@ def fetch(keyword: str) -> dict[str, Any]:
     # 1 call gasta
     quota.spend(1)
 
-    # --- Call 2: RELATED_QUERIES ---
-    params_rq = {
-        "engine": "google_trends",
-        "q": keyword,
-        "data_type": "RELATED_QUERIES",
-        "api_key": api_key,
-    }
-
+    # --- Call 2: RELATED_QUERIES (saltar se timeseries_only) ---
     related_queries: list[dict[str, Any]] = []
-    try:
-        resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.warning("SerpAPI RELATED_QUERIES: erro de rede — %s", e)
-        # Degradação graciosa: prosseguir sem related_queries
-    else:
-        if resp_rq.status_code == 200:
-            try:
-                raw_rq = resp_rq.json()
-            except ValueError:
-                logger.warning("SerpAPI RELATED_QUERIES: resposta não é JSON válido")
-            else:
-                if "error" not in raw_rq:
-                    rq_data = raw_rq.get("related_queries", {})
-                    rising_list = rq_data.get("rising", [])
-                    if isinstance(rising_list, list):
-                        for item in rising_list:
-                            if isinstance(item, dict):
-                                related_queries.append({
-                                    "keyword": item.get("query", item.get("keyword", "")),
-                                    "score": item.get("extracted_value", item.get("value", 0)),
-                                })
-                        related_queries.sort(key=lambda x: x["score"], reverse=True)
+
+    if not timeseries_only:
+        params_rq = {
+            "engine": "google_trends",
+            "q": keyword,
+            "data_type": "RELATED_QUERIES",
+            "api_key": api_key,
+        }
+
+        try:
+            resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            logger.warning("SerpAPI RELATED_QUERIES: erro de rede — %s", e)
+            # Degradação graciosa: prosseguir sem related_queries
         else:
-            logger.warning("SerpAPI RELATED_QUERIES: HTTP %s", resp_rq.status_code)
+            if resp_rq.status_code == 200:
+                try:
+                    raw_rq = resp_rq.json()
+                except ValueError:
+                    logger.warning("SerpAPI RELATED_QUERIES: resposta não é JSON válido")
+                else:
+                    if "error" not in raw_rq:
+                        rq_data = raw_rq.get("related_queries", {})
+                        rising_list = rq_data.get("rising", [])
+                        if isinstance(rising_list, list):
+                            for item in rising_list:
+                                if isinstance(item, dict):
+                                    related_queries.append({
+                                        "keyword": item.get("query", item.get("keyword", "")),
+                                        "score": item.get("extracted_value", item.get("value", 0)),
+                                    })
+                            related_queries.sort(key=lambda x: x["score"], reverse=True)
+            else:
+                logger.warning("SerpAPI RELATED_QUERIES: HTTP %s", resp_rq.status_code)
 
-    # 2ª call gasta (mesmo se falhou — a SerpAPI conta sempre)
-    quota.spend(1)
+        # 2ª call gasta (mesmo se falhou — a SerpAPI conta sempre)
+        quota.spend(1)
 
-    # Parse e cache
+    # Parse e cache (sempre reescrever, mesmo em force_refresh)
     result = _parse_serpapi_response(raw_ts)
     result["related_queries"] = related_queries
     _write_cache(keyword, result)

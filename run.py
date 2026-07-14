@@ -252,17 +252,22 @@ def run_keyword(
     else:
         logger.info("Meta Ads: total=%d saturação=%s", ads_data.get("total_ads", 0), ads_data.get("saturation"))
 
-    # Modo meta_only (--wednesday pulse): para aqui
+    # Modo meta_only (--wednesday pulse): reutilizar dados do pack anterior
     if meta_only:
-        csv_data = {"error": "Modo --wednesday: CSV não carregado"}
-        trends_data = {"error": "Modo --wednesday: Trends não carregados"}
-        seo_data = {"error": "Modo --wednesday: SEO não executado"}
-
-        # Carregar pack anterior para score persistente
         prev = _load_previous_pack(keyword)
-        prev_score = prev.get("score", {}) if prev else {}
-        score_result = prev_score.get("score", {})
-        if not score_result:
+        if prev:
+            # Reutilizar trends/csv/seo do pack anterior — o pulse só atualiza Meta
+            trends_data = prev.get("trends", {})
+            csv_data = prev.get("keyword_planner", {})
+            seo_data = prev.get("seo", {})
+            prev_score = prev.get("score", {})
+            score_result = prev_score if prev_score else score.compute(trends_data, csv_data, ads_data)
+        else:
+            # Sem pack anterior — não há nada a pulsar
+            logger.warning("Pulse %s: sem pack anterior encontrado. A gerar pack mínimo.", keyword)
+            trends_data = {"error": "Sem pack anterior para reutilizar (pulse de quarta)"}
+            csv_data = {"error": "Sem pack anterior para reutilizar (pulse de quarta)"}
+            seo_data = {"error": "Sem pack anterior para reutilizar (pulse de quarta)"}
             score_result = score.compute(trends_data, csv_data, ads_data)
 
         md_path = pack.generate(
@@ -285,20 +290,32 @@ def run_keyword(
             "seo_data": seo_data,
         }
 
-    # Pre-filter Meta: se 0 ads ativos → DESCARTAR sem gastar SerpAPI
+    # Pre-filter Meta: se 0 ads ativos → DESCARTAR forçado sem gastar SerpAPI
     if not ads_data.get("error") and ads_data.get("total_ads", 0) == 0 and not trends_only:
-        logger.info("PRE-FILTER: 0 ads ativos → DESCARTAR sem SerpAPI")
+        logger.info("PRE-FILTER: 0 ads ativos → DESCARTAR forçado sem SerpAPI")
         trends_data = {"error": "SerpAPI não executada: 0 ads ativos (pre-filter Meta)"}
         seo_data = {"error": "SerpAPI não executada: 0 ads ativos (pre-filter Meta)"}
-        csv_data = keyword_csv.parse(csv_path) if csv_path else {"error": "Nenhum CSV encontrado em data/"}
         if csv_path is None:
             alt_csv = _find_latest_csv()
             if alt_csv:
                 csv_data = keyword_csv.parse(alt_csv)
             else:
                 csv_data = {"error": "Nenhum CSV encontrado em data/ — exporta do Google Keyword Planner e coloca em data/"}
+        else:
+            csv_data = keyword_csv.parse(csv_path)
 
-        score_result = score.compute(trends_data, csv_data, ads_data)
+        # Score forçado: DESCARTAR, independentemente do CSV ter volume
+        score_result = {
+            "score": 0,
+            "label": "DESCARTAR",
+            "breakdown": {
+                "trend": 0.0,
+                "volume": 0.0,
+                "ad_longevity": 0.0,
+                "saturacao_invertida": 0.0,
+            },
+            "reason": "sem mercado de ads ativo (pre-filter Meta)",
+        }
         md_path = pack.generate(
             keyword=keyword,
             trends_data=trends_data,
@@ -308,7 +325,7 @@ def run_keyword(
             seo_data=seo_data,
             run_date=date.today(),
         )
-        logger.info("Pack DESCARTAR gerado: %s", md_path)
+        logger.info("Pack DESCARTAR (pre-filter) gerado: %s", md_path)
         return {
             "keyword": keyword,
             "md_path": md_path,
@@ -326,8 +343,8 @@ def run_keyword(
     else:
         logger.info("[2/5] Trends (SerpAPI)...")
         if trends_only:
-            # --monthly: 1 call timeseries só, sem related_queries
-            trends_data = trends.fetch(keyword)
+            # --monthly: 1 call timeseries só, sem related_queries, force refresh
+            trends_data = trends.fetch(keyword, timeseries_only=True, force_refresh=True)
         else:
             trends_data = trends.fetch(keyword)
 
@@ -471,17 +488,17 @@ def _run_wednesday(send: bool = True) -> list[dict]:
 
             logger.info("Pulse %s: %d → %d ads (%s)", kw, prev_total, new_total, ", ".join(changes))
 
-            # Gerar pack ligeiro (só Meta, sem SerpAPI)
-            trends_data = {"error": "Modo --wednesday: 0 calls SerpAPI"}
-            csv_data = {"error": "Modo --wednesday: CSV não carregado"}
-            seo_data = {"error": "Modo --wednesday: 0 calls SerpAPI"}
-
-            # Score do pack anterior (persistente)
-            prev_score = prev.get("score", {}) if prev else {}
-            # Se não houver score anterior, recalcular
-            if prev_score:
-                score_result = prev_score
+            # Reutilizar trends/csv/seo do pack anterior — o pulse só atualiza Meta
+            if prev:
+                trends_data = prev.get("trends", {})
+                csv_data = prev.get("keyword_planner", {})
+                seo_data = prev.get("seo", {})
+                prev_score = prev.get("score", {})
+                score_result = prev_score if prev_score else score.compute(trends_data, csv_data, ads_data)
             else:
+                trends_data = {"error": "Sem pack anterior (pulse de quarta)"}
+                csv_data = {"error": "Sem pack anterior (pulse de quarta)"}
+                seo_data = {"error": "Sem pack anterior (pulse de quarta)"}
                 score_result = score.compute(trends_data, csv_data, ads_data)
 
             md_path = pack.generate(

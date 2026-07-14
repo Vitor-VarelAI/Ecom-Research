@@ -218,3 +218,79 @@ class TestTrendsCache:
         result = trends.fetch("cache-expired-test")
         # Cache expirada → foi buscar dados frescos com direção "estável"
         assert result["direction"] == "estável"
+
+
+class TestTrendsTimeseriesOnly:
+    """Testa o modo timeseries_only (1 call, sem related_queries)."""
+
+    def test_timeseries_only_spends_one(self, monkeypatch, tmp_path):
+        """timeseries_only=True faz só 1 call, não 2."""
+        monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        monkeypatch.setattr(trends, "CACHE_DIR", str(tmp_path))
+
+        call_count = 0
+        spend_count = 0
+
+        class MockResp:
+            status_code = 200
+            @staticmethod
+            def json():
+                return SERPAPI_RESPONSE_JSON
+
+        def mock_get(url, params=None, timeout=None, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return MockResp()
+
+        def mock_spend(n=1):
+            nonlocal spend_count
+            spend_count += n
+
+        monkeypatch.setattr(trends.requests, "get", mock_get)
+        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
+        monkeypatch.setattr(trends.quota, "spend", mock_spend)
+
+        result = trends.fetch("ts-only-test", timeseries_only=True)
+
+        assert call_count == 1  # só timeseries, sem related_queries
+        assert spend_count == 1  # 1 quota unit
+        assert result["related_queries"] == []
+        assert result["direction"] == "estável"
+
+
+class TestTrendsForceRefresh:
+    """Testa o modo force_refresh (ignora cache)."""
+
+    def test_force_refresh_ignores_cache(self, monkeypatch, tmp_path):
+        """force_refresh=True ignora cache válida e chama a API."""
+        monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        monkeypatch.setattr(trends, "CACHE_DIR", str(tmp_path))
+
+        call_count = 0
+
+        class MockResp:
+            status_code = 200
+            @staticmethod
+            def json():
+                return SERPAPI_RESPONSE_JSON
+
+        def mock_get(url, params=None, timeout=None, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return MockResp()
+
+        monkeypatch.setattr(trends.requests, "get", mock_get)
+        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
+        monkeypatch.setattr(trends.quota, "spend", lambda n=1: None)
+
+        # Primeira call — popula cache
+        trends.fetch("force-refresh-test")
+        assert call_count == 2  # timeseries + related
+
+        # Segunda call sem force_refresh — cache hit
+        trends.fetch("force-refresh-test")
+        assert call_count == 2  # não aumentou
+
+        # Terceira call com force_refresh — ignora cache
+        trends.fetch("force-refresh-test", force_refresh=True)
+        assert call_count == 4  # +2 (timeseries + related)

@@ -189,26 +189,30 @@ def _format_feedback_section(feedback_data: dict[str, Any] | None = None) -> str
 
 def _format_verdict(score_result: dict[str, Any], keyword: str) -> str:
     """Gera 1-2 linhas de veredicto em linguagem de decisão."""
-    score = score_result["score"]
+    score_val = score_result["score"]
     label = score_result["label"]
     bd = score_result["breakdown"]
+    reason = score_result.get("reason")
+
+    if reason:
+        return f"Score: {score_val} | {label}\n{reason}"
 
     if label == "AVANÇAR":
         verdict = (
-            f"Score: {score} | {label}\n"
+            f"Score: {score_val} | {label}\n"
             f"Nicho com sinal forte. Tendência {bd['trend']:.0f}/100, "
             f"longevidade de ads {bd['ad_longevity']:.0f}/100. "
             f"Recomendado alimentar ad-machine."
         )
     elif label == "OBSERVAR":
         verdict = (
-            f"Score: {score} | {label}\n"
+            f"Score: {score_val} | {label}\n"
             f"Nicho com potencial mas sinais mistos. "
             f"Reavaliar em 7-14 dias para confirmar tendência."
         )
     else:
         verdict = (
-            f"Score: {score} | {label}\n"
+            f"Score: {score_val} | {label}\n"
             f"Nicho com sinais fracos — saturação alta ou volume baixo. "
             f"Não recomendado neste momento."
         )
