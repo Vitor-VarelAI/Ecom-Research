@@ -50,6 +50,11 @@ def _cache_path(keyword: str) -> str:
     return os.path.join(CACHE_DIR, f"{_slugify(keyword)}.json")
 
 
+def _related_cache_path(keyword: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"{_slugify(keyword)}_related.json")
+
+
 def _read_cache(keyword: str) -> dict[str, Any] | None:
     """Lê cache se existir e for válida (< 30 dias)."""
     path = _cache_path(keyword)
@@ -81,6 +86,54 @@ def _write_cache(keyword: str, data: dict[str, Any]) -> None:
         logger.info("Trends cache: escrita para keyword=%s", keyword)
     except OSError as e:
         logger.warning("Trends cache: erro ao escrever — %s", e)
+
+
+def _read_related_cache(keyword: str) -> dict[str, Any] | None:
+    path = _related_cache_path(keyword)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Trends related cache: ficheiro corrompido para keyword=%s", keyword)
+        return None
+    if time.time() - data.get("_cached_at", 0) > CACHE_TTL:
+        return None
+    return {key: value for key, value in data.items() if key != "_cached_at"}
+
+
+def _write_related_cache(keyword: str, data: dict[str, Any]) -> None:
+    data_to_write = dict(data)
+    data_to_write["_cached_at"] = time.time()
+    try:
+        with open(_related_cache_path(keyword), "w") as f:
+            json.dump(data_to_write, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        logger.warning("Trends related cache: erro ao escrever — %s", exc)
+
+
+def _parse_related_queries(data: dict[str, Any]) -> list[dict[str, Any]]:
+    related = data.get("related_queries", {})
+    rising = related.get("rising", []) if isinstance(related, dict) else []
+    if not isinstance(rising, list):
+        return []
+    parsed: list[dict[str, Any]] = []
+    for item in rising:
+        if not isinstance(item, dict):
+            continue
+        raw_score = item.get("extracted_value", item.get("value", item.get("score", 0)))
+        score: int | float | str
+        if isinstance(raw_score, (int, float)):
+            score = raw_score
+        else:
+            score = str(raw_score or "")
+        parsed.append({
+            "keyword": item.get("query", item.get("keyword", "")),
+            "score": score,
+            "type": item.get("type", ""),
+        })
+    return parsed
 
 
 def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
@@ -282,4 +335,54 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
     result = _parse_serpapi_response(raw_ts)
     result["related_queries"] = related_queries
     _write_cache(keyword, result)
+    return result
+
+
+def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
+    """Fetch only related queries, with the same 30-day disk cache.
+
+    This is used after a successful zero-ad result: it costs one SerpAPI
+    search and gives the user alternatives without running the expensive
+    timeseries or SEO calls.
+    """
+    if not force_refresh:
+        cached = _read_related_cache(keyword)
+        if cached is not None:
+            return cached
+
+    if not quota.can_spend(1):
+        return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
+
+    api_key = _get_api_key()
+    if not api_key:
+        return {"error": "SERPAPI_KEY não definida em .env"}
+
+    params = {
+        "engine": "google_trends",
+        "q": keyword,
+        "data_type": "RELATED_QUERIES",
+        "api_key": api_key,
+    }
+    try:
+        response = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        logger.warning("SerpAPI RELATED_QUERIES: erro de rede")
+        return {"error": f"Erro de rede na SerpAPI RELATED_QUERIES ({type(exc).__name__})"}
+
+    # SerpAPI counts the request even when it returns an HTTP or JSON error.
+    quota.spend(1)
+    if response.status_code != 200:
+        return {"error": f"SerpAPI RELATED_QUERIES: HTTP {response.status_code}"}
+
+    try:
+        raw = response.json()
+    except (ValueError, TypeError):
+        return {"error": "SerpAPI RELATED_QUERIES: resposta não é JSON válido"}
+    if not isinstance(raw, dict):
+        return {"error": "SerpAPI RELATED_QUERIES: resposta inválida"}
+    if "error" in raw:
+        return {"error": f"SerpAPI RELATED_QUERIES: {raw['error']}"}
+
+    result = {"related_queries": _parse_related_queries(raw)}
+    _write_related_cache(keyword, result)
     return result

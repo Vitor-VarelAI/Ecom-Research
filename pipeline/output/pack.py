@@ -1,9 +1,6 @@
-"""
-Gerador de research-pack.md e .json bruto.
+"""Deterministic research-pack Markdown and raw JSON output."""
 
-Segue o schema exacto definido em PLAN.md.
-Secções sem dados escrevem "sem dados: {razão}", nunca inventam.
-"""
+from __future__ import annotations
 
 import json
 import os
@@ -13,338 +10,197 @@ from typing import Any
 
 def _slugify(keyword: str) -> str:
     slug = keyword.lower().strip()
-    slug = "".join(c if c.isalnum() or c == "-" else "-" for c in slug)
-    slug = "-".join(slug.split("-")).strip("-")
-    return slug
+    slug = "".join(char if char.isalnum() or char == "-" else "-" for char in slug)
+    return "-".join(slug.split("-")).strip("-")
 
 
 def _pack_paths(keyword: str, run_date: date | None = None) -> tuple[str, str]:
-    """Devolve (md_path, json_path) para uma keyword."""
     if run_date is None:
         run_date = date.today()
-    slug = _slugify(keyword)
-    date_str = run_date.isoformat()
-
     repo_root = os.path.join(os.path.dirname(__file__), "..", "..")
     packs_dir = os.path.join(repo_root, "packs")
     data_dir = os.path.join(repo_root, "data")
     os.makedirs(packs_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
-
-    md_path = os.path.join(packs_dir, f"{date_str}--{slug}.md")
-    json_path = os.path.join(data_dir, f"{date_str}--{slug}.json")
-    return md_path, json_path
+    date_str = run_date.isoformat()
+    slug = _slugify(keyword)
+    return (
+        os.path.join(packs_dir, f"{date_str}--{slug}.md"),
+        os.path.join(data_dir, f"{date_str}--{slug}.json"),
+    )
 
 
 def _format_trends_section(trends_data: dict[str, Any]) -> str:
     if "error" in trends_data:
         return f"- sem dados: {trends_data['error']}"
-
-    direction = trends_data.get("direction", "?")
-    slope = trends_data.get("slope_pct", 0.0)
-    seasonal = trends_data.get("seasonal", False)
-    peak = trends_data.get("peak")
-    top_geos = trends_data.get("top_geos", [])
-    related_queries = trends_data.get("related_queries", [])
-
     lines = [
-        f"- Direção 90 dias: {direction} ({slope:+.1f}%)",
+        f"- Direção 90 dias: {trends_data.get('direction', '?')} ({trends_data.get('slope_pct', 0.0):+.1f}%)",
+        f"- Sazonalidade: {'sim (pico: ' + str(trends_data.get('peak')) + ')' if trends_data.get('seasonal') else 'não'}",
     ]
-
-    if seasonal:
-        lines.append(f"- Sazonalidade: sim (pico: {peak})")
-    else:
-        lines.append("- Sazonalidade: não")
-
+    top_geos = trends_data.get("top_geos", [])
     if top_geos:
-        geos_str = ", ".join(f"{g['geo']} ({g['value']})" for g in top_geos)
-        lines.append(f"- Geos quentes: {geos_str}")
+        lines.append("- Geos quentes: " + ", ".join(f"{item.get('geo', '?')} ({item.get('value', 0)})" for item in top_geos))
     else:
         lines.append("- Geos quentes: sem dados")
-
-    if related_queries:
+    related = trends_data.get("related_queries", [])
+    if related:
         lines.append("- Queries relacionadas em subida:")
-        for rq in related_queries[:5]:
-            kw = rq.get("keyword", "?")
-            sc = rq.get("score", 0)
-            lines.append(f"  - {kw} (+{sc})")
+        for item in related[:5]:
+            lines.append(f"  - {item.get('keyword', '?')} ({item.get('score', 0)})")
     else:
         lines.append("- Queries relacionadas em subida: sem dados")
-
     return "\n".join(lines)
 
 
 def _format_volume_section(csv_data: dict[str, Any]) -> str:
     if "error" in csv_data:
         return f"- sem dados: {csv_data['error']}"
-
     volume = csv_data.get("volume")
     cpc = csv_data.get("cpc")
+    volume_text = f"{volume:,}".replace(",", ".") if volume is not None else "?"
+    cpc_text = f"€{cpc:.2f}".replace(".", ",") if cpc is not None else "?"
+    lines = [f"- Volume mensal: {volume_text} | CPC médio: {cpc_text}"]
     related = csv_data.get("related_keywords", [])
-
-    lines = []
-    vol_str = f"{volume:,}".replace(",", ".") if volume is not None else "?"
-    cpc_str = f"€{cpc:.2f}".replace(".", ",") if cpc is not None else "?"
-    lines.append(f"- Volume mensal: {vol_str} | CPC médio: {cpc_str}")
-
     if related:
         lines.append("- Top 5 keywords relacionadas com volume:")
-        for i, r in enumerate(related, 1):
-            kw = r["keyword"]
-            vol = r["volume"]
-            lines.append(f"  {i}. {kw} ({vol:,})".replace(",", "."))
+        lines.extend(
+            f"  {index}. {item.get('keyword', '?')} ({item.get('volume', 0):,})".replace(",", ".")
+            for index, item in enumerate(related[:5], 1)
+        )
     else:
         lines.append("- Top 5 keywords relacionadas com volume: sem dados")
-
     return "\n".join(lines)
 
 
 def _format_ads_section(ads_data: dict[str, Any]) -> str:
     if "error" in ads_data:
         return f"- sem dados: {ads_data['error']}"
-
-    total = ads_data.get("total_ads", 0)
+    lines = [
+        f"- Fonte: {ads_data.get('source', 'Facebook Ad Library via Apify')}",
+        f"- Total de ads ativos para o nicho: {ads_data.get('total_ads', 0)}",
+    ]
     top_ads = ads_data.get("top_ads", [])
-    copy_angles = ads_data.get("copy_angles", [])
-    saturation = ads_data.get("saturation", "?")
-
-    lines = [f"- Total de ads ativos para o nicho: {total}"]
-
     if top_ads:
-        lines.append("- Top 3 ads por longevidade (ad a correr há semanas = ad que paga):")
-        for ad in top_ads:
-            adv = ad.get("advertiser", "?")
-            days = ad.get("days_active", 0)
-            reach = ad.get("reach_eu", 0)
-            link = ad.get("link", "")
-            link_str = f" | {link}" if link else ""
-            lines.append(f"  - {adv} | ativo há {days} dias | alcance UE: {reach}{link_str}")
+        lines.append("- Top 3 ads por longevidade:")
+        for ad in top_ads[:3]:
+            link = f" | {ad.get('link')}" if ad.get("link") else ""
+            lines.append(
+                f"  - {ad.get('advertiser', '?')} | ativo há {ad.get('days_active', 0)} dias{link}"
+            )
     else:
         lines.append("- Top 3 ads por longevidade: sem dados")
-
-    if copy_angles:
-        lines.append("- Ângulos de copy dominantes:")
-        for angle in copy_angles:
-            lines.append(f"  - {angle}")
+    copies = ads_data.get("copy_examples", ads_data.get("copy_angles", []))
+    if copies:
+        lines.append("- Exemplos de copy:")
+        lines.extend(f"  - {copy}" for copy in copies[:5])
     else:
-        lines.append("- Ângulos de copy dominantes: sem dados")
-
-    lines.append(f"- Saturação: {saturation}")
-
+        lines.append("- Exemplos de copy: sem dados")
+    lines.append(f"- Saturação: {ads_data.get('saturation', '?')}")
+    lines.append(f"- Amostra: {ads_data.get('raw_ads_count', 0)}/{ads_data.get('sample_limit', 100)}; capped={ads_data.get('sample_capped', False)}")
     return "\n".join(lines)
 
 
 def _format_seo_section(seo_data: dict[str, Any]) -> str:
     if "error" in seo_data:
         return f"- sem dados: {seo_data['error']}"
-
     organic = seo_data.get("organic_results", [])
-    ads_count = seo_data.get("ads_count", 0)
-    paa = seo_data.get("paa_questions", [])
-    opportunity = seo_data.get("seo_opportunity", "?")
-
-    lines = []
-
-    # Top 10 orgânicos — resumo de domínios
+    lines = ["- Top 10 orgânicos: sem dados"]
     if organic:
-        # Agrupar por domínio para mostrar quem domina
-        domain_positions: dict[str, list[int]] = {}
-        for r in organic:
-            domain = r.get("domain", "?")
-            pos = r.get("position", 0)
-            if domain not in domain_positions:
-                domain_positions[domain] = []
-            domain_positions[domain].append(pos)
-
-        # Mostrar domínios com posições
-        lines.append("- Top 10 orgânicos:")
-        for domain, positions in domain_positions.items():
-            pos_str = ", ".join(f"#{p}" for p in sorted(positions))
-            first_title = next((r.get("title", "")[:60] for r in organic if r.get("domain") == domain), "")
-            lines.append(f"  - {domain} ({pos_str}) — {first_title}")
-    else:
-        lines.append("- Top 10 orgânicos: sem dados")
-
-    # Ads no SERP
-    lines.append(f"- Ads no SERP: {ads_count} (proxy de competição paga)")
-
-    # PAA questions
+        lines = ["- Top 10 orgânicos:"]
+        for item in organic[:10]:
+            lines.append(f"  - {item.get('domain', '?')} (#{item.get('position', 0)}) — {item.get('title', '')[:60]}")
+    lines.append(f"- Ads no SERP: {seo_data.get('ads_count', 0)} (proxy de competição paga)")
+    paa = seo_data.get("paa_questions", [])
     if paa:
         lines.append("- PAA questions (matéria-prima para conteúdo):")
-        for i, q in enumerate(paa, 1):
-            lines.append(f"  {i}. {q}")
+        lines.extend(f"  {index}. {question}" for index, question in enumerate(paa[:3], 1))
     else:
         lines.append("- PAA questions: sem dados")
-
-    # Oportunidade SEO
-    lines.append(f"- Oportunidade SEO: {opportunity}")
-
+    lines.append(f"- Oportunidade SEO: {seo_data.get('seo_opportunity', '?')}")
     return "\n".join(lines)
 
 
 def _format_feedback_section(feedback_data: dict[str, Any] | None = None) -> str:
-    """Fase 2. Por agora, sempre sem dados."""
     return "- sem dados: Fase 2 (Reddit/YouTube) ainda não implementada"
 
 
-def _format_verdict(score_result: dict[str, Any], keyword: str) -> str:
-    """Gera 1-2 linhas de veredicto em linguagem de decisão. (mantida para compatibilidade)"""
-    score_val = score_result["score"]
-    label = score_result["label"]
-    bd = score_result["breakdown"]
-    reason = score_result.get("reason")
-
-    if reason:
-        return f"Score: {score_val} | {label}\n{reason}"
-
-    if label == "AVANÇAR":
-        verdict = (
-            f"Score: {score_val} | {label}\n"
-            f"Nicho com sinal forte. Tendência {bd['trend']:.0f}/100, "
-            f"longevidade de ads {bd['ad_longevity']:.0f}/100. "
-            f"Recomendado alimentar ad-machine."
-        )
-    elif label == "OBSERVAR":
-        verdict = (
-            f"Score: {score_val} | {label}\n"
-            f"Nicho com potencial mas sinais mistos. "
-            f"Reavaliar em 7-14 dias para confirmar tendência."
-        )
-    else:
-        verdict = (
-            f"Score: {score_val} | {label}\n"
-            f"Nicho com sinais fracos — saturação alta ou volume baixo. "
-            f"Não recomendado neste momento."
-        )
-
-    return verdict
-
-
-def _build_onde_vender_rows(
-    trends_data: dict[str, Any],
-    ads_data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """
-    Constrói as linhas da tabela 'Onde vender' cruzando top_geos do Trends
-    com delivery_by_region dos ads da Meta.
-
-    Linhas: PT, ES, FR + qualquer país no top 3 do Trends.
-
-    Returns:
-        Lista de dicts com {pais, procura_val, procura_str, advertisers_ativos, alcance_ads_str}
-    """
-    # Países base sempre presentes
-    base_countries = ["PT", "ES", "FR"]
-
-    # Extrair top_geos do trends
-    top_geos = []
+def _market_countries(trends_data: dict[str, Any]) -> list[str]:
+    countries = ["PT", "ES", "FR"]
     if "error" not in trends_data:
-        top_geos = trends_data.get("top_geos", [])
+        for item in trends_data.get("top_geos", [])[:3]:
+            country = str(item.get("geo", "")).upper().strip()
+            if country and country not in countries:
+                countries.append(country)
+    return countries
 
-    # Extrair delivery_by_region agregado de todos os ads
-    # Agregar alcance (%) por país
-    country_reach: dict[str, float] = {}
-    country_advertisers: dict[str, set[str]] = {}
 
+def _build_market_rows(trends_data: dict[str, Any], ads_data: dict[str, Any]) -> list[dict[str, Any]]:
+    geos: dict[str, Any] = {}
+    if "error" not in trends_data:
+        geos = {str(item.get("geo", "")).upper(): item.get("value") for item in trends_data.get("top_geos", [])}
+
+    advertiser_sets = {country: set() for country in _market_countries(trends_data)}
+    ad_counts = {country: 0 for country in _market_countries(trends_data)}
     if "error" not in ads_data:
-        top_ads = ads_data.get("top_ads", [])
-        for ad in top_ads:
-            advertiser = ad.get("advertiser", "?")
-            regions = ad.get("delivery_by_region", [])
-            if isinstance(regions, list):
-                for r in regions:
-                    if isinstance(r, dict):
-                        region_name = r.get("region", "").upper().strip()
-                        if region_name and len(region_name) <= 3:  # só códigos de país
-                            pct = r.get("percentage", 0)
-                            country_reach[region_name] = country_reach.get(region_name, 0) + pct
-                            if region_name not in country_advertisers:
-                                country_advertisers[region_name] = set()
-                            country_advertisers[region_name].add(advertiser)
-
-    # Construir lookup de procura por país a partir dos top_geos
-    geo_values: dict[str, int] = {}
-    for g in top_geos:
-        geo = g.get("geo", "").upper().strip()
-        val = g.get("value", 0)
-        if geo:
-            geo_values[geo] = val
-
-    # Determinar o conjunto de países a mostrar
-    # PT, ES, FR + top 3 geos que não sejam já os base
-    countries_order: list[str] = list(dict.fromkeys(base_countries))  # preserve order, dedupe
-
-    for g in top_geos[:3]:
-        geo = g.get("geo", "").upper().strip()
-        if geo and geo not in countries_order:
-            countries_order.append(geo)
+        for ad in ads_data.get("top_ads", []):
+            countries = ad.get("countries", [])
+            if not countries:
+                countries = [item.get("region", "") for item in ad.get("delivery_by_region", []) if isinstance(item, dict)]
+            seen_for_ad: set[str] = set()
+            for country in countries:
+                country = str(country).upper().strip()
+                if country not in ad_counts or country in seen_for_ad:
+                    continue
+                seen_for_ad.add(country)
+                ad_counts[country] += 1
+                advertiser_sets[country].add(str(ad.get("page_id") or ad.get("advertiser") or "?"))
 
     rows = []
-    for country in countries_order:
-        procura_val = geo_values.get(country)
-        procura_str = str(procura_val) if procura_val is not None else "—"
-        alcance = country_reach.get(country)
-        alcance_str = f"{alcance:.0f}%" if alcance is not None else "—"
-        n_adv = len(country_advertisers.get(country, set()))
-        adv_str = str(n_adv) if n_adv > 0 else "—"
-
+    for country in _market_countries(trends_data):
         rows.append({
-            "pais": country,
-            "procura_str": procura_str,
-            "procura_val": procura_val,
-            "advertisers_ativos_str": adv_str,
-            "advertisers_ativos_val": n_adv,
-            "alcance_ads_str": alcance_str,
+            "country": country,
+            "trends_demand": geos.get(country, "—"),
+            "advertisers_observed": len(advertiser_sets[country]) or "—",
+            "ads_observed": ad_counts[country] or "—",
         })
-
     return rows
 
 
-def _format_onde_vender(rows: list[dict[str, Any]]) -> str:
-    """Formata a secção 'Onde vender' como tabela markdown."""
-    if not rows:
-        return "- sem dados: zero países para cruzar (Trends e Ads sem dados)"
-
+def _format_market_signals(rows: list[dict[str, Any]]) -> str:
     lines = [
-        "| País | Procura (Trends 0-100) | Advertisers ativos | Alcance ads |",
-        "|------|-------------------------|-------------------|-------------|",
+        "| country | Trends demand | advertisers observed | ads observed |",
+        "|---------|----------------|----------------------|--------------|",
     ]
-    for r in rows:
-        lines.append(
-            f"| {r['pais']} | {r['procura_str']} | {r['advertisers_ativos_str']} | {r['alcance_ads_str']} |"
-        )
+    lines.extend(
+        f"| {row['country']} | {row['trends_demand']} | {row['advertisers_observed']} | {row['ads_observed']} |"
+        for row in rows
+    )
     return "\n".join(lines)
 
 
-def _pick_best_country(rows: list[dict[str, Any]]) -> str:
-    """
-    Escolhe o melhor país da tabela 'Onde vender':
-    procura alta + advertisers moderados.
-    Heurística: país com maior procura que tenha advertisers_ativos > 0 mas não excessivos.
-    """
-    if not rows:
-        return "sem dados"
-
-    # Filtrar países com dados de procura
-    with_data = [r for r in rows if r["procura_val"] is not None]
-    if not with_data:
-        return rows[0]["pais"] if rows else "sem dados"
-
-    # Ordenar por procura desc, e entre os de alta procura preferir advertisers moderados (1-5)
-    def score_row(r: dict) -> tuple:
-        procura = r.get("procura_val", 0) or 0
-        adv = r.get("advertisers_ativos_val", 0) or 0
-        # Penalizar muitos advertisers (> 10) e zero advertisers
-        if adv == 0:
-            adv_penalty = -50
-        elif adv > 10:
-            adv_penalty = -(adv - 10) * 2
-        else:
-            adv_penalty = 0
-        return (-procura, adv_penalty)
-
-    with_data.sort(key=score_row)
-    return with_data[0]["pais"]
+def _format_cohort_section(ad_cohort: dict[str, Any] | None) -> str:
+    if not ad_cohort:
+        return "- Pulse de persistência: sem baseline (seção preenchida no pulse de quarta-feira)"
+    baseline = ad_cohort.get("baseline_date") or "?"
+    current = ad_cohort.get("current_date") or "?"
+    retention = ad_cohort.get("ad_retention_pct")
+    adv_retention = ad_cohort.get("advertiser_retention_pct")
+    top_share = ad_cohort.get("top_advertiser_share_pct")
+    retention_text = f"{retention:.1f}%" if retention is not None else "sem baseline"
+    adv_retention_text = f"{adv_retention:.1f}%" if adv_retention is not None else "sem baseline"
+    top_share_text = f"{top_share:.1f}%" if top_share is not None else "sem dados"
+    lines = [
+        f"- Janela: {baseline} → {current}",
+        f"- Retenção de ads: {retention_text} ({len(ad_cohort.get('retained_ads', []))} de {len(ad_cohort.get('previous_ads', []))}) | novos: +{len(ad_cohort.get('new_ads', []))} | removidos: -{len(ad_cohort.get('removed_ads', []))}",
+        f"- Retenção de anunciantes: {adv_retention_text} ({len(ad_cohort.get('retained_advertisers', []))} de {len(ad_cohort.get('previous_advertisers', []))}) | novos: +{len(ad_cohort.get('new_advertisers', []))} | perdidos: -{len(ad_cohort.get('lost_advertisers', []))}",
+        f"- Concentração: maior anunciante com {top_share_text} das variantes atuais",
+    ]
+    signals = ad_cohort.get("signals", [])
+    if signals:
+        lines.append("- Sinais: " + ", ".join(signals))
+    else:
+        lines.append("- Sinais: sem sinal advisory")
+    return "\n".join(lines)
 
 
 def _format_decision(
@@ -353,91 +209,70 @@ def _format_decision(
     trends_data: dict[str, Any],
     ads_data: dict[str, Any],
     landing_price_data: dict[str, Any] | None,
-    onde_vender_rows: list[dict[str, Any]],
 ) -> str:
-    """
-    Gera o bloco DECISÃO no topo do pack (substitui Veredicto).
-
-    Formato fixo de 5 linhas, cada uma derivada de dados, zero adjetivos.
-    """
-    label = score_result["label"]
-
-    # ── Vender? ──
-    vender_map = {"AVANÇAR": "SIM", "OBSERVAR": "OBSERVAR", "DESCARTAR": "NÃO"}
-    vender = vender_map.get(label, label)
-
-    seasonal_note = ""
-    if "error" not in trends_data:
-        if trends_data.get("seasonal"):
-            peak = trends_data.get("peak", "pico")
-            seasonal_note = f" — lançar antes de {peak}"
-
-    vender_line = f"Vender?    {vender}{seasonal_note}"
-
-    # ── Onde? ──
-    best_country = _pick_best_country(onde_vender_rows)
-    onde_line = f"Onde?      {best_country}"
-
-    # ── Preço ──
-    if landing_price_data and "price_range" in landing_price_data:
-        pr = landing_price_data["price_range"]
-        price_min = pr["min"]
-        price_max = pr["max"]
-        sourcing_target = round(price_min / 3, 2)
-        preco_line = (
-            f"Preço:     €{price_min:.2f}–€{price_max:.2f} "
-            f"→ sourcing manual: margem ok se custo < €{sourcing_target:.2f}"
-        )
-    elif landing_price_data and "error" in landing_price_data:
-        preco_line = f"Preço:     sem dados ({landing_price_data['error']})"
+    label = score_result.get("label", "DADOS INSUFICIENTES")
+    if label == "AVANÇAR":
+        vender = "SIM"
+    elif label == "OBSERVAR":
+        vender = "OBSERVAR"
+    elif label == "DESCARTAR":
+        vender = "NÃO"
     else:
-        preco_line = "Preço:     sem dados"
+        vender = "DADOS INSUFICIENTES"
 
-    # ── Prova ──
+    seasonal = ""
+    if "error" not in trends_data and trends_data.get("seasonal"):
+        seasonal = f" — lançar antes de {trends_data.get('peak', 'pico')}"
+    lines = [f"{keyword} — DECISÃO", f"Vender?    {vender}{seasonal}", "Mercado:   decisão manual"]
+
+    if landing_price_data and "price_range" in landing_price_data:
+        price = landing_price_data["price_range"]
+        target = round(price["min"] / 3, 2)
+        lines.append(f"Preço:     €{price['min']:.2f}–€{price['max']:.2f} → sourcing manual: margem ok se custo < €{target:.2f}")
+    elif landing_price_data and "error" in landing_price_data:
+        lines.append(f"Preço:     sem dados ({landing_price_data['error']})")
+    else:
+        lines.append("Preço:     sem dados")
+
     advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
     if advertisers:
         top = advertisers[0]
-        name = top.get("page_name", "Desconhecido")
-        variants = top.get("active_ads", 0)
-        days = top.get("oldest_ad_days", 0)
-        prova_line = f"Prova:     {name}: {variants} variantes ativas, anúncio mais antigo com {days} dias"
+        lines.append(f"Prova:     {top.get('page_name', '?')}: {top.get('active_ads', 0)} variantes ativas, anúncio mais antigo com {top.get('oldest_ad_days', 0)} dias")
     else:
-        prova_line = "Prova:     sem escala detetada"
+        lines.append("Prova:     sem escala detetada")
 
-    # ── Risco ──
-    saturation = ads_data.get("saturation", "?") if "error" not in ads_data else "?"
-    # Derivar 1 linha adicional dos dados
-    if "error" not in ads_data:
-        total_ads = ads_data.get("total_ads", 0)
-        market_proven = ads_data.get("market_proven", False)
-        if not market_proven and total_ads > 0:
-            risco_extra = "nenhum advertiser com ≥5 variantes ativas — validação de mercado incerta"
-        elif total_ads == 0:
-            risco_extra = "zero ads ativos — sem sinal de mercado"
-        elif saturation == "alta":
-            risco_extra = "mercado com competição publicitária intensa — diferenciação obrigatória"
-        elif saturation == "baixa":
-            risco_extra = "mercado pouco disputado — janela de oportunidade aberta"
-        else:
-            risco_extra = "competição moderada — monitorizar evolução"
+    if label == "DADOS INSUFICIENTES" or "error" in ads_data:
+        risk = "repetir quando o Apify estiver disponível"
+    elif ads_data.get("total_ads", 0) == 0:
+        risk = "zero ads ativos — sem sinal de mercado"
+    elif ads_data.get("saturation") == "alta":
+        risk = "mercado com competição publicitária intensa"
     else:
-        risco_extra = "sem dados de ads para avaliar risco"
-
-    # Saturação já está em português no ads_data
-    risco_line = f"Risco:     saturação {saturation} — {risco_extra}"
-
-    decision_block = f"{keyword} — DECISÃO\n{vender_line}\n{onde_line}\n{preco_line}\n{prova_line}\n{risco_line}"
-
-    return decision_block
+        risk = f"saturação {ads_data.get('saturation', '?')}"
+    lines.append(f"Risco:     {risk}")
+    return "\n".join(lines)
 
 
 def _format_next_step(label: str) -> str:
     if label == "AVANÇAR":
-        return "alimentar ad-machine com este pack"
-    elif label == "OBSERVAR":
-        return "reavaliar em 14 dias"
+        return "AVANÇAR: preparar ad-machine após aprovação manual"
+    if label == "OBSERVAR":
+        return "OBSERVAR: manter em watchlist e voltar a verificar"
+    if label == "DESCARTAR":
+        return "DESCARTAR: arquivar salvo nova evidência"
+    return "DADOS INSUFICIENTES: repetir quando o Apify estiver disponível"
+
+
+def _format_suggestions(suggestions: list[dict[str, Any]]) -> str:
+    lines = ["Nada foi adicionado a config/keywords.txt; estas sugestões exigem aprovação manual."]
+    if suggestions:
+        lines.extend(
+            f"- {item.get('keyword', '?')} ({item.get('score', 0)}) — status: {item.get('status', 'proposed')}"
+            for item in suggestions
+        )
     else:
-        return "arquivar; reavaliar apenas se tendência inverter"
+        lines.append("- Sem sugestões nesta execução.")
+    return "\n".join(lines)
 
 
 def generate(
@@ -450,101 +285,72 @@ def generate(
     feedback_data: dict[str, Any] | None = None,
     landing_price_data: dict[str, Any] | None = None,
     run_date: date | None = None,
+    suggested_keywords: list[dict[str, Any]] | None = None,
+    ad_cohort: dict[str, Any] | None = None,
 ) -> str:
-    """
-    Gera o research-pack.md e o .json bruto.
-
-    Args:
-        keyword: keyword pesquisada
-        trends_data: dict do adapter trends.py
-        csv_data: dict do adapter keyword_csv.py
-        ads_data: dict do adapter meta_ads.py
-        score_result: dict do scoring/score.py
-        seo_data: dict do adapter serp_seo.py, ou None
-        feedback_data: dados de Reddit/YouTube (Fase 2), ou None
-        landing_price_data: dict do adapter landing_price.py, ou None (Delta B)
-        run_date: data do run (default: hoje)
-
-    Returns:
-        Caminho do ficheiro .md gerado
-    """
     if run_date is None:
         run_date = date.today()
-
-    if seo_data is None:
-        seo_data = {"error": "SEO não executado — modo reduzido (ex: --wednesday, --monthly)"}
-
+    seo_data = seo_data or {"error": "SEO não executado — modo reduzido"}
+    suggested_keywords = suggested_keywords or []
     md_path, json_path = _pack_paths(keyword, run_date)
-
-    # ── Construir tabela Onde vender ──
-    onde_vender_rows = _build_onde_vender_rows(trends_data, ads_data)
-
-    # ── Bloco DECISÃO (substitui Veredicto) ──
-    decision_text = _format_decision(
-        keyword, score_result, trends_data, ads_data,
-        landing_price_data, onde_vender_rows,
-    )
-
-    # --- Gerar .md ---
-    trends_text = _format_trends_section(trends_data)
-    volume_text = _format_volume_section(csv_data)
-    ads_text = _format_ads_section(ads_data)
-    onde_vender_text = _format_onde_vender(onde_vender_rows)
-    seo_text = _format_seo_section(seo_data)
-    feedback_text = _format_feedback_section(feedback_data)
-    bd = score_result["breakdown"]
-    next_step = _format_next_step(score_result["label"])
+    rows = _build_market_rows(trends_data, ads_data)
+    breakdown = score_result.get("breakdown", {})
 
     md_content = f"""# RESEARCH PACK — {keyword} — {run_date.isoformat()}
 
 ## DECISÃO
-{decision_text}
+{_format_decision(keyword, score_result, trends_data, ads_data, landing_price_data)}
 
 ## Trend Signal (Google Trends via SerpAPI)
-{trends_text}
+{_format_trends_section(trends_data)}
+
+## Sugestões de keywords — aprovação manual
+{_format_suggestions(suggested_keywords)}
 
 ## Volume & CPC (Keyword Planner CSV)
-{volume_text}
+{_format_volume_section(csv_data)}
 
-## Ads Ativos (Meta Ad Library)
-{ads_text}
+## Ads Ativos (Facebook Ad Library via Apify)
+{_format_ads_section(ads_data)}
 
-## Onde vender
-{onde_vender_text}
+## Persistência de mercado — pulse quarta (advisory)
+{_format_cohort_section(ad_cohort)}
+
+## Sinais por mercado — decisão manual
+{_format_market_signals(rows)}
 
 ## SEO snapshot (SerpAPI engine google, PT)
-{seo_text}
+{_format_seo_section(seo_data)}
 
 ## Feedback (Fase 2 — Reddit/YouTube)
-{feedback_text}
+{_format_feedback_section(feedback_data)}
 
 ## Score breakdown
-trend({bd['trend']} × 0.3) + volume({bd['volume']} × 0.2) + ad_longevity({bd['ad_longevity']} × 0.3) + saturação_invertida({bd['saturacao_invertida']} × 0.2) = {score_result['score']}
+trend({breakdown.get('trend', 0)} × 0.3) + volume({breakdown.get('volume', 0)} × 0.2) + ad_longevity({breakdown.get('ad_longevity', 0)} × 0.3) + saturação_invertida({breakdown.get('saturacao_invertida', 0)} × 0.2) = {score_result.get('score', 0)}
 Fórmula determinística. Sem LLM no score.
 
 ## Próximo passo sugerido
-{next_step}
+{_format_next_step(score_result.get('label', 'DADOS INSUFICIENTES'))}
 """
+    with open(md_path, "w", encoding="utf-8") as output:
+        output.write(md_content)
 
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(md_content)
-
-    # --- Gerar .json bruto ---
     raw_pack = {
         "keyword": keyword,
         "date": run_date.isoformat(),
         "score": score_result,
         "trends": trends_data,
         "keyword_planner": csv_data,
-        "meta_ads": ads_data,
+        "facebook_ads": ads_data,
         "seo": seo_data,
         "feedback": feedback_data,
         "landing_price": landing_price_data,
+        "suggested_keywords": suggested_keywords,
     }
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(raw_pack, f, ensure_ascii=False, indent=2)
-
+    if ad_cohort is not None:
+        raw_pack["ad_cohort"] = ad_cohort
+    with open(json_path, "w", encoding="utf-8") as output:
+        json.dump(raw_pack, output, ensure_ascii=False, indent=2)
     return md_path
 
 
@@ -555,63 +361,17 @@ def generate_digest_line(
     landing_price_data: dict[str, Any] | None = None,
     trends_data: dict[str, Any] | None = None,
 ) -> str:
-    """
-    Gera uma linha de digest para o Telegram usando o formato DECISÃO.
-    Usa as linhas Vender?/Onde?/Prova do bloco DECISÃO como 3 linhas.
-
-    Com dados completos, devolve formato rico. Sem dados, fallback ao formato simples.
-    """
-    score = score_result["score"]
-    label = score_result["label"]
-    emoji = {"AVANÇAR": "🟢", "OBSERVAR": "🟡", "DESCARTAR": "🔴"}.get(label, "⚪")
-
-    # Fallback simples quando não há dados adicionais
+    score_value = score_result.get("score", 0)
+    label = score_result.get("label", "DADOS INSUFICIENTES")
     if ads_data is None:
-        return f"{emoji} *{keyword}* — Score: {score}/100 ({label})"
-
-    lines: list[str] = []
-
-    # ── Vender? ──
-    vender_map = {"AVANÇAR": "SIM", "OBSERVAR": "OBSERVAR", "DESCARTAR": "NÃO"}
-    vender = vender_map.get(label, label)
-
-    seasonal_note = ""
-    if trends_data and "error" not in trends_data and trends_data.get("seasonal"):
-        peak = trends_data.get("peak", "pico")
-        seasonal_note = f" (lançar antes de {peak})"
-
-    lines.append(f"Vender? {vender}{seasonal_note}")
-
-    # ── Onde? ──
-    # Simplificado: usa os advertisers como proxy
+        return f"{keyword} — Score: {score_value}/100 ({label})"
     advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
-    if advertisers:
-        # Usar delivery_by_region dos top ads para escolher o melhor país
-        top_ads = ads_data.get("top_ads", [])
-        country_count: dict[str, int] = {}
-        for ad in top_ads:
-            regions = ad.get("delivery_by_region", [])
-            if isinstance(regions, list):
-                for r in regions:
-                    region = r.get("region", "").upper().strip()
-                    if region and len(region) <= 3:
-                        country_count[region] = country_count.get(region, 0) + 1
-        if country_count:
-            best = max(country_count, key=lambda k: country_count[k])
-            lines.append(f"Onde? {best}")
-        else:
-            lines.append("Onde? sem dados")
-    else:
-        lines.append("Onde? sem dados")
-
-    # ── Prova ──
-    if advertisers:
-        top = advertisers[0]
-        name = top.get("page_name", "?")
-        variants = top.get("active_ads", 0)
-        lines.append(f"Prova: {name} ({variants} variantes)")
-    else:
-        lines.append(f"Prova: sem escala detetada")
-
-    header = f"{emoji} *{keyword}* — Score: {score}/100 ({label})"
-    return header + "\n" + " | ".join(lines)
+    proof = f"{advertisers[0].get('page_name', '?')} ({advertisers[0].get('active_ads', 0)} variantes)" if advertisers else "sem escala detetada"
+    seasonal = ""
+    if trends_data and "error" not in trends_data and trends_data.get("seasonal"):
+        seasonal = f" (lançar antes de {trends_data.get('peak', 'pico')})"
+    return (
+        f"{keyword} — Score: {score_value}/100 ({label})\n"
+        f"Vender? {('SIM' if label == 'AVANÇAR' else 'NÃO' if label == 'DESCARTAR' else label)}{seasonal} | "
+        f"Mercado: decisão manual | Prova: {proof}"
+    )

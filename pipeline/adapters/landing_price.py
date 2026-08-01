@@ -1,7 +1,7 @@
 """
 Adapter: Landing Price.
 
-Extrai preços praticados nas landings dos concorrentes (dos top ads da Meta).
+Extrai preços praticados nas landings dos concorrentes (dos top ads do Apify).
 Estratégia HYBRID em 2 níveis:
   Nível 1 (grátis): GET com requests, timeout 10s, User-Agent browser, sem JS.
   Nível 2 (Firecrawl, só se nível 1 não encontrar preço): POST /v2/scrape, 1 credit/página.
@@ -26,6 +26,7 @@ import re
 import time
 import json as json_lib
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -42,6 +43,16 @@ BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
+
+
+def _is_ad_library_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return True
+    hostname = (parsed.hostname or "").casefold()
+    path = (parsed.path or "").casefold()
+    return hostname in {"facebook.com", "www.facebook.com", "m.facebook.com"} and "/ads/library" in path
 
 
 def _extract_jsonld_price(html: str) -> list[float] | None:
@@ -164,7 +175,7 @@ def fetch_price(url: str) -> dict[str, Any] | None:
     Returns:
         {"source_url": str, "prices": [float, ...], "via": "http"|"firecrawl"} ou None se falhar
     """
-    if not url:
+    if not url or _is_ad_library_url(url):
         return None
 
     # ── Nível 1: HTTP simples ──
@@ -261,12 +272,12 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
     """
     Extrai preços das landings dos top 3 ads por longevidade.
 
-    Dos top_ads, usa o ad_snapshot_url como link da landing.
-    Se a Meta API não devolver link de destino, marca como indisponível.
+    Dos top_ads, usa exclusivamente landing_url; links da Ad Library são
+    identificadores de origem e nunca são landings.
     Máximo 3 fetches, sem retries.
 
     Args:
-        ads_data: dict devolvido por meta_ads.fetch()
+        ads_data: dict devolvido por apify_ads.fetch()
 
     Returns:
         {
@@ -275,7 +286,7 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
         }
     """
     if "error" in ads_data or not ads_data:
-        return {"error": "sem dados: Meta Ads indisponível (não foi possível extrair landings)"}
+        return {"error": "sem dados: Facebook Ad Library via Apify indisponível (não foi possível extrair landings)"}
 
     top_ads = ads_data.get("top_ads", [])
     if not top_ads:
@@ -288,12 +299,12 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
     firecrawl_used = False
 
     for ad in top_ads[:MAX_FETCHES]:
-        link = ad.get("link", "")
-        if not link:
-            errors.append("sem dados: link de destino indisponível para um dos top ads")
+        landing_url = ad.get("landing_url", "")
+        if not landing_url or _is_ad_library_url(landing_url):
+            errors.append("sem dados: landing_url indisponível para um dos top ads")
             continue
 
-        result = fetch_price(link)
+        result = fetch_price(landing_url)
         if result and result.get("prices"):
             all_prices.extend(result["prices"])
             sources += 1

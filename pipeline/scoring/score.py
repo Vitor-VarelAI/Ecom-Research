@@ -108,7 +108,7 @@ def compute(trends_data: dict[str, Any], csv_data: dict[str, Any], ads_data: dic
     Args:
         trends_data: dict devolvido por adapters/trends.py
         csv_data: dict devolvido por adapters/keyword_csv.py
-        ads_data: dict devolvido por adapters/meta_ads.py
+        ads_data: dict devolvido por adapters/apify_ads.py
 
     Returns:
         {

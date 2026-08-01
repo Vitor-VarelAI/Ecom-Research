@@ -220,6 +220,11 @@ class TestFetchPrice:
         result = landing_price.fetch_price("")
         assert result is None
 
+    def test_ad_library_url_is_never_fetched(self):
+        with patch.object(landing_price.requests, "get", side_effect=AssertionError("Ad Library URL fetched")), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Ad Library URL sent to Firecrawl")):
+            assert landing_price.fetch_price("https://www.facebook.com/ads/library/?id=123") is None
+
 
 # ── Tests: Firecrawl fallback (nível 2) ─────────────────────────────────────
 
@@ -314,12 +319,12 @@ class TestFetchPricesFromAds:
     def test_ads_with_no_links_returns_error(self):
         ads_data = {
             "top_ads": [
-                {"advertiser": "X", "link": "", "days_active": 30},
+                {"advertiser": "X", "landing_url": "", "days_active": 30},
             ]
         }
         result = landing_price.fetch_prices_from_ads(ads_data)
         assert "error" in result
-        assert "link de destino indisponível" in result["error"]
+        assert "landing_url indisponível" in result["error"]
 
     def test_error_in_ads_data(self):
         result = landing_price.fetch_prices_from_ads({"error": "no data"})
@@ -328,8 +333,8 @@ class TestFetchPricesFromAds:
     def test_fetches_from_top_ads_with_links(self):
         ads_data = {
             "top_ads": [
-                {"advertiser": "A", "link": "https://ex.com/a", "days_active": 100},
-                {"advertiser": "B", "link": "https://ex.com/b", "days_active": 80},
+                {"advertiser": "A", "landing_url": "https://ex.com/a", "days_active": 100},
+                {"advertiser": "B", "landing_url": "https://ex.com/b", "days_active": 80},
             ]
         }
 
@@ -357,7 +362,7 @@ class TestFetchPricesFromAds:
     def test_all_fetches_fail_gracefully(self):
         ads_data = {
             "top_ads": [
-                {"advertiser": "A", "link": "https://ex.com/a", "days_active": 100},
+                {"advertiser": "A", "landing_url": "https://ex.com/a", "days_active": 100},
             ]
         }
 
@@ -370,10 +375,10 @@ class TestFetchPricesFromAds:
         """Apenas os primeiros 3 ads são usados para fetch de preços."""
         ads_data = {
             "top_ads": [
-                {"advertiser": "A", "link": "https://ex.com/1", "days_active": 100},
-                {"advertiser": "B", "link": "https://ex.com/2", "days_active": 90},
-                {"advertiser": "C", "link": "https://ex.com/3", "days_active": 80},
-                {"advertiser": "D", "link": "https://ex.com/4", "days_active": 70},  # ignorado
+                {"advertiser": "A", "landing_url": "https://ex.com/1", "days_active": 100},
+                {"advertiser": "B", "landing_url": "https://ex.com/2", "days_active": 90},
+                {"advertiser": "C", "landing_url": "https://ex.com/3", "days_active": 80},
+                {"advertiser": "D", "landing_url": "https://ex.com/4", "days_active": 70},  # ignorado
             ]
         }
 

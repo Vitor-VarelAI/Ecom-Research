@@ -1,175 +1,100 @@
-# ECOM-RESEARCH — Pipeline de Research de Nichos
+# ECOM-RESEARCH
 
-Pipeline CLI para pesquisa automatizada de keywords para e-commerce.
-Input: keyword → Output: research-pack.md com score determinístico.
+CLI determinístico para transformar uma keyword num research pack. O pipeline usa anúncios ativos existentes como prova de procura; o score organiza sinais, mas não escolhe produto, país ou campanha. Qualquer sugestão é advisory e precisa de aprovação manual.
 
-## Setup (< 10 passos)
+## Setup
 
 ```bash
-# 1. Clonar o repo
-git clone https://github.com/Vitor-VarelAI/Ecom-Research.git
-cd Ecom-Research
-
-# 2. Python 3.12+ (já deve estar no Contabo)
-python3 --version
-
-# 3. Criar virtualenv
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 4. Instalar dependências
 pip install -r requirements.txt
-
-# 5. Configurar .env
 cp .env.example .env
-# Editar .env com as credenciais reais:
-#   META_ACCESS_TOKEN  — https://developers.facebook.com/ → criar app → token ads_read
-#   SERPAPI_KEY        — https://serpapi.com/ (free tier: 250 searches/mês)
-#   TELEGRAM_BOT_TOKEN — (opcional) token do bot Telegram
-#   TELEGRAM_CHAT_ID   — (opcional) ID do chat Telegram
-
-# 6. Exportar CSV do Google Keyword Planner
-#    No Google Ads → Keyword Planner → descarregar CSV
-#    Colocar em: data/seu-export.csv
-
-# 7. Configurar keywords
-#    Editar config/keywords.txt (uma keyword por linha)
-
-# 8. Testar
-python run.py "mochila personalizada"
-# Verificar output em: packs/
-
-# 9. Correr testes
-pip install pytest
-pytest tests/ -v
 ```
+
+O modo full requer `APIFY_API_TOKEN` e `SERPAPI_KEY`. O repositório não contém credenciais Telegram localmente e o `.env` está ignorado pelo Git. Não alteres `config/keywords.txt` para aceitar sugestões: elas aparecem no pack e no digest com `status: proposed`.
+
+- `APIFY_API_TOKEN`: token do Apify para `curious_coder~facebook-ads-library-scraper`.
+- `SERPAPI_KEY`: Trends e snapshot SEO.
+- `FIRECRAWL_KEY`: fallback opcional para landings sem preço no HTML.
+- `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`: entrega opcional, sempre send-only.
+
+O volume e CPC vêm de um export CSV manual do Google Keyword Planner colocado em `data/`. Sem CSV, o pipeline degrada graciosamente, mas o score perde esse sinal.
 
 ## Uso
 
 ```bash
-# Keyword única (modo full: Trends + SEO + Meta + CSV)
-python run.py "mochila personalizada"
-
-# Batch — todas as keywords em config/keywords.txt (sem consumir a lista)
-python run.py --all
-
-# Batch com digest no stdout (ligar ao Telegram bridge depois)
-python run.py --all --digest
-
-# Modos agendados (cron):
-python run.py --sunday       # Deep run: consome keywords.txt, Full mode
-python run.py --wednesday    # Pulse Meta: refresh ads, 0 calls SerpAPI
-python run.py --monthly      # Re-score watchlist OBSERVAR (1 call/kw)
-python run.py --auto         # Auto-detecta o dia e despacha
-
-# Especificar CSV manual
-python run.py "keyword" --csv data/meu-export.csv
+.venv/bin/python run.py "mochila personalizada"
+.venv/bin/python run.py --all
+.venv/bin/python run.py --sunday
+.venv/bin/python run.py --wednesday
+.venv/bin/python run.py --monthly
+.venv/bin/python run.py --auto --digest
 ```
 
-## Quota SerpAPI
+`--sunday` lê as keywords ativas sem as reescrever. `--auto` executa todas as ações que coincidirem com a data: no dia 1 executa primeiro o re-score mensal; depois executa domingo ou quarta-feira quando aplicável. Cada ação produz o seu próprio digest.
 
-Free tier: **250 searches/mês**. Hard stop interno: **230 calls** (margem de segurança).
+## Facebook Ad Library via Apify
 
-### Custo por operação
+Cada keyword faz uma única chamada POST, com custo do actor limitado a uma invocação e sample de 100, com timeout de conexão/leitura `(10, 135)`, `count=100` e uma URL global da Ad Library com `active_status=active`, `ad_type=all`, `country=ALL`, `is_targeted_country=false`, `media_type=all`, `search_type=keyword_unordered` e `q` URL-encoded. Não há retries.
 
-| Operação | Calls SerpAPI | Modo |
-|---|---|---|
-| Keyword novo (Full) | 3 | Trends timeseries + Related queries + SEO SERP |
-| --wednesday (pulse Meta) | 0 | Só Meta Ad Library (grátis) |
-| --monthly (re-score OBSERVAR) | 1 por keyword | Só Trends timeseries |
-| Cache hit (mesma keyword <30d) | 0 | Dados em /data/cache/ |
+A resposta é normalizada localmente com filtros determinísticos: status inativo é removido, texto é accent-folded, uma keyword exige o token e queries com vários tokens exigem pelo menos 60% de cobertura, com a frase exata sempre aceite. Duplicados são removidos por `ad_archive_id`, depois URL, depois `page_id + copy + date`. O pack guarda amostra, descartes, duplicados, IDs, top ads, advertisers e saturação; o limite de 100 permite que `alta` (>50) seja atingível.
 
-### Orçamento mensal (250 calls)
+Um resultado vazio é sucesso e força `DESCARTAR`, sem SEO nem landing. Ainda faz uma call Related Queries da SerpAPI, cacheada por 30 dias e contada na quota, para propor alternativas. Uma falha do Apify continua Trends, SEO e CSV, mas produz `DADOS INSUFICIENTES` e nunca um `DESCARTAR` falso.
 
-| Rubrica | Calls | Notas |
-|---|---|---|
-| 4 domingos × ~8-10 keywords | ~120 | 24-30 calls por domingo |
-| Watchlist mensal (day 1) | ~20 | Máx 20 keywords em OBSERVAR |
-| **Buffer livre** | **~110** | Curiosidade manual, falhas, re-runs |
-| **Total** | **250** | |
+## Custos e modos
 
-### Regras de proteção
+| Modo | Apify | SerpAPI | SEO/landing | Dados usados |
+|---|---:|---:|---|---|
+| Full / domingo | 1 por keyword | Timeseries + related, salvo cache | Ambos, exceto falha Apify ou zero ads | Fresh |
+| Quarta | 1 chamada paga/bounded por keyword elegível | 0 | 0 | Trends, CSV, SEO, landing, sugestões e score anteriores |
+| Dia 1 | 0 | 1 timeseries forçada por keyword | 0 | Ads, CSV, SEO, landing e sugestões anteriores |
 
-1. **Cache 30 dias.** Re-run da mesma keyword = zero calls. Trends/SEO não mudam em semanas.
-2. **Contador local** em `data/quota.json`. Reset dia 1 do mês. Hard stop aos 230.
-3. **Meta como pre-filter.** Se keyword tem 0 ads ativos → DESCARTAR sem gastar SerpAPI.
-4. **Pulse de quarta:** 0 calls SerpAPI. Só refresh Meta (fonte grátis).
+A quarta compara `ad_ids` e advertisers, mas se o Apify falhar relata o erro e preserva o último pack bom. O mensal é um caminho de rescore separado: não faz refresh de anúncios nem chama Firecrawl.
 
-## Output
+## Sugestões e mercados
 
-```
-packs/YYYY-MM-DD--{keyword-slug}.md   ← research-pack (schema PLAN.md)
-data/YYYY-MM-DD--{keyword-slug}.json  ← dados brutos
-data/cache/                           ← cache SerpAPI (30 dias)
-data/quota.json                       ← contador de calls do mês
-```
+`pipeline/suggestions.py` normaliza resultados Related Queries numéricos e `Breakout`, ordena Breakout primeiro e depois valores numéricos descendentes, remove vazios, a keyword original, duplicados, URLs e interrogativas. O JSON guarda `suggested_keywords`; o Markdown usa a secção **Sugestões de keywords — aprovação manual** e declara que nada foi adicionado a `config/keywords.txt`.
 
-## Cron (instalar no Contabo)
+A secção **Sinais por mercado — decisão manual** lista PT, ES, FR e os top geos de Trends com `country`, `Trends demand`, `advertisers observed` e `ads observed`. Não existe ranking automático de país. O digest diz `Mercado: decisão manual`.
+
+## Landings e Telegram
+
+Preços usam exclusivamente `top_ads[].landing_url`; links da Ad Library são rejeitados. São tentadas no máximo três landings, primeiro por HTTP e depois por Firecrawl, com falhas isoladas e sem retries. Quarta e mensal reutilizam o resultado anterior.
+
+Telegram é send-only: cada mensagem é plain text, no máximo 4000 caracteres, dividida em quebras de linha quando possível. O payload contém apenas `chat_id`, `text` e `disable_web_page_preview=true`. Falta de credenciais, timeout, HTTP diferente de 200, JSON inválido ou `ok != true` imprime o digest completo no stdout e não interrompe o pipeline. O token nunca é escrito em logs.
+
+## Saída
+
+- `packs/YYYY-MM-DD--<keyword>.md`: decisão, evidência, sinais de mercado, sugestões e próximo passo advisory.
+- `data/YYYY-MM-DD--<keyword>.json`: raw pack com a chave `facebook_ads` e `suggested_keywords`.
+- `data/cache/`: cache de Trends/SEO/Related Queries por 30 dias.
+- `data/quota.json`: contador SerpAPI e créditos Firecrawl.
+
+As recomendações são operacionais, não decisões automáticas: `AVANÇAR` prepara o ad-machine após aprovação manual, `OBSERVAR` mantém watchlist/recheck, `DESCARTAR` arquiva salvo nova evidência e `DADOS INSUFICIENTES` pede retry do Apify.
+
+## Verificação
 
 ```bash
-# Editar crontab
-crontab -e
+.venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m compileall run.py pipeline
+.venv/bin/python run.py --help
+git diff --check
+```
 
-# Adicionar (corre todos os dias às 08:00 UTC)
+Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **124 testes verdes**.
+
+## Ativação live
+
+O código não instala cron automaticamente. Antes de ativar:
+
+1. Configurar e testar `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`.
+2. Validar o CSV real do Keyword Planner.
+3. Executar uma única keyword live e rever manualmente o Markdown/JSON, incluindo relevância, dedupe, custo Apify, landing e sugestões.
+4. Regenerar antes de produção qualquer credencial que tenha sido partilhada numa conversa.
+5. Só então instalar o cron diário das 08:00:
+
+```cron
 0 8 * * * cd /home/vitor/projects/Ecom-Research && /home/vitor/projects/Ecom-Research/.venv/bin/python run.py --auto --digest >> /home/vitor/projects/Ecom-Research/data/cron.log 2>&1
 ```
 
-O `--auto` deteta o dia:
-- **Domingo:** deep run (consome keywords.txt, move para keywords_done.txt)
-- **Quarta:** pulse Meta nos packs AVANÇAR/OBSERVAR (<14d)
-- **Dia 1:** re-score watchlist OBSERVAR
-- **Outros dias:** exit 0
-
-## Telegram Bridge
-
-A função `send_digest()` em `run.py` é um **stub** — faz print para stdout.
-Para ligar ao Telegram, substituir o corpo da função por:
-
-```python
-def send_digest(text: str) -> None:
-    import requests
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
-        logger.warning("Telegram não configurado — a enviar para stdout")
-        print(text)
-        return
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-```
-
-## Estrutura
-
-```
-.
-├── run.py                    # CLI principal
-├── pipeline/
-│   ├── quota.py              # Contador de quota SerpAPI (hard stop 230/mês)
-│   ├── adapters/
-│   │   ├── meta_ads.py       # Meta Ad Library API
-│   │   ├── trends.py         # Google Trends (SerpAPI — 2 calls: timeseries + related)
-│   │   ├── serp_seo.py       # Google SERP snapshot (SerpAPI — 1 call)
-│   │   └── keyword_csv.py    # Parser CSV Keyword Planner
-│   ├── scoring/
-│   │   └── score.py          # Score determinístico (0-100)
-│   └── output/
-│       └── pack.py           # Gerador de research-pack.md + .json
-├── config/
-│   ├── keywords.txt          # Lista de keywords a processar (1 por linha)
-│   └── keywords_done.txt     # Keywords já processadas (domingos)
-├── packs/                    # Output: research-packs .md
-├── data/                     # Dados brutos .json + cache + quota.json
-├── tests/                    # Testes pytest
-├── .env.example              # Template de credenciais
-└── PLAN.md                   # Documento de arquitectura
-```
-
-## Design decisions
-
-- **Zero dependências web** — CLI puro, nada de FastAPI/Flask
-- **Zero LLM calls** na Fase 1 — score é matemática pura
-- **Degradação graciosa** — se um adapter falha, os outros continuam
-- **Cache 30 dias** no SerpAPI — 3 calls por keyword novo, 0 em re-runs
-- **Meta pre-filter** — Meta primeiro (grátis), 0 ads = DESCARTAR sem gastar quota
-- **Credenciais via .env** — nunca hardcoded
-- **Hard stop 230 calls/mês** — contador local em data/quota.json
+O cron verifica a data diariamente, mas só atua ao domingo, à quarta-feira e no dia 1 do mês.

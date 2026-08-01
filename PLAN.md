@@ -1,247 +1,67 @@
-# ECOM-RESEARCH — Plano de Revival — 2026-07-14
+# ECOM-RESEARCH — plano operacional
 
-Repo original: https://github.com/Vitor-VarelAI/Ecom-Research (1 commit, 2025-07-15, esqueleto Streamlit sem lógica)
+## Objetivo
 
-## Decisão de arquitetura
+Manter um pipeline CLI reproduzível em que anúncios ativos existentes provam procura. O utilizador decide produto, mercado, margem e campanha; score, sugestões e recomendações são advisory.
 
-Morre a UI. O projeto renasce como **pipeline CLI no Contabo + skill no vault**, agent-native: files as interface. Output é um `research-pack.md` por keyword, consumido pelo `ad-machine` como input de campanha e entregue diariamente via Telegram.
+## Fluxo Full
 
-Razões:
-1. Um único user (Vitor). Dashboard Next.js + FastAPI = 2 serviços a manter com ROI zero.
-2. Todo o sistema existente (skills, vault, Telegram bridge, ad-machine) fala em ficheiros. Um dashboard vive fora do circuito; um .md entra direto.
-3. KPI original ainda válido: reduzir research de 3h para 15min. Um digest diário no Telegram cumpre isto sem UI.
+1. Fazer uma chamada ao actor Apify `curious_coder~facebook-ads-library-scraper`, com uma URL global da Facebook Ad Library por keyword e `count=100`.
+2. Normalizar localmente, retirar anúncios inativos/irrelevantes com accent-folding e deduplicar por ID, URL ou página+copy+data.
+3. Se houver anúncios, executar Trends, SEO, CSV e preços de landing. Se não houver, forçar `DESCARTAR`, saltar SEO/landing e fazer apenas a call Related Queries cacheada para sugestões.
+4. Se a fonte Apify falhar, continuar Trends/SEO/CSV, marcar `DADOS INSUFICIENTES` e não produzir uma decisão negativa.
+5. Persistir Markdown e JSON, incluindo `facebook_ads` e `suggested_keywords`.
 
-UI só se doer, e nesse caso: página Next.js estática a ler os JSONs do VPS. Sem API entre eles. Não é Fase de nada, é hipótese futura.
+## Contrato Apify
 
-## O que se mantém do original
+A requisição usa POST para o endpoint `run-sync-get-dataset-items`, `Authorization: Bearer APIFY_API_TOKEN`, `Content-Type: application/json`, query `clean=true&format=json`, timeout `(10,135)` e nenhum retry. O payload contém uma URL global com `active_status=active`, `ad_type=all`, `country=ALL`, `is_targeted_country=false`, `media_type=all`, `q` URL-encoded, `search_type=keyword_unordered`, e `count=100`.
 
-- Conceito: keyword → multi-source → score → decisão
-- Data flow dos docs (`extracted_docs/DATA_FLOW.md`)
-- KPI: 1 insight útil/dia, 3h → 15min
-- Keyword Planner via CSV manual (não há API grátis, continua certo)
+O resultado tem `source`, `query`, `sample_limit`, `sample_capped`, `raw_ads_count`, `filtered_out_count`, `duplicates_removed`, `total_ads`, `ad_ids`, `top_ads`, `advertisers`, `market_proven`, `copy_examples` e `saturation`. Cada top ad tem `ad_archive_id`, advertiser, page ID, longevidade, link da Ad Library, `landing_url`, copy, plataformas e países.
 
-## O que morre
+## Cadência e limites
 
-- Streamlit e todo o código de `app/` e `components/` (era placeholder)
-- pytrends (Google bloqueia desde 2024)
-- Scraping direto do TikTok como fonte primária (anti-bot 2026)
-- requirements.txt de 2025
-
-## Fontes de dados (2026, por ordem de prioridade)
-
-| Fonte | Via | Custo | Nota |
-|---|---|---|---|
-| Meta Ad Library | API oficial | Grátis | **Fonte central.** Na UE, o DSA obriga a Meta a expor TODOS os ads (comerciais incluídos) com alcance por país. Para mercado PT/ES é a fonte mais rica que existe. Requer app FB + token. |
-| Google Trends | SerpAPI | 250 searches/mês grátis | Cache agressiva (1 keyword = 1 call, guardar 30 dias). Se apertar: Glimpse ou scraping com cache. |
-| Keyword Planner | CSV manual | Grátis | Vitor exporta, pipeline faz parse. |
-| Reddit | PRAW | Grátis (<100 QPM) | Fase 2. |
-| YouTube | Data API v3 | Grátis (10k unid/dia) | Fase 2. |
-| TikTok Creative Center | Scraper no VPS | Grátis, frágil | Fase 2. Aceitar que parte; nunca bloquear o pipeline por causa dele. |
-
-## Schema do research-pack (o contrato)
-
-Um ficheiro por keyword por run: `packs/YYYY-MM-DD--{keyword-slug}.md`
-Dados brutos em paralelo: `data/YYYY-MM-DD--{keyword-slug}.json`
-
-```markdown
-# RESEARCH PACK — {keyword} — {data}
-
-## Veredicto
-Score: {0-100} | {AVANÇAR / OBSERVAR / DESCARTAR}
-{1-2 linhas: porquê, em linguagem de decisão}
-
-## Trend Signal (Google Trends via SerpAPI)
-- Direção 90 dias: {subida/estável/queda} ({slope %})
-- Sazonalidade: {sim/não + pico}
-- Geos quentes: {top 3 países}
-
-## Volume & CPC (Keyword Planner CSV)
-- Volume mensal: {n} | CPC médio: €{n}
-- Top 5 keywords relacionadas com volume
-
-## Ads Ativos (Meta Ad Library)
-- Total de ads ativos para o nicho: {n}
-- Top 3 ads por longevidade (ad a correr há semanas = ad que paga):
-  - {advertiser} | ativo há {n} dias | alcance UE: {n} | link
-- Ângulos de copy dominantes: {2-3 bullets}
-- Saturação: {baixa <10 ads / média 10-50 / alta >50}
-
-## SEO snapshot (SerpAPI engine google, PT)
-- Top 10 orgânicos: {domínio + título, quem domina}
-- Ads no SERP: {n} (proxy de competição paga)
-- PAA questions: {top 3, matéria-prima para conteúdo}
-- Oportunidade SEO: {alta se top 10 fraco / baixa se dominado por marketplaces}
-
-## Feedback (Fase 2 — Reddit/YouTube)
-- Clusters de dor/desejo: {bullets}
-- Red flags: {queixas recorrentes}
-
-## Score breakdown
-trend({peso 0.3}) + volume({0.2}) + ad_longevity({0.3}) + saturação_invertida({0.2}) = {total}
-Fórmula determinística. Sem LLM no score.
-
-## Próximo passo sugerido
-{1 linha: ex. "alimentar ad-machine com este pack" ou "reavaliar em 14 dias"}
-```
-
-Regras do schema:
-1. **Veredicto primeiro.** O Vitor lê 3 linhas no Telegram e decide se abre o resto.
-2. Score determinístico e reproduzível. LLM só entra na Fase 3 (clustering de comentários), delegado ao DeepSeek.
-3. Secções sem dados escrevem "sem dados: {razão}", nunca inventam.
-
-## Cadência e quota (regime 80/20)
-
-Contexto: projeto side, 2 pontos de contacto por semana. O cron corre diário no sentido técnico (verifica o dia, decide o que fazer), mas o Vitor só interage domingo e quarta.
-
-### Quotas confirmadas (julho 2026)
-
-| Fonte | Free tier | Binding? |
-|---|---|---|
-| SerpAPI | **250 searches/mês**, 50/hora | SIM — única quota que morde |
-| Meta Ad Library | Grátis, rate limits Graph API standard | Não |
-| YouTube Data v3 | 10.000 units/dia (search=100, comments=1) | Não |
-| Reddit PRAW | 100 queries/min | Não |
-| Keyword Planner | CSV manual | Não |
-
-### Custo SerpAPI por keyword (modo Full)
-
-Cada `data_type` do engine google_trends é 1 search separado:
-1. Trends timeseries (90 dias) = 1 call
-2. Related queries = 1 call
-3. SEO SERP orgânico (engine google: quem ranka, ads no SERP, PAA) = 1 call
-
-**Total: 3 calls por keyword novo.**
-
-### Regime semanal
-
-**Domingo — deep run (dia caro):**
-- 8-10 keywords novos em modo Full = 24-30 calls SerpAPI
-- Meta Ad Library para todos (grátis)
-- Digest completo no Telegram ao fim do run: veredicto em 3 linhas por keyword, para planear a semana
-
-**Quarta — pulse (dia grátis, 0 calls SerpAPI):**
-- Refresh Meta Ad Library APENAS nos keywords com veredicto AVANÇAR/OBSERVAR da semana
-- Detetar: ads novos a entrar no nicho, ads antigos que morreram, longevidade atualizada
-- Digest curto no Telegram: "os ads mexeram?"
-- Racional: Trends/SEO quase não mudam em 3 dias; ads na Meta mudam depressa e a fonte é grátis
-
-**Dia 1 do mês — watchlist re-score:**
-- Keywords em OBSERVAR: re-score com 1 call cada (timeseries só)
-- Watchlist máx 20 keywords = 20 calls/mês
-
-### Orçamento mensal
-
-| Rubrica | Calls |
+| Ação | Comportamento |
 |---|---|
-| 4 domingos × ~30 | 120 |
-| Watchlist mensal | 20 |
-| **Buffer livre** (curiosidade manual, falhas, re-runs) | **110** |
-| **Total** | **250** |
+| Full/domingo | Um Apify por keyword; Trends/SEO/landing só conforme o resultado; Related Queries cacheada quando zero ads |
+| Quarta | Uma chamada paga e bounded de Apify por keyword elegível; zero SerpAPI, Firecrawl ou landing; reutiliza todos os outros campos; compara IDs e advertisers |
+| Mensal | Uma timeseries Trends forçada por keyword OBSERVAR; zero Apify, SEO, landing ou Firecrawl; rescore com os dados reutilizados |
+| Auto no dia 1 | Mensal primeiro; depois domingo ou quarta; cada ação conserva o próprio digest |
 
-Capacidade: ~35-40 nichos novos analisados a fundo/mês + 20 em observação contínua. Custo €0.
+Cache de Trends, SEO e Related Queries dura 30 dias. A quota SerpAPI mantém hard stop local em 230 chamadas. O limite Apify por execução é uma invocação por keyword e o sample cap é 100.
 
-### Regras de proteção do budget (implementar no pipeline)
+## Sugestões
 
-1. **Cache 30 dias.** Re-run da mesma keyword dentro de 30 dias = zero calls SerpAPI (Trends não muda o suficiente em 7 dias).
-2. **Contador local de quota** em `data/quota.json` (calls do mês corrente, reset dia 1). Aos 230 calls, o pipeline recusa keywords novos e avisa no Telegram. Nunca deixar a SerpAPI devolver 429 às cegas.
-3. **Meta como pre-filter.** Ordem de execução: Meta Ad Library PRIMEIRO (grátis). Se a keyword tem 0 ads ativos, gravar pack com veredicto DESCARTAR (razão: "sem mercado de ads ativo") e NÃO gastar as 3 calls de SerpAPI. Poupa 30-40% da quota.
-4. **Watchlist refresh mensal, não semanal.**
+Related Queries passa por `extract_keyword_suggestions`: valores numéricos e `Breakout` são normalizados, Breakout vem primeiro, números ordenam descendentemente, e removem-se vazios, origem, duplicados, URLs e interrogativas. Cada entrada persistida tem `status: proposed`. Nunca se escreve em `config/keywords.txt` nem se executa uma sugestão automaticamente; o digest agrega no máximo três por fonte.
 
-### Lógica de dias no cron
+## Decisão e mercados
 
-```
-cron diário →
-  se domingo: deep_run(config/keywords.txt, modo=full)
-  se quarta:  meta_pulse(packs com veredicto AVANÇAR|OBSERVAR, <14 dias)
-  se dia 1:   watchlist_rescore(packs OBSERVAR, 1 call/kw)
-  senão:      exit 0
-```
+O score mantém os pesos `trend 0.3 + volume 0.2 + ad_longevity 0.3 + saturação_invertida 0.2`. A recomendação é:
 
-## Fases
+- `AVANÇAR`: preparar ad-machine depois de aprovação manual.
+- `OBSERVAR`: manter watchlist e voltar a verificar.
+- `DESCARTAR`: arquivar salvo nova evidência.
+- `DADOS INSUFICIENTES`: repetir quando Apify estiver disponível.
 
-### Fase 0 — Setup (1 sessão, Vitor)
-- [ ] Criar app FB + token Meta Ad Library API
-- [ ] Conta SerpAPI (free tier)
-- [x] Repo limpo: branch legacy, main novo
-- [x] Estrutura: `/pipeline` (Python), `/packs`, `/data`, `/config/keywords.txt`
+O pack não escolhe país. **Sinais por mercado — decisão manual** lista PT, ES, FR e os top geos de Trends nas colunas `country`, `Trends demand`, `advertisers observed` e `ads observed`. O digest usa `Mercado: decisão manual`.
 
-### Fase 1 — Pipeline mínimo (1 fim de semana, delegável ao DeepSeek)
-- [x] Adapter Meta Ad Library (interface comum: `fetch(keyword) -> dict`)
-- [ ] Adapter SerpAPI Trends com cache em disco (30 dias) + related queries
-- [ ] Adapter SerpAPI SEO (engine google, SERP snapshot)
-- [ ] Parser CSV Keyword Planner
-- [ ] Scoring determinístico (pesos no schema acima)
-- [ ] Gerador de research-pack.md a partir dos dicts
-- [ ] Quota counter (data/quota.json, hard stop 230)
-- [ ] Pre-filter Meta (Meta primeiro, 0 ads = DESCARTAR sem SerpAPI)
-- [ ] CLI modos: --sunday, --wednesday, --monthly, --auto
-- [ ] Cron diário no Contabo + push do Veredicto para o Telegram bridge
-- Critério de feito: `python run.py "mochila personalizada"` produz pack completo e chega ao Telegram
+## Landing e Telegram
 
-### Fase 2 — Fontes secundárias (só após Fase 1 provar valor)
-- [ ] PRAW Reddit adapter
-- [ ] YouTube Data API adapter
-- [ ] TikTok Creative Center scraper (best-effort, nunca bloqueia o run)
+`landing_price.py` lê apenas `top_ads[].landing_url`, rejeita URLs de Ad Library e tenta no máximo três páginas: HTTP primeiro, Firecrawl depois, sempre best-effort. Quarta e mensal reutilizam o preço anterior.
 
-### Fase 3 — Clustering IA
-- [ ] Comentários Reddit/YouTube → DeepSeek via delegation-gate → clusters de dor/desejo
-- [ ] Só esta fase toca em LLM
+`pipeline.delivery.telegram.send` envia plain text em chunks de no máximo 4000 caracteres, sem parse mode, botões, callbacks ou webhook. Sem credenciais ou perante qualquer erro, imprime o digest completo e devolve `False`; o pipeline nunca cai e nunca regista o token.
 
-## Skill no vault (paralelo à Fase 1)
-- [ ] `ecom-research` skill: triggers "research de nicho", "vale a pena este produto", "pack de {keyword}"
-- [ ] A skill lê os packs existentes primeiro; só dispara run novo se o pack tiver >30 dias
-- [ ] Handoff direto para `ad-machine` quando veredicto = AVANÇAR
+## Estado atual
 
-## Kill criteria
+O código é CLI puro, sem chamadas LLM, sem cron instalado e sem alteração automática de decisões do utilizador. O output é a interface para consumo humano e eventual aprovação posterior pelo ad-machine. O baseline validado em 2026-08-01 tem 124 testes verdes; as integrações de rede são mockadas na suite.
 
-Se após **2 semanas de digests diários** nenhum pack alimentar o ad-machine nem gerar decisão de produto, o projeto morre. Custo total do falhanço: 1 fim de semana. Sem sunk cost.
+## Gate de ativação
 
-## Custo estimado
+A ativação live exige, por ordem:
 
-- SerpAPI free tier: €0 (250 searches/mês com cache 30 dias)
-- Meta Ad Library: €0
-- Compute: já pago (Contabo)
-- LLM: €0 na Fase 1-2; centavos na Fase 3 via DeepSeek
+1. Configurar e testar a entrega send-only com `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`.
+2. Validar um CSV real do Google Keyword Planner.
+3. Fazer um único full run live e rever manualmente relevância/dedupe do Apify, custo, landing, score e sugestões.
+4. Regenerar antes de produção credenciais que tenham sido expostas numa conversa.
+5. Instalar o cron apenas depois desse smoke passar.
 
----
-
-## Delta 2 — Decisão de produto (2026-07-14)
-
-O pack passa a responder "vendo este produto ou não, e onde" em 5 linhas. Três adições: sinal de escala por advertiser, preço praticado nas landings dos concorrentes, e tabela procura×concorrência por país. Novo bloco DECISÃO no topo do pack.
-
-Tudo usa dados que a Meta Ad Library já devolve mais fetch de landings — zero calls SerpAPI novas, zero impacto na quota. Score determinístico NÃO muda: os deltas são camada de decisão, não de scoring.
-
-### Delta A — Sinal de escala por advertiser (meta_ads.py)
-- Agrupar ads por page_id/page_name
-- Devolver campo `advertisers`: top 5 ordenados desc por nº de ads ativos, cada um com {page_name, active_ads, oldest_ad_days}
-- Flag `market_proven: true` quando qualquer advertiser tem ≥5 ads ativos
-- Pulse de quarta: delta de variantes por advertiser
-
-### Delta B — Preço praticado (novo: adapters/landing_price.py)
-- Dos top 3 ads por longevidade, extrair link da landing
-- Estratégia HYBRID em 2 níveis por landing:
-  - Nível 1 (grátis): GET com requests, timeout 10s, User-Agent browser, sem JS. Parse do HTML.
-  - Nível 2 (Firecrawl, só se nível 1 não encontrar preço): POST /v2/scrape (FIRECRAWL_KEY via .env), formato html+markdown. 1 credit/página. Nunca modo JSON extraction (5 credits).
-- Parser comum aos 2 níveis: JSON-LD schema.org Product/Offer PRIMEIRO, depois regex €XX/XX€/XX,XX EUR
-- Devolver price_range: {min, max, currency, sources, via: "http"|"firecrawl"}
-- Máx 3 landings por keyword, sem retries. Firecrawl: fetches sequenciais com pausa ≥6s entre calls
-- Contador de credits Firecrawl em data/quota.json (campo firecrawl_credits), soft warning no digest aos 800. Free tier: 1.000/mês, 10 req/min, 2 concurrent
-- Falha em todas as landings = "sem dados: landings não legíveis". NUNCA bloquear o run
-
-### Delta C — Tabela "Onde vender" (pack.py)
-- Cruzar top_geos do Trends com alcance por país dos ads (breakdown DSA)
-- Secção: | País | Procura (Trends 0-100) | Advertisers ativos | Alcance ads |
-- Linhas: PT, ES, FR + top 3 geos do Trends
-- Sem dados = "—", nunca omitir linha
-
-### Delta D — Bloco DECISÃO (pack.py)
-Substitui "Veredicto" no topo do pack:
-```
-{KEYWORD} — DECISÃO
-Vender?    {SIM/NÃO/OBSERVAR} {+ nota sazonal se seasonal=true}
-Onde?      {melhor país: procura alta + advertisers moderados}
-Preço:     {price_range} → sourcing manual: margem ok se custo < {min/3}
-Prova:     {advertiser líder: nome + variantes + dias} {ou "sem escala detetada"}
-Risco:     {saturação + 1 linha derivada dos dados}
-```
-Cada linha deriva de dados do pack, zero adjetivos. Digest do Telegram usa Vender?/Onde?/Prova como 3 linhas.
+Até ao gate passar, não declarar o pipeline em produção e não executar batches pagos.
