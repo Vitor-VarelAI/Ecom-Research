@@ -217,55 +217,56 @@ def _fetch_via_firecrawl(url: str) -> dict[str, Any] | None:
     if not api_key:
         return None
 
-    if not quota.can_spend_firecrawl(1):
-        logger.warning("Firecrawl: credits esgotados — a saltar")
-        return None
+    with quota.transaction(1, firecrawl=True) as reservation:
+        if not reservation.available:
+            logger.warning("Firecrawl: credits esgotados — a saltar")
+            return None
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "url": url,
-        "formats": ["html", "markdown"],
-    }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "url": url,
+            "formats": ["html", "markdown"],
+        }
 
-    try:
-        resp = requests.post(FIRECRAWL_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.debug("Firecrawl: erro de rede para %s — %s", url[:80], e)
-        return None
+        try:
+            resp = requests.post(FIRECRAWL_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            logger.debug("Firecrawl: erro de rede para %s — %s", url[:80], e)
+            return None
 
-    if resp.status_code != 200:
-        logger.debug("Firecrawl: HTTP %s para %s", resp.status_code, url[:80])
-        return None
+        if resp.status_code != 200:
+            logger.debug("Firecrawl: HTTP %s para %s", resp.status_code, url[:80])
+            return None
 
-    # Registar o credit
-    quota.spend_firecrawl(1)
+        # Registar o credit (só após HTTP 200, como antes)
+        reservation.charge(1)
 
-    try:
-        data = resp.json()
-    except ValueError:
-        logger.debug("Firecrawl: resposta não é JSON válido")
-        return None
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.debug("Firecrawl: resposta não é JSON válido")
+            return None
 
-    # Firecrawl devolve {data: {html: "...", markdown: "..."}}
-    content = data.get("data", {})
-    html = content.get("html", "") or ""
-    markdown = content.get("markdown", "") or ""
+        # Firecrawl devolve {data: {html: "...", markdown: "..."}}
+        content = data.get("data", {})
+        html = content.get("html", "") or ""
+        markdown = content.get("markdown", "") or ""
 
-    # Parser comum: JSON-LD primeiro, depois regex
-    prices = _extract_jsonld_price(html)
-    if not prices:
-        # Tentar regex no markdown também (landings JS podem ter preço no markdown)
-        prices = _extract_regex_price(html)
-    if not prices and markdown:
-        prices = _extract_regex_price(markdown)
+        # Parser comum: JSON-LD primeiro, depois regex
+        prices = _extract_jsonld_price(html)
+        if not prices:
+            # Tentar regex no markdown também (landings JS podem ter preço no markdown)
+            prices = _extract_regex_price(html)
+        if not prices and markdown:
+            prices = _extract_regex_price(markdown)
 
-    if not prices:
-        return None
+        if not prices:
+            return None
 
-    return {"source_url": url, "prices": prices, "via": "firecrawl"}
+        return {"source_url": url, "prices": prices, "via": "firecrawl"}
 
 
 def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:

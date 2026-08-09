@@ -21,7 +21,7 @@ def test_sunday_dispatches(monkeypatch):
          patch.object(run_module, "_run_wednesday") as wednesday, \
          patch.object(run_module, "_run_monthly") as monthly:
         assert run_module._auto_dispatch(send=False) == [{"keyword": "sun"}]
-    sunday.assert_called_once_with(send=False)
+    sunday.assert_called_once_with(send=False, csv_path=None)
     wednesday.assert_not_called()
     monthly.assert_not_called()
 
@@ -45,7 +45,7 @@ def test_day_one_sunday_runs_monthly_then_sunday(monkeypatch):
         calls.append("monthly")
         return [{"keyword": "monthly"}]
 
-    def sunday(send):
+    def sunday(send, csv_path=None):
         calls.append("sunday")
         return [{"keyword": "sunday"}]
 

@@ -16,6 +16,7 @@ Em caso de erro, devolve {"error": "razão"} — nunca levanta excepção.
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -59,8 +60,33 @@ def _cache_path(keyword: str) -> str:
     return os.path.join(CACHE_DIR, f"{_slugify(keyword)}_serp.json")
 
 
+def _valid_payload(data: dict[str, Any]) -> bool:
+    """A SEO cache hit must carry the full parsed shape: ``organic_results``
+    as a list, ``ads_count`` as a finite number, ``paa_questions`` as a list
+    and ``seo_opportunity`` as a non-empty string.  Anything else is a miss
+    — malformed valid JSON must never be served nor suppress a refresh."""
+    if not isinstance(data.get("organic_results"), list):
+        return False
+    ads_count = data.get("ads_count")
+    if isinstance(ads_count, bool) or not isinstance(ads_count, (int, float)):
+        return False
+    if not math.isfinite(float(ads_count)):
+        return False
+    if not isinstance(data.get("paa_questions"), list):
+        return False
+    opportunity = data.get("seo_opportunity")
+    if not isinstance(opportunity, str) or not opportunity:
+        return False
+    return True
+
+
 def _read_cache(keyword: str) -> dict[str, Any] | None:
-    """Lê cache se existir e for válida (< 30 dias)."""
+    """Lê cache se existir e for válida (< 30 dias).
+
+    JSON válido que não seja um dict, com ``_cached_at`` não numérico/não
+    finito, com payload de erro, ou com forma inválida é tratado como miss
+    — nunca crash, nunca refresh suprimido.  Payloads de erro são removidos.
+    """
     path = _cache_path(keyword)
     if not os.path.exists(path):
         return None
@@ -71,9 +97,25 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
         logger.warning("SERP cache: ficheiro corrompido para keyword=%s", keyword)
         return None
 
+    if not isinstance(data, dict):
+        logger.warning("SERP cache: payload não-dict para keyword=%s", keyword)
+        return None
+    if "error" in data:
+        logger.warning("SERP cache: payload de erro antigo removido para keyword=%s", keyword)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
     cached_ts = data.get("_cached_at", 0)
-    if time.time() - cached_ts > CACHE_TTL:
-        logger.info("SERP cache: expirada para keyword=%s", keyword)
+    if isinstance(cached_ts, bool) or not isinstance(cached_ts, (int, float)):
+        logger.warning("SERP cache: timestamp inválido para keyword=%s", keyword)
+        return None
+    if not math.isfinite(float(cached_ts)) or time.time() - cached_ts > CACHE_TTL:
+        logger.info("SERP cache: expirada/inválida para keyword=%s", keyword)
+        return None
+    if not _valid_payload(data):
+        logger.warning("SERP cache: payload com forma inválida para keyword=%s; miss", keyword)
         return None
 
     logger.info("SERP cache: HIT para keyword=%s (idade=%ds)", keyword, int(time.time() - cached_ts))
@@ -202,48 +244,52 @@ def fetch(keyword: str) -> dict[str, Any]:
         result = {k: v for k, v in cached.items() if k != "_cached_at"}
         return result
 
-    # 2. Cache miss — verificar quota
-    if not quota.can_spend(1):
-        return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
+    # 2. Cache miss — verificar quota (reserva/commit atómico sob lock)
+    with quota.transaction(1) as reservation:
+        if not reservation.available:
+            return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
 
-    # 3. Chamar API
-    api_key = _get_api_key()
-    if not api_key:
-        return {"error": "SERPAPI_KEY não definida em .env"}
+        # 3. Chamar API
+        api_key = _get_api_key()
+        if not api_key:
+            return {"error": "SERPAPI_KEY não definida em .env"}
 
-    params = {
-        "engine": "google",
-        "q": keyword,
-        "gl": "pt",
-        "hl": "pt",
-        "location": "Portugal",
-        "api_key": api_key,
-    }
+        params = {
+            "engine": "google",
+            "q": keyword,
+            "gl": "pt",
+            "hl": "pt",
+            "location": "Portugal",
+            "api_key": api_key,
+        }
 
-    try:
-        resp = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.warning("SerpAPI SERP: erro de rede — %s", e)
-        return {"error": f"Erro de rede na SerpAPI (SERP): {e}"}
+        try:
+            resp = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
+        except Exception as exc:
+            # Never propagate or log raw exception text/URL: it can echo the
+            # request, including the api_key query parameter.  Log only the
+            # exception type; return a stable sanitized message.
+            logger.warning("SerpAPI SERP: erro de rede (%s)", type(exc).__name__)
+            return {"error": f"Erro de rede na SerpAPI (SERP) ({type(exc).__name__})"}
 
-    if resp.status_code == 403:
-        return {"error": "SerpAPI SERP: chave inválida ou quota esgotada (HTTP 403)"}
-    if resp.status_code != 200:
-        logger.warning("SerpAPI SERP: HTTP %s — %s", resp.status_code, resp.text[:300])
-        return {"error": f"SerpAPI SERP: HTTP {resp.status_code}"}
+        if resp.status_code == 403:
+            return {"error": "SerpAPI SERP: chave inválida ou quota esgotada (HTTP 403)"}
+        if resp.status_code != 200:
+            logger.warning("SerpAPI SERP: HTTP %s", resp.status_code)
+            return {"error": f"SerpAPI SERP: HTTP {resp.status_code}"}
 
-    try:
-        raw = resp.json()
-    except ValueError:
-        return {"error": "SerpAPI SERP: resposta não é JSON válido"}
+        try:
+            raw = resp.json()
+        except ValueError:
+            return {"error": "SerpAPI SERP: resposta não é JSON válido"}
 
-    # Verificar erro da própria SerpAPI
-    if "error" in raw:
-        return {"error": f"SerpAPI SERP: {raw['error']}"}
+        # Verificar erro da própria SerpAPI
+        if "error" in raw:
+            return {"error": f"SerpAPI SERP: {raw['error']}"}
 
-    # Registar a call na quota
-    quota.spend(1)
+        # Registar a call na quota (só após sucesso, como antes)
+        reservation.charge(1)
 
-    result = _parse_serp_response(raw)
-    _write_cache(keyword, result)
-    return result
+        result = _parse_serp_response(raw)
+        _write_cache(keyword, result)
+        return result

@@ -16,6 +16,7 @@ Em caso de erro, devolve {"error": "razão"} — nunca levanta excepção.
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -55,8 +56,34 @@ def _related_cache_path(keyword: str) -> str:
     return os.path.join(CACHE_DIR, f"{_slugify(keyword)}_related.json")
 
 
+def _valid_full_payload(data: dict[str, Any]) -> bool:
+    """A Trends cache hit must look like a real timeseries result:
+    ``direction`` a non-empty string, ``slope_pct`` a finite number and
+    ``related_queries`` a list.  Anything else is a miss — malformed valid
+    JSON must never be served as evidence nor suppress a refresh."""
+    direction = data.get("direction")
+    if not isinstance(direction, str) or not direction:
+        return False
+    slope = data.get("slope_pct")
+    if isinstance(slope, bool) or not isinstance(slope, (int, float)):
+        return False
+    if not math.isfinite(float(slope)):
+        return False
+    if not isinstance(data.get("related_queries"), list):
+        return False
+    return True
+
+
 def _read_cache(keyword: str) -> dict[str, Any] | None:
-    """Lê cache se existir e for válida (< 30 dias)."""
+    """Lê cache se existir e for válida (< 30 dias).
+
+    Entradas com payload de erro são tratadas como miss e removidas: um erro
+    de parse nunca deve ficar em cache por 30 dias (correção de hardening).
+    JSON válido que não seja um dict (lista, string, null), com
+    ``_cached_at`` não numérico/não finito, ou com forma inválida
+    (``direction``/``slope_pct``/``related_queries`` ausentes ou errados) é
+    tratado como miss — nunca crash, nunca refresh suprimido.
+    """
     path = _cache_path(keyword)
     if not os.path.exists(path):
         return None
@@ -67,17 +94,54 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
         logger.warning("Trends cache: ficheiro corrompido para keyword=%s", keyword)
         return None
 
-    cached_ts = data.get("_cached_at", 0)
-    if time.time() - cached_ts > CACHE_TTL:
-        logger.info("Trends cache: expirada para keyword=%s", keyword)
+    if not isinstance(data, dict):
+        logger.warning("Trends cache: payload não-dict para keyword=%s", keyword)
+        return None
+    if "error" in data:
+        logger.warning("Trends cache: payload de erro antigo removido para keyword=%s", keyword)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+    cached_ts = _cached_at_value(data)
+    if cached_ts is None or time.time() - cached_ts > CACHE_TTL:
+        logger.info("Trends cache: expirada/inválida para keyword=%s", keyword)
+        return None
+    if not _valid_full_payload(data):
+        logger.warning("Trends cache: payload com forma inválida para keyword=%s; miss", keyword)
         return None
 
     logger.info("Trends cache: HIT para keyword=%s (idade=%ds)", keyword, int(time.time() - cached_ts))
     return data
 
 
+def _cached_at_value(data: dict[str, Any]) -> float | None:
+    """Finite numeric ``_cached_at``, or None when absent/invalid.
+
+    Rejects bools and non-finite floats (NaN/Infinity are valid JSON but
+    useless timestamps), so a poisoned cache entry is a miss, never a
+    fresh hit that suppresses a refresh.
+    """
+    value = data.get("_cached_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    timestamp = float(value)
+    if not math.isfinite(timestamp):
+        return None
+    return timestamp
+
+
 def _write_cache(keyword: str, data: dict[str, Any]) -> None:
-    """Escreve dados na cache com timestamp."""
+    """Escreve dados na cache com timestamp.
+
+    Payloads com erro nunca são cacheados: uma falha de parse é transitória e
+    não deve bloquear novos fetches durante 30 dias.
+    """
+    if "error" in data:
+        logger.warning("Trends cache: payload de erro NÃO escrito para keyword=%s", keyword)
+        return
     data["_cached_at"] = time.time()
     path = _cache_path(keyword)
     try:
@@ -98,7 +162,22 @@ def _read_related_cache(keyword: str) -> dict[str, Any] | None:
     except (json.JSONDecodeError, OSError):
         logger.warning("Trends related cache: ficheiro corrompido para keyword=%s", keyword)
         return None
-    if time.time() - data.get("_cached_at", 0) > CACHE_TTL:
+    if not isinstance(data, dict):
+        logger.warning("Trends related cache: payload não-dict para keyword=%s", keyword)
+        return None
+    if "error" in data:
+        logger.warning("Trends related cache: payload de erro antigo removido para keyword=%s", keyword)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    cached_ts = _cached_at_value(data)
+    if cached_ts is None or time.time() - cached_ts > CACHE_TTL:
+        logger.info("Trends related cache: expirada/inválida para keyword=%s", keyword)
+        return None
+    if not isinstance(data.get("related_queries"), list):
+        logger.warning("Trends related cache: payload sem lista de related queries para keyword=%s; miss", keyword)
         return None
     return {key: value for key, value in data.items() if key != "_cached_at"}
 
@@ -251,91 +330,95 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
             result = {k: v for k, v in cached.items() if k != "_cached_at"}
             return result
 
-    # 2. Cache miss — verificar quota
+    # 2. Cache miss — verificar quota (reserva/commit atómico sob lock)
     calls_needed = 1 if timeseries_only else 2
-    if not quota.can_spend(calls_needed):
-        return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
+    with quota.transaction(calls_needed) as reservation:
+        if not reservation.available:
+            return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
 
-    api_key = _get_api_key()
-    if not api_key:
-        return {"error": "SERPAPI_KEY não definida em .env"}
+        api_key = _get_api_key()
+        if not api_key:
+            return {"error": "SERPAPI_KEY não definida em .env"}
 
-    # --- Call 1: TIMESERIES ---
-    params_ts = {
-        "engine": "google_trends",
-        "q": keyword,
-        "date": "today+3-m",  # últimos 90 dias
-        "api_key": api_key,
-    }
-
-    try:
-        resp_ts = requests.get(SERPAPI_URL, params=params_ts, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.warning("SerpAPI Trends: erro de rede — %s", e)
-        return {"error": f"Erro de rede na SerpAPI: {e}"}
-
-    if resp_ts.status_code == 403:
-        return {"error": "SerpAPI Trends: chave inválida ou quota esgotada (HTTP 403)"}
-    if resp_ts.status_code != 200:
-        logger.warning("SerpAPI Trends: HTTP %s — %s", resp_ts.status_code, resp_ts.text[:300])
-        return {"error": f"SerpAPI Trends: HTTP {resp_ts.status_code}"}
-
-    try:
-        raw_ts = resp_ts.json()
-    except ValueError:
-        return {"error": "SerpAPI Trends: resposta não é JSON válido"}
-
-    if "error" in raw_ts:
-        return {"error": f"SerpAPI Trends: {raw_ts['error']}"}
-
-    # 1 call gasta
-    quota.spend(1)
-
-    # --- Call 2: RELATED_QUERIES (saltar se timeseries_only) ---
-    related_queries: list[dict[str, Any]] = []
-
-    if not timeseries_only:
-        params_rq = {
+        # --- Call 1: TIMESERIES ---
+        params_ts = {
             "engine": "google_trends",
             "q": keyword,
-            "data_type": "RELATED_QUERIES",
+            "date": "today+3-m",  # últimos 90 dias
             "api_key": api_key,
         }
 
         try:
-            resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as e:
-            logger.warning("SerpAPI RELATED_QUERIES: erro de rede — %s", e)
-            # Degradação graciosa: prosseguir sem related_queries
-        else:
-            if resp_rq.status_code == 200:
-                try:
-                    raw_rq = resp_rq.json()
-                except ValueError:
-                    logger.warning("SerpAPI RELATED_QUERIES: resposta não é JSON válido")
-                else:
-                    if "error" not in raw_rq:
-                        rq_data = raw_rq.get("related_queries", {})
-                        rising_list = rq_data.get("rising", [])
-                        if isinstance(rising_list, list):
-                            for item in rising_list:
-                                if isinstance(item, dict):
-                                    related_queries.append({
-                                        "keyword": item.get("query", item.get("keyword", "")),
-                                        "score": item.get("extracted_value", item.get("value", 0)),
-                                    })
-                            related_queries.sort(key=lambda x: x["score"], reverse=True)
+            resp_ts = requests.get(SERPAPI_URL, params=params_ts, timeout=REQUEST_TIMEOUT)
+        except Exception as exc:
+            # Never propagate or log raw exception text/URL: it can echo the
+            # request, including the api_key query parameter.  Log only the
+            # exception type; return a stable sanitized message.
+            logger.warning("SerpAPI Trends: erro de rede (%s)", type(exc).__name__)
+            return {"error": f"Erro de rede na SerpAPI ({type(exc).__name__})"}
+
+        if resp_ts.status_code == 403:
+            return {"error": "SerpAPI Trends: chave inválida ou quota esgotada (HTTP 403)"}
+        if resp_ts.status_code != 200:
+            logger.warning("SerpAPI Trends: HTTP %s", resp_ts.status_code)
+            return {"error": f"SerpAPI Trends: HTTP {resp_ts.status_code}"}
+
+        try:
+            raw_ts = resp_ts.json()
+        except ValueError:
+            return {"error": "SerpAPI Trends: resposta não é JSON válido"}
+
+        if "error" in raw_ts:
+            return {"error": f"SerpAPI Trends: {raw_ts['error']}"}
+
+        # 1 call gasta (só após o sucesso da timeseries)
+        reservation.charge(1)
+
+        # --- Call 2: RELATED_QUERIES (saltar se timeseries_only) ---
+        related_queries: list[dict[str, Any]] = []
+
+        if not timeseries_only:
+            params_rq = {
+                "engine": "google_trends",
+                "q": keyword,
+                "data_type": "RELATED_QUERIES",
+                "api_key": api_key,
+            }
+
+            try:
+                resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
+            except Exception as exc:
+                logger.warning("SerpAPI RELATED_QUERIES: erro de rede (%s)", type(exc).__name__)
+                # Degradação graciosa: prosseguir sem related_queries
             else:
-                logger.warning("SerpAPI RELATED_QUERIES: HTTP %s", resp_rq.status_code)
+                if resp_rq.status_code == 200:
+                    try:
+                        raw_rq = resp_rq.json()
+                    except ValueError:
+                        logger.warning("SerpAPI RELATED_QUERIES: resposta não é JSON válido")
+                    else:
+                        if "error" not in raw_rq:
+                            rq_data = raw_rq.get("related_queries", {})
+                            rising_list = rq_data.get("rising", [])
+                            if isinstance(rising_list, list):
+                                for item in rising_list:
+                                    if isinstance(item, dict):
+                                        related_queries.append({
+                                            "keyword": item.get("query", item.get("keyword", "")),
+                                            "score": item.get("extracted_value", item.get("value", 0)),
+                                        })
+                                related_queries.sort(key=lambda x: x["score"], reverse=True)
+                else:
+                    logger.warning("SerpAPI RELATED_QUERIES: HTTP %s", resp_rq.status_code)
 
-        # 2ª call gasta (mesmo se falhou — a SerpAPI conta sempre)
-        quota.spend(1)
+            # 2ª call gasta (mesmo se falhou — a SerpAPI conta sempre)
+            reservation.charge(1)
 
-    # Parse e cache (sempre reescrever, mesmo em force_refresh)
-    result = _parse_serpapi_response(raw_ts)
-    result["related_queries"] = related_queries
-    _write_cache(keyword, result)
-    return result
+        # Parse e cache (sempre reescrever, mesmo em force_refresh)
+        result = _parse_serpapi_response(raw_ts)
+        result["related_queries"] = related_queries
+        _write_cache(keyword, result)
+        return result
 
 
 def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
@@ -350,39 +433,40 @@ def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
         if cached is not None:
             return cached
 
-    if not quota.can_spend(1):
-        return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
+    with quota.transaction(1) as reservation:
+        if not reservation.available:
+            return {"error": "Quota SerpAPI esgotada para este mês (230/250). Tente no próximo mês."}
 
-    api_key = _get_api_key()
-    if not api_key:
-        return {"error": "SERPAPI_KEY não definida em .env"}
+        api_key = _get_api_key()
+        if not api_key:
+            return {"error": "SERPAPI_KEY não definida em .env"}
 
-    params = {
-        "engine": "google_trends",
-        "q": keyword,
-        "data_type": "RELATED_QUERIES",
-        "api_key": api_key,
-    }
-    try:
-        response = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        logger.warning("SerpAPI RELATED_QUERIES: erro de rede")
-        return {"error": f"Erro de rede na SerpAPI RELATED_QUERIES ({type(exc).__name__})"}
+        params = {
+            "engine": "google_trends",
+            "q": keyword,
+            "data_type": "RELATED_QUERIES",
+            "api_key": api_key,
+        }
+        try:
+            response = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            logger.warning("SerpAPI RELATED_QUERIES: erro de rede")
+            return {"error": f"Erro de rede na SerpAPI RELATED_QUERIES ({type(exc).__name__})"}
 
-    # SerpAPI counts the request even when it returns an HTTP or JSON error.
-    quota.spend(1)
-    if response.status_code != 200:
-        return {"error": f"SerpAPI RELATED_QUERIES: HTTP {response.status_code}"}
+        # SerpAPI counts the request even when it returns an HTTP or JSON error.
+        reservation.charge(1)
+        if response.status_code != 200:
+            return {"error": f"SerpAPI RELATED_QUERIES: HTTP {response.status_code}"}
 
-    try:
-        raw = response.json()
-    except (ValueError, TypeError):
-        return {"error": "SerpAPI RELATED_QUERIES: resposta não é JSON válido"}
-    if not isinstance(raw, dict):
-        return {"error": "SerpAPI RELATED_QUERIES: resposta inválida"}
-    if "error" in raw:
-        return {"error": f"SerpAPI RELATED_QUERIES: {raw['error']}"}
+        try:
+            raw = response.json()
+        except (ValueError, TypeError):
+            return {"error": "SerpAPI RELATED_QUERIES: resposta não é JSON válido"}
+        if not isinstance(raw, dict):
+            return {"error": "SerpAPI RELATED_QUERIES: resposta inválida"}
+        if "error" in raw:
+            return {"error": f"SerpAPI RELATED_QUERIES: {raw['error']}"}
 
-    result = {"related_queries": _parse_related_queries(raw)}
-    _write_related_cache(keyword, result)
-    return result
+        result = {"related_queries": _parse_related_queries(raw)}
+        _write_related_cache(keyword, result)
+        return result

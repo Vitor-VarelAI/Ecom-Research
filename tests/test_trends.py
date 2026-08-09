@@ -14,7 +14,9 @@ import pytest
 
 os.environ.pop("SERPAPI_KEY", None)
 
+from pipeline import quota
 from pipeline.adapters import trends
+
 
 # ── Fixture: resposta simulada da SerpAPI Google Trends ────────────────────
 
@@ -64,23 +66,38 @@ SERPAPI_SEASONAL_JSON = {
 # ── Tests ──────────────────────────────────────────────────────────────────
 
 
+def _isolate_quota(monkeypatch, tmp_path):
+    """Point the real quota counter at a temp file (never touch data/quota.json)."""
+    quota_file = tmp_path / "quota.json"
+    quota_file.write_text(json.dumps({
+        "month": quota._current_month(), "calls": 0, "limit": quota.QUOTA_LIMIT,
+        "firecrawl_credits": 0, "firecrawl_limit": quota.FIRECRAWL_LIMIT,
+    }), encoding="utf-8")
+    monkeypatch.setattr(trends.quota, "QUOTA_FILE", str(quota_file))
+    return quota_file
+
+
 class TestTrendsWithoutKey:
     """Sem SERPAPI_KEY definida, deve devolver erro graciosamente."""
 
-    def test_no_key_returns_error(self, monkeypatch):
+    def test_no_key_returns_error(self, monkeypatch, tmp_path):
         monkeypatch.delenv("SERPAPI_KEY", raising=False)
+        _isolate_quota(monkeypatch, tmp_path)
         # Limpar cache para forçar ida à API
         result = trends.fetch("mochila-test-sem-key")
         assert "error" in result
         assert "SERPAPI_KEY" in result["error"]
+        # Nada foi cobrado: a key faltou antes de qualquer call.
+        assert quota.get_usage()["calls"] == 0
 
 
 class TestTrendsParse:
     """Testa o parsing da resposta JSON da SerpAPI."""
 
-    def test_parse_response(self, monkeypatch):
+    def test_parse_response(self, monkeypatch, tmp_path):
         """Resposta normal com tendência de subida."""
         monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
 
         class MockResponse:
             status_code = 200
@@ -112,9 +129,10 @@ class TestTrendsParse:
         assert len(result["top_geos"]) == 3
         assert result["top_geos"][0]["geo"] == "PT"
 
-    def test_seasonal_detection(self, monkeypatch):
+    def test_seasonal_detection(self, monkeypatch, tmp_path):
         """Detecção de sazonalidade."""
         monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
 
         class MockResponse:
             status_code = 200
@@ -137,9 +155,10 @@ class TestTrendsParse:
         assert result["seasonal"] is True
         assert result["peak"] is not None
 
-    def test_network_error(self, monkeypatch):
+    def test_network_error(self, monkeypatch, tmp_path):
         """Erro de rede tratado graciosamente."""
         monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
 
         def mock_get_raise(url, params, timeout):
             raise trends.requests.ConnectionError("DNS failure")
@@ -149,6 +168,8 @@ class TestTrendsParse:
         result = trends.fetch("test-network-error")
         assert "error" in result
         assert "Erro de rede" in result["error"]
+        # Falha de rede antes do charge: nada é cobrado.
+        assert quota.get_usage()["calls"] == 0
 
 
 class TestTrendsCache:
@@ -174,21 +195,21 @@ class TestTrendsCache:
             return MockResp()
 
         monkeypatch.setattr(trends.requests, "get", mock_get)
-        # Mock quota
-        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(trends.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         # Primeira chamada — deve ir à API (2 calls: timeseries + related)
         result1 = trends.fetch("cache-test-1")
         assert call_count == 2  # 2 API calls (timeseries + related_queries)
         # Dados planos → direção "estável"
         assert result1["direction"] == "estável"
+        assert quota.get_usage()["calls"] == 2  # contabilidade real: 2 units
 
         # Segunda chamada — deve vir da cache, zero chamadas adicionais
         result2 = trends.fetch("cache-test-1")
         assert call_count == 2  # não aumentou
         assert result2["direction"] == "estável"
         assert "_cached_at" not in result2  # metadados internos removidos
+        assert quota.get_usage()["calls"] == 2  # cache hit: zero gastos
 
     def test_cache_expired(self, monkeypatch, tmp_path):
         """Cache expirada (>30 dias) deve forçar nova chamada."""
@@ -212,8 +233,7 @@ class TestTrendsCache:
                 return SERPAPI_RESPONSE_JSON
 
         monkeypatch.setattr(trends.requests, "get", lambda url, params=None, timeout=None, **kwargs: MockResp())
-        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(trends.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         result = trends.fetch("cache-expired-test")
         # Cache expirada → foi buscar dados frescos com direção "estável"
@@ -229,7 +249,6 @@ class TestTrendsTimeseriesOnly:
         monkeypatch.setattr(trends, "CACHE_DIR", str(tmp_path))
 
         call_count = 0
-        spend_count = 0
 
         class MockResp:
             status_code = 200
@@ -242,18 +261,13 @@ class TestTrendsTimeseriesOnly:
             call_count += 1
             return MockResp()
 
-        def mock_spend(n=1):
-            nonlocal spend_count
-            spend_count += n
-
         monkeypatch.setattr(trends.requests, "get", mock_get)
-        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(trends.quota, "spend", mock_spend)
+        _isolate_quota(monkeypatch, tmp_path)
 
         result = trends.fetch("ts-only-test", timeseries_only=True)
 
         assert call_count == 1  # só timeseries, sem related_queries
-        assert spend_count == 1  # 1 quota unit
+        assert quota.get_usage()["calls"] == 1  # 1 quota unit
         assert result["related_queries"] == []
         assert result["direction"] == "estável"
 
@@ -280,8 +294,7 @@ class TestTrendsForceRefresh:
             return MockResp()
 
         monkeypatch.setattr(trends.requests, "get", mock_get)
-        monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(trends.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         # Primeira call — popula cache
         trends.fetch("force-refresh-test")

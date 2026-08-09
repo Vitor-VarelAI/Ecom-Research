@@ -3,11 +3,25 @@ Testes do adapter Landing Price.
 
 Usa fixtures HTML simuladas — sem chamadas reais à rede.
 """
+import json
 import pytest
 import os
 from unittest.mock import patch, Mock
 
+from pipeline import quota
 from pipeline.adapters import landing_price
+
+
+def _isolate_quota(monkeypatch, tmp_path, *, firecrawl_credits=0, firecrawl_limit=None):
+    """Point the real quota counter at a temp file (never touch data/quota.json)."""
+    quota_file = tmp_path / "quota.json"
+    quota_file.write_text(json.dumps({
+        "month": quota._current_month(), "calls": 0, "limit": quota.QUOTA_LIMIT,
+        "firecrawl_credits": firecrawl_credits,
+        "firecrawl_limit": firecrawl_limit or quota.FIRECRAWL_LIMIT,
+    }), encoding="utf-8")
+    monkeypatch.setattr(landing_price.quota, "QUOTA_FILE", str(quota_file))
+    return quota_file
 
 # ── Fixtures HTML ──────────────────────────────────────────────────────────
 
@@ -270,23 +284,20 @@ class TestFirecrawlFallback:
             result = landing_price._fetch_via_firecrawl("https://example.com/test")
             assert result is None
 
-    def test_firecrawl_quota_exhausted_returns_none(self, monkeypatch):
+    def test_firecrawl_quota_exhausted_returns_none(self, monkeypatch, tmp_path):
         """Sem credits Firecrawl, devolve None."""
         monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
-        monkeypatch.setattr(landing_price.quota, "can_spend_firecrawl", lambda n=1: False)
+        _isolate_quota(monkeypatch, tmp_path, firecrawl_credits=quota.FIRECRAWL_LIMIT)
 
         result = landing_price._fetch_via_firecrawl("https://example.com/test")
         assert result is None
+        # Nada foi cobrado numa reserva negada.
+        assert quota.get_firecrawl_usage()["credits"] == quota.FIRECRAWL_LIMIT
 
-    def test_firecrawl_success_counts_credit(self, monkeypatch):
+    def test_firecrawl_success_counts_credit(self, monkeypatch, tmp_path):
         """Firecrawl bem-sucedido gasta 1 credit."""
         monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
-        monkeypatch.setattr(landing_price.quota, "can_spend_firecrawl", lambda n=1: True)
-
-        spend_count = [0]
-        def mock_spend(n=1):
-            spend_count[0] += n
-        monkeypatch.setattr(landing_price.quota, "spend_firecrawl", mock_spend)
+        _isolate_quota(monkeypatch, tmp_path)
 
         mock_resp = Mock()
         mock_resp.status_code = 200
@@ -299,7 +310,19 @@ class TestFirecrawlFallback:
             assert result is not None
             assert result["via"] == "firecrawl"
             assert 45.99 in result["prices"]
-            assert spend_count[0] == 1  # 1 credit gasto
+            assert quota.get_firecrawl_usage()["credits"] == 1  # 1 credit gasto
+
+    def test_firecrawl_http_error_charges_nothing(self, monkeypatch, tmp_path):
+        """Resposta HTTP != 200 → None e zero credits (como a contabilidade antiga)."""
+        monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
+        mock_resp = Mock()
+        mock_resp.status_code = 500
+
+        with patch.object(landing_price.requests, "post", return_value=mock_resp):
+            result = landing_price._fetch_via_firecrawl("https://example.com/js-heavy")
+        assert result is None
+        assert quota.get_firecrawl_usage()["credits"] == 0
 
     def test_firecrawl_timeout_both_levels_graceful(self):
         """Timeout nos 2 níveis → None, sem crash."""

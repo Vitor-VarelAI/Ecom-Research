@@ -12,6 +12,7 @@ import pytest
 
 os.environ.pop("SERPAPI_KEY", None)
 
+from pipeline import quota
 from pipeline.adapters import serp_seo
 
 # ── Fixture: resposta simulada da SerpAPI Google SERP ──────────────────────
@@ -66,6 +67,17 @@ SERPAPI_SEO_MARKETPLACES_JSON = {
 # ── Tests ──────────────────────────────────────────────────────────────────
 
 
+def _isolate_quota(monkeypatch, tmp_path):
+    """Point the real quota counter at a temp file (never touch data/quota.json)."""
+    quota_file = tmp_path / "quota.json"
+    quota_file.write_text(json.dumps({
+        "month": quota._current_month(), "calls": 0, "limit": quota.QUOTA_LIMIT,
+        "firecrawl_credits": 0, "firecrawl_limit": quota.FIRECRAWL_LIMIT,
+    }), encoding="utf-8")
+    monkeypatch.setattr(serp_seo.quota, "QUOTA_FILE", str(quota_file))
+    return quota_file
+
+
 class TestSerpSEOParse:
     """Testa o parsing da resposta JSON da SerpAPI Google SERP."""
 
@@ -83,10 +95,7 @@ class TestSerpSEOParse:
                 return SERPAPI_SEO_JSON
 
         monkeypatch.setattr(serp_seo.requests, "get", lambda url, params, timeout: MockResponse())
-
-        # Mock quota: permitir sempre
-        monkeypatch.setattr(serp_seo.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(serp_seo.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         result = serp_seo.fetch("mochila personalizada")
 
@@ -97,6 +106,7 @@ class TestSerpSEOParse:
         assert len(result["paa_questions"]) == 3
         assert result["paa_questions"][0] == "Quanto custa personalizar uma mochila?"
         assert result["seo_opportunity"] in ("alta", "média", "baixa")
+        assert quota.get_usage()["calls"] == 1  # 1 call cobrada após sucesso
 
     def test_no_ads_high_opportunity(self, monkeypatch, tmp_path):
         """SERP sem ads e sem marketplaces → oportunidade alta."""
@@ -111,8 +121,7 @@ class TestSerpSEOParse:
                 return SERPAPI_SEO_NO_ADS_JSON
 
         monkeypatch.setattr(serp_seo.requests, "get", lambda url, params, timeout: MockResponse())
-        monkeypatch.setattr(serp_seo.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(serp_seo.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         result = serp_seo.fetch("keyword artesanal")
 
@@ -133,20 +142,21 @@ class TestSerpSEOParse:
                 return SERPAPI_SEO_MARKETPLACES_JSON
 
         monkeypatch.setattr(serp_seo.requests, "get", lambda url, params, timeout: MockResponse())
-        monkeypatch.setattr(serp_seo.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(serp_seo.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         result = serp_seo.fetch("produto competitivo")
 
         assert result["seo_opportunity"] == "baixa"
         assert len(result["organic_results"]) == 5
 
-    def test_no_key_returns_error(self, monkeypatch):
+    def test_no_key_returns_error(self, monkeypatch, tmp_path):
         """Sem SERPAPI_KEY deve devolver erro."""
         monkeypatch.delenv("SERPAPI_KEY", raising=False)
+        _isolate_quota(monkeypatch, tmp_path)
         result = serp_seo.fetch("test-sem-key")
         assert "error" in result
         assert "SERPAPI_KEY" in result["error"]
+        assert quota.get_usage()["calls"] == 0
 
     def test_cache_hit(self, monkeypatch, tmp_path):
         """Cache hit — zero chamadas à API."""
@@ -168,15 +178,16 @@ class TestSerpSEOParse:
             return MockResponse()
 
         monkeypatch.setattr(serp_seo.requests, "get", mock_get)
-        monkeypatch.setattr(serp_seo.quota, "can_spend", lambda n=1: True)
-        monkeypatch.setattr(serp_seo.quota, "spend", lambda n=1: None)
+        _isolate_quota(monkeypatch, tmp_path)
 
         # Primeira call — vai à API
         result1 = serp_seo.fetch("cache-seo-test")
         assert call_count == 1
+        assert quota.get_usage()["calls"] == 1
 
         # Segunda call — cache hit
         result2 = serp_seo.fetch("cache-seo-test")
         assert call_count == 1  # não aumentou
         assert "_cached_at" not in result2
         assert result2["ads_count"] == 2
+        assert quota.get_usage()["calls"] == 1  # cache hit: zero gastos

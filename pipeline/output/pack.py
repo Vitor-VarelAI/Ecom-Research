@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 from datetime import date
 from typing import Any
+
+from pipeline.run_state import atomic_write_json, atomic_write_text, utc_now_iso
+
+_REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+
+# Scheduled modes write a deterministic ``--<mode>`` suffix so that day-1
+# monthly + Sunday/Wednesday artifacts for the same keyword and date coexist
+# without clobbering each other or legacy manual/full names.
+SCHEDULED_MODES = frozenset({"sunday", "wednesday", "monthly"})
 
 
 def _slugify(keyword: str) -> str:
@@ -14,19 +23,50 @@ def _slugify(keyword: str) -> str:
     return "-".join(slug.split("-")).strip("-")
 
 
-def _pack_paths(keyword: str, run_date: date | None = None) -> tuple[str, str]:
+def _keyword_hash(keyword: str) -> str:
+    """Stable SHA-256 (12 hex chars) of the raw keyword for filename identity."""
+    return hashlib.sha256(keyword.encode("utf-8")).hexdigest()[:12]
+
+
+def _pack_paths(
+    keyword: str,
+    run_date: date | None = None,
+    mode: str | None = None,
+    run_id: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the deterministic paths for a pack.
+
+    Legacy (no ``run_id``): ``YYYY-MM-DD--<slug>[--<mode>]`` — unchanged and
+    still read by every reader.
+
+    Run-scoped (``run_id`` present): ``YYYY-MM-DD--<mode>--<kw_hash12>--
+    <slug>--<run_id[:12]>``.  The stable keyword hash keeps slug-equivalent
+    keywords (``a/b`` vs ``a-b``) collision-free, the mode separates
+    keyword/all/sunday/wednesday/monthly artifacts, and the run-id prefix
+    makes repeated same runs resolve to the same path.  Because every run
+    writes unique paths, a crash can leave at most an orphan Markdown: it
+    can never replace an older complete JSON.
+    """
     if run_date is None:
         run_date = date.today()
-    repo_root = os.path.join(os.path.dirname(__file__), "..", "..")
-    packs_dir = os.path.join(repo_root, "packs")
-    data_dir = os.path.join(repo_root, "data")
+    packs_dir = os.path.join(_REPO_ROOT, "packs")
+    data_dir = os.path.join(_REPO_ROOT, "data")
     os.makedirs(packs_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     date_str = run_date.isoformat()
     slug = _slugify(keyword)
+    if run_id:
+        mode_part = mode or "manual"
+        kw_hash = _keyword_hash(keyword)
+        rid = run_id[:12]
+        base = f"{date_str}--{mode_part}--{kw_hash}--{slug}--{rid}"
+    else:
+        base = f"{date_str}--{slug}"
+        if mode in SCHEDULED_MODES:
+            base = f"{base}--{mode}"
     return (
-        os.path.join(packs_dir, f"{date_str}--{slug}.md"),
-        os.path.join(data_dir, f"{date_str}--{slug}.json"),
+        os.path.join(packs_dir, f"{base}.md"),
+        os.path.join(data_dir, f"{base}.json"),
     )
 
 
@@ -275,6 +315,45 @@ def _format_suggestions(suggestions: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _format_provenance_section(
+    *,
+    mode: str | None,
+    run_id: str | None,
+    scoring_version: str | None,
+    generated_at: str | None,
+    completed_at: str | None,
+    source_states: dict[str, Any] | None,
+) -> str:
+    """Concise provenance block; only rendered when run metadata is present."""
+    if not (mode or run_id):
+        return ""
+    lines = ["## Proveniência"]
+    bits = []
+    if mode:
+        bits.append(f"modo {mode}")
+    if run_id:
+        bits.append(f"run {run_id[:12]}")
+    if scoring_version:
+        bits.append(f"scoring v{scoring_version}")
+    if bits:
+        lines.append("- " + ", ".join(bits))
+    if generated_at:
+        lines.append(f"- Gerado: {generated_at}")
+    if completed_at and completed_at != generated_at:
+        lines.append(f"- Concluído: {completed_at}")
+    if source_states:
+        rendered = []
+        for name, entry in sorted(source_states.items()):
+            status = entry.get("status", "?")
+            if status == "valid" and entry.get("origin") == "fresh":
+                rendered.append(f"{name}=valid")
+            else:
+                rendered.append(f"{name}={status}({entry.get('origin', '?')})")
+        lines.append("- Fontes: " + ", ".join(rendered))
+    lines.append("- Políticas de fontes e evidência usada: ver JSON (source_policies / source_states)")
+    return "\n".join(lines) + "\n"
+
+
 def generate(
     keyword: str,
     trends_data: dict[str, Any],
@@ -287,14 +366,36 @@ def generate(
     run_date: date | None = None,
     suggested_keywords: list[dict[str, Any]] | None = None,
     ad_cohort: dict[str, Any] | None = None,
+    mode: str | None = None,
+    run_id: str | None = None,
+    source_states: dict[str, Any] | None = None,
+    source_policies: dict[str, Any] | None = None,
+    scoring_version: str | None = None,
+    scoring_config: dict[str, Any] | None = None,
+    generated_at: str | None = None,
+    completed_at: str | None = None,
 ) -> str:
     if run_date is None:
         run_date = date.today()
     seo_data = seo_data or {"error": "SEO não executado — modo reduzido"}
     suggested_keywords = suggested_keywords or []
-    md_path, json_path = _pack_paths(keyword, run_date)
+    if mode is None:
+        md_path, json_path = _pack_paths(keyword, run_date)
+    else:
+        md_path, json_path = _pack_paths(keyword, run_date, mode, run_id)
     rows = _build_market_rows(trends_data, ads_data)
     breakdown = score_result.get("breakdown", {})
+    now = generated_at or utc_now_iso()
+    done_at = completed_at or now
+
+    provenance = _format_provenance_section(
+        mode=mode,
+        run_id=run_id,
+        scoring_version=scoring_version,
+        generated_at=now,
+        completed_at=done_at,
+        source_states=source_states,
+    )
 
     md_content = f"""# RESEARCH PACK — {keyword} — {run_date.isoformat()}
 
@@ -331,11 +432,11 @@ Fórmula determinística. Sem LLM no score.
 
 ## Próximo passo sugerido
 {_format_next_step(score_result.get('label', 'DADOS INSUFICIENTES'))}
-"""
-    with open(md_path, "w", encoding="utf-8") as output:
-        output.write(md_content)
 
-    raw_pack = {
+{provenance}"""
+    atomic_write_text(md_path, md_content)
+
+    raw_pack: dict[str, Any] = {
         "keyword": keyword,
         "date": run_date.isoformat(),
         "score": score_result,
@@ -349,8 +450,26 @@ Fórmula determinística. Sem LLM no score.
     }
     if ad_cohort is not None:
         raw_pack["ad_cohort"] = ad_cohort
-    with open(json_path, "w", encoding="utf-8") as output:
-        json.dump(raw_pack, output, ensure_ascii=False, indent=2)
+    # Additive run/provenance metadata; legacy top-level keys stay as aliases.
+    if run_id is not None:
+        raw_pack["run_id"] = run_id
+    if mode is not None:
+        raw_pack["mode"] = mode
+    raw_pack["generated_at"] = now
+    raw_pack["completed_at"] = done_at
+    if scoring_version is not None:
+        raw_pack["scoring_version"] = scoring_version
+    if scoring_config is not None:
+        raw_pack["scoring_config"] = scoring_config
+    if source_states is not None:
+        raw_pack["source_states"] = source_states
+    if source_policies is not None:
+        raw_pack["source_policies"] = source_policies
+    # Written last: a run-scoped JSON without this flag is an incomplete
+    # artifact and readers ignore it (an orphan Markdown without a JSON can
+    # never replace an older complete JSON, thanks to unique run paths).
+    raw_pack["artifact_complete"] = True
+    atomic_write_json(json_path, raw_pack)
     return md_path
 
 

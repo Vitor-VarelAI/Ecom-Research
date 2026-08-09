@@ -2,76 +2,74 @@
 
 ## Estado
 
-O projeto é um pipeline CLI determinístico. A fonte central de ads é a Facebook Ad Library via Apify; o transporte antigo (Meta Graph API) foi removido. O utilizador mantém todas as decisões de produto e mercado. Sugestões, score e recomendações são apenas advisory.
+O projeto continua a ser um pipeline CLI determinístico e advisory. A revisão de robustez foi concluída sem alterar pesos, thresholds, labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`), decisões de mercado, comandos existentes ou direcção send-only do Telegram.
 
-Este commit fecha o incremento completo que estava na árvore: migração Apify, reescrita do `run.py` (modos e contratos de custo), novo schema de pack (decisão manual de mercado, sugestões advisory, métrica `ad_cohort` no pulse de quarta), entrega Telegram send-only e a suite de testes correspondente.
+O comportamento de negócio foi comparado diferencialmente com o commit anterior `155a3fabfe20b7f6aa02721601727214d5f28b17`: 5 cenários, 2 tentativas por versão, 20 execuções isoladas e 71 comparações exactas. Scores, labels, breakdowns, evidências, sequência de adapters, decisões e digests foram iguais. As diferenças são apenas o envelope de robustez documentado em `README.md`: `run_id`, timestamps, proveniência, nomes sem colisões e estado de entrega.
 
-## Arquitetura
+## Onde está cada fluxo
 
-```text
-run.py
-pipeline/
-  adapters/
-    apify_ads.py       # uma invocação Apify, filtros, relevância e dedupe
-    trends.py          # timeseries, related queries e cache de 30 dias
-    serp_seo.py        # snapshot SEO com cache
-    keyword_csv.py     # parser de export manual
-    landing_price.py   # landing_url: HTTP -> Firecrawl, max 3
-  delivery/
-    telegram.py        # send-only, chunks de 4000, fallback stdout
-  output/pack.py       # Markdown + JSON facebook_ads + sugestões + ad_cohort
-  suggestions.py       # propostas determinísticas com status proposed
-  quota.py             # quota SerpAPI e créditos Firecrawl
-  scoring/score.py     # fórmula determinística inalterada
-```
+- `run.py`: parser, precedência de modos, execução full/domingo/quarta/mensal/auto, idempotência e checkpoints por keyword.
+- `pipeline/run_state.py`: identidade determinística, manifestos, escritas atómicas e locks de run.
+- `pipeline/provenance.py`: estados `valid`, `missing`, `stale` e `failed`, mais políticas não secretas das fontes.
+- `pipeline/output/pack.py`: Markdown/JSON run-scoped, metadados de proveniência e marcador `artifact_complete`.
+- `pipeline/delivery/telegram.py`: send-only, chunks de 4000 caracteres, estado persistido e resume apenas dos chunks não enviados.
+- `pipeline/quota.py`: quota SerpAPI/Firecrawl com escrita atómica e transacções bloqueantes/fail-closed.
+- `pipeline/adapters/`: contratos, caches, timeouts e fallbacks por fonte; payloads inválidos ou de erro não são reutilizados como cache válido.
+- `pipeline/scoring/score.py`: cálculo inalterado; `SCORING_VERSION` e snapshot da configuração são apenas metadados.
 
-## Modos
+O diagrama e a descrição completa da arquitectura estão em `README.md`.
 
-- Full/domingo: um Apify por keyword. Falha Apify continua Trends/SEO/CSV como `DADOS INSUFICIENTES` (nunca um `DESCARTAR` falso); zero ads força `DESCARTAR`, salta SEO/landing e faz uma Related Query cacheada para sugestões.
-- Quarta: uma chamada Apify paga e bounded por keyword elegível (AVANÇAR/OBSERVAR, <14 dias), zero SerpAPI/Firecrawl/landing. Reutiliza Trends, CSV, SEO, landing, sugestões e score; compara ad IDs e advertisers e calcula a métrica advisory `ad_cohort`. Falha preserva o último pack bom.
-- Mensal: uma timeseries Trends forçada, sem Apify/SEO/landing/Firecrawl, e rescore com o resto do pack anterior.
-- Auto no dia 1: mensal primeiro, depois domingo ou quarta; cada ação envia o seu digest.
+## Garantias agora cobertas
 
-## Métrica `ad_cohort` (pulse de quarta, advisory)
-
-`_ad_cohort(previous, current)` faz álgebra de conjuntos determinística sobre `ad_ids` e identidades de advertiser (page_id, senão nome com accent-folding) entre o pack anterior e a leitura atual. Retenções de ads e anunciantes são percentagens `None` quando o baseline não tem itens comparáveis. Concentração = quota de variantes do maior anunciante. Sinais possíveis: `durable_demand`, `high_churn`, `concentrated_market`, `insufficient_baseline`. Nunca toca em scores ou labels. No pack aparece como secção **Persistência de mercado — pulse quarta (advisory)** e no JSON como `ad_cohort`.
-
-## Contratos de operação
-
-`APIFY_API_TOKEN` é a única credencial usada pelo adapter Apify. Nunca expor valores do `.env`, nunca versionar esse ficheiro e nunca adicionar sugestões automaticamente a `config/keywords.txt`. O código nunca executa uma sugestão, nunca escolhe país e nunca regista tokens. Nenhum cron foi instalado.
-
-A chave raw do pack é `facebook_ads`; a secção de mercado chama-se **Sinais por mercado — decisão manual** (colunas `country`, `Trends demand`, `advertisers observed`, `ads observed`). O JSON guarda também `suggested_keywords` (com `status: proposed`) e `ad_cohort` (só quando há pulse). Preços só aceitam `top_ads[].landing_url`, nunca um URL da Ad Library. Telegram envia plain text sem campos interativos e imprime o digest completo se não puder entregar.
-
-## Estado local
-
-- `APIFY_API_TOKEN`, `SERPAPI_KEY` e `FIRECRAWL_KEY` estão configuradas no `.env` ignorado pelo Git e foram autenticadas com sucesso. Os valores nunca devem aparecer em documentação ou logs.
-- `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` ainda não foram fornecidos.
-- Existem cinco keywords em `config/keywords.txt`, zero packs gerados após esta refatoração e nenhum CSV real do Keyword Planner validado.
-- A implementação Apify foi testada unitariamente; ainda falta um smoke full live e revisão humana do primeiro pack.
-- Credenciais partilhadas em conversas anteriores devem ser regeneradas antes de produção.
+- Precedência fixa: `auto > sunday > wednesday > monthly > all > keyword`; selectores ou CSV ignorados produzem avisos determinísticos.
+- Um `run_id` concluído não repete fontes pagas, packs ou digests. Domingo e `--all` gravam checkpoints e repetem apenas keywords com falha técnica.
+- Falha mensal do Trends preserva o último pack `OBSERVAR`, portanto a keyword não desaparece da watchlist.
+- Packs de modos/keywords diferentes não colidem; formatos legados continuam a ser lidos, mas novos packs usam nomes run-scoped.
+- Manifestos, packs, caches e estados Telegram malformados são rejeitados sem serem tratados como evidência válida.
+- Excepções de rede e falhas técnicas são sanitizadas; tokens e URLs sensíveis não entram em packs, manifestos, digests ou logs.
+- O estado Telegram distingue sucesso, parcial, falha, configuração ausente e estado corrompido; chunks confirmados localmente não são reenviados.
+- Quota e runs usam locks bloqueantes e fail-closed. Não existem retries novos nem alterações aos limites de chamadas.
 
 ## Verificação
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-.venv/bin/python -m compileall run.py pipeline
+.venv/bin/python -m compileall -q run.py pipeline
 .venv/bin/python run.py --help
 git diff --check
 ```
 
-Último resultado: **135 testes passaram**, `compileall`, CLI help e `git diff --check` passaram; todos os testes de rede usam mocks.
+Último resultado: **289 testes passaram**; `compileall`, CLI help e `git diff --check` passaram. Todos os testes de rede usam mocks.
+
+Validação diferencial final:
+
+- baseline: commit `155a3fabfe20b7f6aa02721601727214d5f28b17`, **135 testes**;
+- candidato: working tree endurecido, **289 testes**;
+- resultado: **PASS**, zero divergências nas 71 comparações de negócio;
+- `score.compute()` e os quatro componentes têm AST idêntica antes/depois.
+
+## Riscos e decisões pendentes
+
+1. Um crash depois de uma chamada paga e antes do checkpoint pode repetir essa chamada; exactly-once por fonte exigiria reservas/checkpoints externos ao processo.
+2. O Telegram pode aceitar um chunk e o processo falhar antes da persistência local; esse chunk pode ser duplicado no retry.
+3. O lock de quota fica activo durante o pedido ao provider. Isto preserva limites duros, mas serializa processos e pode aumentar latência.
+4. Um batch com excepção técnica adia o Telegram final até todas as keywords terminarem; o digest parcial fica no stdout e no manifesto.
+5. Uma segunda execução intencional no mesmo dia, com os mesmos inputs, é tratada como repetição. Um eventual `--force` precisa de decisão de produto.
+6. CSV, ads históricos e preços reutilizados são marcados como stale, mas não expiram decisões automaticamente; impor TTL mudaria regras de negócio.
+7. `data/runs/` e `data/digests/` ainda não têm política de retenção.
 
 ## Próxima sessão
 
-1. Receber `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` sem os expor em docs ou commits.
-2. Validar uma mensagem Telegram send-only e o fallback stdout.
-3. Confirmar ou exportar o CSV do Google Keyword Planner para `data/`.
-4. Executar um único smoke full live, rever custo/relevância do Apify, inspecionar manualmente o pack (incluindo o bloco `ad_cohort` num pulse de quarta) e confirmar que o score e as sugestões estão sanos.
-5. Só depois instalar o cron diário das 08:00 com `run.py --auto --digest`.
+1. Fazer um smoke live controlado de uma keyword e rever manualmente custo, relevância, pack e proveniência.
+2. Validar uma entrega Telegram real e o fallback stdout sem expor credenciais.
+3. Confirmar o CSV real do Keyword Planner antes de activar produção.
+4. Decidir se são necessários `--force`, TTLs obrigatórios e retenção dos manifestos/digests.
+5. Só depois instalar ou confirmar o cron diário `run.py --auto --digest`.
 
-A aprovação do utilizador continua obrigatória para produto, mercado, sugestões e handoff para ad-machine.
+A aprovação humana continua obrigatória para produto, mercado, sugestões e passagem para ad-machine.
 
 ## Suggested skills
 
-- `tdd` — para qualquer adaptador ou modo novo (a suite atual cobre contrato, custo e normalização com mocks).
-- `diagnose` — se o smoke full live revelar falhas de rede/parser do Apify ou da SerpAPI, usar o loop reproduzir → isolar → corrigir.
+- `diagnose` — para qualquer divergência observada no smoke live.
+- `tdd` — para alterações futuras aos modos, adapters, idempotência ou entrega.
+- `security-review` — antes de alterar persistência de credenciais, Telegram ou integrações externas.

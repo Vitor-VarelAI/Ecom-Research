@@ -1,3 +1,6 @@
+import json
+
+from pipeline import quota
 from pipeline.adapters import trends
 
 
@@ -5,7 +8,6 @@ def test_fetch_related_is_one_quota_counted_cached_call(monkeypatch, tmp_path):
     monkeypatch.setenv("SERPAPI_KEY", "test-key")
     monkeypatch.setattr(trends, "CACHE_DIR", str(tmp_path))
     calls = []
-    spends = []
 
     class Response:
         status_code = 200
@@ -18,9 +20,13 @@ def test_fetch_related_is_one_quota_counted_cached_call(monkeypatch, tmp_path):
         calls.append((args, kwargs))
         return Response()
 
+    quota_file = tmp_path / "quota.json"
+    quota_file.write_text(json.dumps({
+        "month": quota._current_month(), "calls": 0, "limit": quota.QUOTA_LIMIT,
+        "firecrawl_credits": 0, "firecrawl_limit": quota.FIRECRAWL_LIMIT,
+    }), encoding="utf-8")
+    monkeypatch.setattr(trends.quota, "QUOTA_FILE", str(quota_file))
     monkeypatch.setattr(trends.requests, "get", get)
-    monkeypatch.setattr(trends.quota, "can_spend", lambda n=1: True)
-    monkeypatch.setattr(trends.quota, "spend", lambda n=1: spends.append(n))
 
     first = trends.fetch_related("mochila")
     second = trends.fetch_related("mochila")
@@ -28,5 +34,5 @@ def test_fetch_related_is_one_quota_counted_cached_call(monkeypatch, tmp_path):
     assert first["related_queries"][1]["score"] == "Breakout"
     assert second == first
     assert len(calls) == 1
-    assert spends == [1]
+    assert quota.get_usage()["calls"] == 1  # exactly one charge for one call
     assert calls[0][1]["params"]["data_type"] == "RELATED_QUERIES"

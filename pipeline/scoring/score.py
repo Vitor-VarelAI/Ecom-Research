@@ -48,7 +48,35 @@ Normalização:
 """
 
 import math
+from types import MappingProxyType
 from typing import Any
+
+# Version of the scoring formula.  Bump only when the formula changes; it is
+# part of the deterministic run identity and of every pack's provenance.
+SCORING_VERSION = "1.0.0"
+
+# Immutable metadata snapshots of the formula.  Exported for provenance and
+# run metadata; the calculation below remains byte-for-byte unchanged.
+WEIGHTS = MappingProxyType({
+    "trend": 0.3,
+    "volume": 0.2,
+    "ad_longevity": 0.3,
+    "saturacao_invertida": 0.2,
+})
+THRESHOLDS = MappingProxyType({
+    "AVANÇAR": 70,  # score >= 70
+    "OBSERVAR": 40,  # 40 <= score < 70; abaixo de 40 é DESCARTAR
+})
+
+
+def scoring_config_snapshot() -> dict[str, Any]:
+    """Credential-free JSON-safe snapshot of the formula metadata."""
+    return {
+        "version": SCORING_VERSION,
+        "weights": dict(WEIGHTS),
+        "thresholds": dict(THRESHOLDS),
+        "labels": ["AVANÇAR", "OBSERVAR", "DESCARTAR"],
+    }
 
 
 def _trend_component(trends_data: dict[str, Any]) -> float:
