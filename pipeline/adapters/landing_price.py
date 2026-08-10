@@ -5,10 +5,16 @@ Extrai preços praticados nas landings dos concorrentes (dos top ads do Apify).
 Estratégia HYBRID em 2 níveis:
   Nível 1 (grátis): GET com requests, timeout 10s, User-Agent browser, sem JS.
   Nível 2 (Firecrawl, só se nível 1 não encontrar preço): POST /v2/scrape, 1 credit/página.
-Parser comum: JSON-LD schema.org Product/Offer PRIMEIRO, depois regex €XX/XX€/XX,XX EUR.
+Parser comum: JSON-LD schema.org Product/Offer PRIMEIRO (com priceCurrency),
+depois regex €XX/XX€/XX,XX EUR (moeda explícita — EUR).
+
+Moeda: preços JSON-LD só são aceites com priceCurrency explícito e
+normalizável (ISO-4217-like, ex.: ARS/EUR/USD). Preços JSON-LD sem moeda
+clara nunca são assumidos como EUR — falham com segurança e caem no regex de
+moeda explícita. Aggregation nunca combina moedas diferentes num range.
 
 Interface:
-    fetch_price(url) -> dict[str, Any] | None
+    fetch_price(url) -> dict[str, Any] | None   # inclui currency normalizada
     fetch_prices_from_ads(ads_data) -> dict[str, Any]
 
 Regras:
@@ -17,20 +23,27 @@ Regras:
 - Firecrawl: fetches sequenciais com pausa ≥6s entre calls
 - Falha em qualquer landing = ignora e continua
 - Falha em todas = "sem dados: landings não legíveis"
+- Moedas diferentes entre landings = erro explícito, nunca um price_range
+- Proveniência por fonte limitada (URL pública + domain, via, currency, min/max)
 - NUNCA bloqueia o run
 """
 
 import logging
+import math
 import os
 import re
 import time
 import json as json_lib
 from typing import Any
-from urllib.parse import urlparse
 
 import requests
 
 from pipeline import quota
+from pipeline.adapters.url_sanitize import (
+    domain_of as _domain_of,
+    is_ad_library_url as _is_ad_library_url,
+    sanitize_url as _sanitize_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,28 +57,68 @@ BROWSER_UA = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 
-
-def _is_ad_library_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return True
-    hostname = (parsed.hostname or "").casefold()
-    path = (parsed.path or "").casefold()
-    return hostname in {"facebook.com", "www.facebook.com", "m.facebook.com"} and "/ads/library" in path
+# Código ISO-4217-like: exatamente 3 letras ASCII (ARS, BRL, EUR, USD, ...).
+_ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 
-def _extract_jsonld_price(html: str) -> list[float] | None:
+def _normalize_currency(value: Any) -> str | None:
+    """Normaliza priceCurrency JSON-LD para um código ISO-like maiúsculo.
+
+    Valores sem um código claro de 3 letras ("$", "R$", "", "EUR ") devolvem
+    None — nunca são assumidos como EUR. Minúsculas ("usd") e lixo não-letra
+    à volta do código são normalizados.
+    """
+    if value is None:
+        return None
+    code = re.sub(r"[^A-Za-z]", "", str(value)).upper()
+    if _ISO_CURRENCY_RE.fullmatch(code):
+        return code
+    return None
+
+
+def _item_types(value: Any) -> list[str]:
+    """@type pode ser string ou lista — normaliza para tokens lowercase."""
+    if isinstance(value, list):
+        return [str(token).lower() for token in value]
+    return [str(value).lower()]
+
+
+def _extract_jsonld_entries(html: str) -> list[dict[str, Any]] | None:
     """
     Procura <script type="application/ld+json"> com schema.org Product/Offer.
-    Devolve lista de preços encontrados ou None.
+
+    Devolve entradas ``{"price": float, "currency": str | None}`` ou None.
+    A moeda vem de priceCurrency (Offer/AggregateOffer/Product) e é
+    normalizada; entradas sem priceCurrency ficam com ``currency=None`` e são
+    descartadas mais tarde (nunca assumidas como EUR).
     """
     # Padrão: <script type="application/ld+json"> ... </script>
     ld_pattern = re.compile(
         r'<script\s+type="application/ld\+json"[^>]*>(.*?)</script>',
         re.DOTALL | re.IGNORECASE,
     )
-    prices: list[float] = []
+    entries: list[dict[str, Any]] = []
+
+    def add_price(value: Any, currency: Any) -> None:
+        price = _safe_float(value)
+        if price is not None:
+            entries.append({"price": price, "currency": _normalize_currency(currency)})
+
+    def add_offer(offer: dict[str, Any], parent_currency: Any = None) -> None:
+        offer_types = _item_types(offer.get("@type", ""))
+        currency = offer.get("priceCurrency", parent_currency)
+        if "aggregateoffer" in offer_types:
+            add_price(offer.get("lowPrice"), currency)
+            add_price(offer.get("highPrice"), currency)
+        elif "offer" in offer_types:
+            add_price(offer.get("price"), currency)
+        else:
+            # Offers sem @type: desambiguar pelas chaves presentes.
+            if "lowPrice" in offer or "highPrice" in offer:
+                add_price(offer.get("lowPrice"), currency)
+                add_price(offer.get("highPrice"), currency)
+            else:
+                add_price(offer.get("price"), currency)
 
     for match in ld_pattern.finditer(html):
         try:
@@ -79,43 +132,44 @@ def _extract_jsonld_price(html: str) -> list[float] | None:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            item_type = str(item.get("@type", "")).lower()
+            item_types = _item_types(item.get("@type", ""))
 
             # Product com offers
-            if item_type == "product" and "offers" in item:
+            if "product" in item_types and "offers" in item:
                 offers = item["offers"]
                 offers_list = offers if isinstance(offers, list) else [offers]
                 for offer in offers_list:
                     if isinstance(offer, dict):
-                        offer_type = str(offer.get("@type", "")).lower()
-                        if offer_type == "aggregateoffer":
-                            low = _safe_float(offer.get("lowPrice"))
-                            high = _safe_float(offer.get("highPrice"))
-                            if low is not None:
-                                prices.append(low)
-                            if high is not None:
-                                prices.append(high)
-                        else:
-                            price = _safe_float(offer.get("price"))
-                            if price is not None:
-                                prices.append(price)
+                        add_offer(offer, item.get("priceCurrency"))
 
             # Offer direto
-            elif item_type == "offer":
-                price = _safe_float(item.get("price"))
-                if price is not None:
-                    prices.append(price)
+            elif "offer" in item_types:
+                add_offer(item, item.get("priceCurrency"))
 
             # AggregateOffer
-            elif item_type == "aggregateoffer":
-                low = _safe_float(item.get("lowPrice"))
-                high = _safe_float(item.get("highPrice"))
-                if low is not None:
-                    prices.append(low)
-                if high is not None:
-                    prices.append(high)
+            elif "aggregateoffer" in item_types:
+                add_offer(item, item.get("priceCurrency"))
 
-    return prices if prices else None
+    return entries if entries else None
+
+
+def _resolve_currency(entries: list[dict[str, Any]] | None) -> tuple[list[float], str] | None:
+    """Reduz entradas JSON-LD a ``(prices, currency)`` quando há moeda única.
+
+    Entradas sem moeda explícita são descartadas (nunca EUR). Mais do que uma
+    moeda distinta na mesma página devolve None — ambíguo, o fetch cai para o
+    regex de moeda explícita em vez de inventar um range.
+    """
+    if not entries:
+        return None
+    labeled = [entry for entry in entries if entry.get("currency")]
+    if not labeled:
+        return None
+    currencies = {entry["currency"] for entry in labeled}
+    if len(currencies) > 1:
+        return None
+    currency = currencies.pop()
+    return [entry["price"] for entry in labeled], currency
 
 
 def _extract_regex_price(html: str) -> list[float] | None:
@@ -149,16 +203,20 @@ def _extract_regex_price(html: str) -> list[float] | None:
 
 
 def _safe_float(val: Any) -> float | None:
-    """Converte valor para float de forma segura."""
+    """Converte valor para float de forma segura.
+
+    Rejeita NaN e infinidades (``math.isfinite``) além de não-positivos: um
+    preço NaN/inf na página nunca entra no range nem na provenance.
+    """
     if val is None:
         return None
     try:
         f = float(val)
-        if f <= 0:
-            return None
-        return f
     except (ValueError, TypeError):
         return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
 
 
 def fetch_price(url: str) -> dict[str, Any] | None:
@@ -173,10 +231,19 @@ def fetch_price(url: str) -> dict[str, Any] | None:
         url: URL da landing page
 
     Returns:
-        {"source_url": str, "prices": [float, ...], "via": "http"|"firecrawl"} ou None se falhar
+        {"source_url": str, "prices": [float, ...], "currency": str,
+         "via": "http"|"firecrawl"} ou None se falhar.
+
+    A moeda vem do JSON-LD (priceCurrency normalizado) ou é ``EUR`` quando o
+    preço vem do regex, que só aceita €/EUR explícito. JSON-LD sem moeda clara
+    nunca é assumido como EUR: cai no regex ou falha.
     """
-    if not url or _is_ad_library_url(url):
+    if _sanitize_url(url) is None:
         return None
+    # A URL original é usada nos fetches; só o que é devolvido é sanitizado.
+    # Logs de falha usam a forma sanitizada (scheme+host+porta+path) — nunca a
+    # URL crua com userinfo/query/fragment.
+    safe_url = _sanitize_url(url) or ""
 
     # ── Nível 1: HTTP simples ──
     headers = {"User-Agent": BROWSER_UA}
@@ -184,24 +251,29 @@ def fetch_price(url: str) -> dict[str, Any] | None:
     try:
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     except requests.RequestException as e:
-        logger.debug("Landing price (HTTP): erro de rede para %s — %s", url[:80], e)
+        # Nunca logar o texto da exceção: pode ecoar a URL crua (userinfo/
+        # query/fragment) ou credenciais. Só o tipo da exceção e a URL
+        # sanitizada (scheme+host+path) saem do processo.
+        logger.debug("Landing price (HTTP): erro de rede para %s (%s)", safe_url, type(e).__name__)
         resp = None
 
     if resp and resp.status_code == 200:
         html = resp.text
-        prices = _extract_jsonld_price(html)
-        if not prices:
-            prices = _extract_regex_price(html)
-
+        resolved = _resolve_currency(_extract_jsonld_entries(html))
+        if resolved:
+            prices, currency = resolved
+            return {"source_url": safe_url, "prices": prices, "currency": currency, "via": "http"}
+        # JSON-LD sem moeda explícita (ou ambíguo) → regex com moeda explícita (EUR)
+        prices = _extract_regex_price(html)
         if prices:
-            return {"source_url": url, "prices": prices, "via": "http"}
+            return {"source_url": safe_url, "prices": prices, "currency": "EUR", "via": "http"}
 
     # ── Nível 2: Firecrawl (só se nível 1 não encontrou preço) ──
     firecrawl_result = _fetch_via_firecrawl(url)
     if firecrawl_result and firecrawl_result.get("prices"):
         return firecrawl_result
 
-    logger.debug("Landing price: zero preços encontrados em %s (HTTP + Firecrawl)", url[:80])
+    logger.debug("Landing price: zero preços encontrados em %s (HTTP + Firecrawl)", safe_url)
     return None
 
 
@@ -211,11 +283,15 @@ def _fetch_via_firecrawl(url: str) -> dict[str, Any] | None:
     Custa 1 credit. Só usado quando o fetch HTTP normal não encontra preço.
 
     Returns:
-        {"source_url": str, "prices": [float, ...], "via": "firecrawl"} ou None
+        {"source_url": str, "prices": [float, ...], "currency": str,
+         "via": "firecrawl"} ou None
     """
     api_key = os.getenv("FIRECRAWL_KEY")
     if not api_key:
         return None
+    safe_url = _sanitize_url(url)
+    if safe_url is None:
+        return None  # sem URL pública válida não há source_url persistível
 
     with quota.transaction(1, firecrawl=True) as reservation:
         if not reservation.available:
@@ -234,11 +310,13 @@ def _fetch_via_firecrawl(url: str) -> dict[str, Any] | None:
         try:
             resp = requests.post(FIRECRAWL_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as e:
-            logger.debug("Firecrawl: erro de rede para %s — %s", url[:80], e)
+            # Só o tipo da exceção e a URL sanitizada — nunca o texto da
+            # exceção (pode ecoar a URL crua/credenciais).
+            logger.debug("Firecrawl: erro de rede para %s (%s)", safe_url, type(e).__name__)
             return None
 
         if resp.status_code != 200:
-            logger.debug("Firecrawl: HTTP %s para %s", resp.status_code, url[:80])
+            logger.debug("Firecrawl: HTTP %s para %s", resp.status_code, safe_url)
             return None
 
         # Registar o credit (só após HTTP 200, como antes)
@@ -246,27 +324,41 @@ def _fetch_via_firecrawl(url: str) -> dict[str, Any] | None:
 
         try:
             data = resp.json()
-        except ValueError:
+        except (ValueError, TypeError):
             logger.debug("Firecrawl: resposta não é JSON válido")
             return None
 
-        # Firecrawl devolve {data: {html: "...", markdown: "..."}}
-        content = data.get("data", {})
-        html = content.get("html", "") or ""
-        markdown = content.get("markdown", "") or ""
+        # Firecrawl devolve {data: {html: "...", markdown: "..."}}. Raiz ou
+        # `data` que não sejam dict (list/null/string/falta) nunca crasham —
+        # best-effort: devolve None e o credit já foi registado (HTTP 200).
+        if not isinstance(data, dict):
+            logger.debug("Firecrawl: raiz da resposta não é objeto — ignorada")
+            return None
+        content = data.get("data")
+        if not isinstance(content, dict):
+            logger.debug("Firecrawl: campo data não é objeto — ignorada")
+            return None
+        # ``data.html`` / ``data.markdown`` têm de ser strings: valores
+        # scalar/list/dict tornam-se strings vazias e nunca chegam ao parse
+        # JSON-LD/regex (finditer exige str — um dict/list crasharia aqui).
+        raw_html = content.get("html", "")
+        raw_markdown = content.get("markdown", "")
+        html = raw_html if isinstance(raw_html, str) else ""
+        markdown = raw_markdown if isinstance(raw_markdown, str) else ""
 
-        # Parser comum: JSON-LD primeiro, depois regex
-        prices = _extract_jsonld_price(html)
-        if not prices:
-            # Tentar regex no markdown também (landings JS podem ter preço no markdown)
-            prices = _extract_regex_price(html)
+        # Parser comum: JSON-LD primeiro (com moeda), depois regex EUR explícito
+        resolved = _resolve_currency(_extract_jsonld_entries(html))
+        if resolved:
+            prices, currency = resolved
+            return {"source_url": safe_url, "prices": prices, "currency": currency, "via": "firecrawl"}
+        # JSON-LD sem moeda clara → regex EUR explícito no HTML ou markdown
+        prices = _extract_regex_price(html)
         if not prices and markdown:
             prices = _extract_regex_price(markdown)
+        if prices:
+            return {"source_url": safe_url, "prices": prices, "currency": "EUR", "via": "firecrawl"}
 
-        if not prices:
-            return None
-
-        return {"source_url": url, "prices": prices, "via": "firecrawl"}
+        return None
 
 
 def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
@@ -282,9 +374,14 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
 
     Returns:
         {
-            "price_range": {"min": float, "max": float, "currency": "EUR", "sources": int}
-            ou erro se nenhum fetch funcionou
+            "price_range": {"min": float, "max": float, "currency": str,
+                             "sources": int, "via": str},
+            "source_provenance": [{"source_url": str, "domain": str,
+                                    "via": str, "currency": str,
+                                    "min": float, "max": float}, ...],
         }
+        ou erro estruturado (inclui erro de moedas mistas, que nunca é
+        confundível com price_range).
     """
     if "error" in ads_data or not ads_data:
         return {"error": "sem dados: Facebook Ad Library via Apify indisponível (não foi possível extrair landings)"}
@@ -294,8 +391,7 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
         return {"error": "sem dados: zero ads para extrair landings"}
 
     all_prices: list[float] = []
-    sources = 0
-    via_methods: list[str] = []
+    per_source: list[dict[str, Any]] = []
     errors: list[str] = []
     firecrawl_used = False
 
@@ -306,20 +402,38 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
             continue
 
         result = fetch_price(landing_url)
-        if result and result.get("prices"):
-            all_prices.extend(result["prices"])
-            sources += 1
-            via_methods.append(result.get("via", "http"))
+        if result and result.get("prices") and result.get("currency"):
+            prices: list[float] = result["prices"]
+            all_prices.extend(prices)
+            per_source.append({
+                "source_url": result["source_url"],
+                "domain": _domain_of(result["source_url"]),
+                "via": result.get("via", "http"),
+                "currency": result["currency"],
+                "min": round(min(prices), 2),
+                "max": round(max(prices), 2),
+            })
             if result.get("via") == "firecrawl":
                 firecrawl_used = True
                 # Pausa ≥6s entre calls Firecrawl (rate limit: 10 req/min)
                 time.sleep(FIRECRAWL_PAUSE)
 
-    if not all_prices:
+    if not per_source:
         if errors:
             return {"error": "; ".join(errors[:3])}
         return {"error": "sem dados: landings não legíveis (nenhum fetch de preço bem-sucedido)"}
 
+    currencies = sorted({entry["currency"] for entry in per_source})
+    if len(currencies) > 1:
+        return {
+            "error": "sem dados: landings reportam moedas diferentes ("
+                     + ", ".join(currencies)
+                     + ") — ranges não combináveis",
+            "mixed_currencies": currencies,
+            "source_provenance": per_source,
+        }
+
+    currency = currencies[0]
     # Determinar via predominante
     via = "firecrawl" if firecrawl_used else "http"
 
@@ -327,8 +441,9 @@ def fetch_prices_from_ads(ads_data: dict[str, Any]) -> dict[str, Any]:
         "price_range": {
             "min": round(min(all_prices), 2),
             "max": round(max(all_prices), 2),
-            "currency": "EUR",
-            "sources": sources,
+            "currency": currency,
+            "sources": len(per_source),
             "via": via,
         },
+        "source_provenance": per_source,
     }

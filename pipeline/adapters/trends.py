@@ -2,7 +2,7 @@
 Adapter: Google Trends via SerpAPI.
 
 Endpoint: GET https://serpapi.com/search
-Parâmetros: engine=google_trends, q=keyword, date=today+3-m (90 dias)
+Parâmetros: engine=google_trends, q=keyword, date=today 3-m (90 dias)
 
 Cache: /data/cache/{keyword_slug}.json com TTL de 30 dias.
 Se cache válida, ZERO chamadas à API.
@@ -24,6 +24,7 @@ from typing import Any
 
 import requests
 
+from pipeline.adapters import http_errors
 from pipeline import quota
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,14 @@ logger = logging.getLogger(__name__)
 SERPAPI_URL = "https://serpapi.com/search"
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "cache")
 CACHE_TTL = 30 * 24 * 3600  # 30 dias em segundos
-REQUEST_TIMEOUT = 15
+# Tolerância a skew de relógio: timestamps de cache mais de 5 minutos no
+# futuro são inválidos (miss) — um relógio adiantado do escrevente nunca
+# serve como cache fresca nem suprime refresh.
+CLOCK_SKEW_TOLERANCE = 5 * 60
+# A live timeseries call with ``date=today 3-m`` routinely exceeds 15s on the
+# provider side; 60s is required for the Trends lookup to complete and charge
+# quota instead of timing out without charging.
+REQUEST_TIMEOUT = 60
 
 
 def _get_api_key() -> str | None:
@@ -106,7 +114,11 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
         return None
 
     cached_ts = _cached_at_value(data)
-    if cached_ts is None or time.time() - cached_ts > CACHE_TTL:
+    if (
+        cached_ts is None
+        or cached_ts > time.time() + CLOCK_SKEW_TOLERANCE
+        or time.time() - cached_ts > CACHE_TTL
+    ):
         logger.info("Trends cache: expirada/inválida para keyword=%s", keyword)
         return None
     if not _valid_full_payload(data):
@@ -142,11 +154,12 @@ def _write_cache(keyword: str, data: dict[str, Any]) -> None:
     if "error" in data:
         logger.warning("Trends cache: payload de erro NÃO escrito para keyword=%s", keyword)
         return
-    data["_cached_at"] = time.time()
+    data_to_write = dict(data)
+    data_to_write["_cached_at"] = time.time()
     path = _cache_path(keyword)
     try:
         with open(path, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data_to_write, f, ensure_ascii=False, indent=2)
         logger.info("Trends cache: escrita para keyword=%s", keyword)
     except OSError as e:
         logger.warning("Trends cache: erro ao escrever — %s", e)
@@ -173,7 +186,11 @@ def _read_related_cache(keyword: str) -> dict[str, Any] | None:
             pass
         return None
     cached_ts = _cached_at_value(data)
-    if cached_ts is None or time.time() - cached_ts > CACHE_TTL:
+    if (
+        cached_ts is None
+        or cached_ts > time.time() + CLOCK_SKEW_TOLERANCE
+        or time.time() - cached_ts > CACHE_TTL
+    ):
         logger.info("Trends related cache: expirada/inválida para keyword=%s", keyword)
         return None
     if not isinstance(data.get("related_queries"), list):
@@ -215,13 +232,81 @@ def _parse_related_queries(data: dict[str, Any]) -> list[dict[str, Any]]:
     return parsed
 
 
+def _related_score_sort_key(item: dict[str, Any]) -> tuple[int, float]:
+    """Deterministic sort key for mixed numeric/"Breakout" related scores.
+
+    Non-numeric scores ("Breakout") always sort first; numeric scores then
+    sort descending.  Sorting with ``reverse=True`` on a bare ``score`` would
+    raise TypeError on mixed types — this key never does.
+    """
+    score = item.get("score")
+    if isinstance(score, str):
+        return (0, 0.0)
+    try:
+        return (1, -float(score))
+    except (TypeError, ValueError):
+        return (0, 0.0)
+
+
+def _finite_number(value: Any) -> float | None:
+    """Finite numeric value (int/float excluding bool, or a numeric string),
+    or None for NaN/Infinity and any other shape.
+
+    Trends timeline/region values are small non-negative interest indices;
+    accepting NaN/Infinity would fabricate slope/seasonality and poison cache
+    validation, so only finite numbers ever enter the parse.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        raw = float(value)
+    elif isinstance(value, str):
+        try:
+            raw = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(raw):
+        return None
+    return raw
+
+
+def _timeline_value(point: Any) -> float | None:
+    """Finite numeric value of one timeline point, or None when malformed.
+
+    The point and its ``values[0]`` entry must both be dicts (a non-dict
+    ``values[0]`` used to crash the parse with AttributeError) and the
+    extracted value must be finite; a malformed point never fabricates a
+    trend value nor crashes.
+    """
+    if not isinstance(point, dict):
+        return None
+    values = point.get("values")
+    if not isinstance(values, list) or not values:
+        return None
+    item = values[0]
+    if not isinstance(item, dict):
+        return None
+    return _finite_number(item.get("extracted_value", 0))
+
+
 def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
     """
     Extrai informação relevante da resposta raw da SerpAPI Google Trends.
     Devolve dict com direction, slope_pct, seasonal, peak, top_geos.
+    Malformed nested shapes (non-dict points, non-dict ``values[0]``,
+    NaN/Infinity values) degrade to the same sanitized error as missing
+    timeline data — never crash, never invent a trend value.  Only finite
+    numeric values are accepted; malformed points are skipped and the peak
+    stays anchored to the real point (not a shifted timeline index).
     """
     interest_over_time = data.get("interest_over_time", {})
+    if not isinstance(interest_over_time, dict):
+        interest_over_time = {}
     timeline = interest_over_time.get("timeline_data", [])
+    if not isinstance(timeline, list):
+        timeline = []
 
     # Calcular slope % (diferença entre primeira e última metade)
     if not timeline or len(timeline) < 2:
@@ -234,14 +319,16 @@ def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
             "error": "Trends: dados insuficientes (< 2 pontos no timeline)",
         }
 
-    values = []
+    values: list[float] = []
+    points: list[tuple[dict[str, Any], float]] = []
     for point in timeline:
-        vals = point.get("values", [])
-        if vals and isinstance(vals, list) and len(vals) > 0:
-            try:
-                values.append(float(vals[0].get("extracted_value", 0)))
-            except (ValueError, TypeError, KeyError):
-                values.append(0.0)
+        if not isinstance(point, dict):
+            continue
+        value = _timeline_value(point)
+        if value is None:
+            continue
+        points.append((point, value))
+        values.append(value)
 
     if not values or len(values) < 2:
         return {
@@ -279,17 +366,26 @@ def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
     seasonal = (max_val - min_val) > avg_val if avg_val > 0 else False
     peak_idx = values.index(max_val) if seasonal else None
     peak_label = None
-    if peak_idx is not None and peak_idx < len(timeline):
-        peak_label = timeline[peak_idx].get("date", None)
+    if peak_idx is not None and peak_idx < len(points):
+        # Ancorado ao ponto real (values/points caminham juntos): um ponto
+        # malformado descartado nunca desloca o pico para a data errada.
+        peak_label = points[peak_idx][0].get("date", None)
 
-    # Top geos
+    # Top geos — só regiões com geo string e valor finito entram; itens
+    # não-dict, geo ausente e valores NaN/Inf são descartados.
     interest_by_region = data.get("interest_by_region", [])
     top_geos: list[dict[str, Any]] = []
     if isinstance(interest_by_region, list):
-        top_geos = [
-            {"geo": r.get("geo", "?"), "value": r.get("value", 0)}
-            for r in interest_by_region[:3]
-        ]
+        for region in interest_by_region[:3]:
+            if not isinstance(region, dict):
+                continue
+            geo = region.get("geo")
+            if not isinstance(geo, str) or not geo.strip():
+                continue
+            value = _finite_number(region.get("value", 0))
+            if value is None:
+                continue
+            top_geos.append({"geo": geo.strip(), "value": value})
 
     return {
         "direction": direction,
@@ -344,7 +440,7 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
         params_ts = {
             "engine": "google_trends",
             "q": keyword,
-            "date": "today+3-m",  # últimos 90 dias
+            "date": "today 3-m",  # últimos 90 dias (forma documentada da SerpAPI)
             "api_key": api_key,
         }
 
@@ -357,22 +453,30 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
             logger.warning("SerpAPI Trends: erro de rede (%s)", type(exc).__name__)
             return {"error": f"Erro de rede na SerpAPI ({type(exc).__name__})"}
 
-        if resp_ts.status_code == 403:
-            return {"error": "SerpAPI Trends: chave inválida ou quota esgotada (HTTP 403)"}
+        # 1 call gasta: a call foi realmente feita (a SerpAPI conta-a mesmo
+        # quando o HTTP/JSON falha; uma exceção de rede não chega à SerpAPI).
+        reservation.charge(1)
+
         if resp_ts.status_code != 200:
             logger.warning("SerpAPI Trends: HTTP %s", resp_ts.status_code)
-            return {"error": f"SerpAPI Trends: HTTP {resp_ts.status_code}"}
+            return {"error": http_errors.compose(
+                "SerpAPI Trends", resp_ts.status_code, resp_ts,
+                fallback="SerpAPI Trends: chave inválida ou quota esgotada (HTTP 403)"
+                if resp_ts.status_code == 403 else None,
+            )}
 
         try:
             raw_ts = resp_ts.json()
         except ValueError:
             return {"error": "SerpAPI Trends: resposta não é JSON válido"}
+        if not isinstance(raw_ts, dict):
+            # HTTP 200 mas raiz não-objeto (lista/string/null): nunca fazer
+            # ``.get``/``in`` sobre uma raiz não-dict — erro estruturado.
+            return {"error": "SerpAPI Trends: resposta inválida (raiz não é objeto JSON)"}
 
         if "error" in raw_ts:
-            return {"error": f"SerpAPI Trends: {raw_ts['error']}"}
-
-        # 1 call gasta (só após o sucesso da timeseries)
-        reservation.charge(1)
+            message = http_errors.provider_error_message(raw_ts)
+            return {"error": f"SerpAPI Trends: {message or 'erro reportado pelo fornecedor'}"}
 
         # --- Call 2: RELATED_QUERIES (saltar se timeseries_only) ---
         related_queries: list[dict[str, Any]] = []
@@ -387,9 +491,11 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
 
             try:
                 resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
+                related_call_made = True
             except Exception as exc:
                 logger.warning("SerpAPI RELATED_QUERIES: erro de rede (%s)", type(exc).__name__)
                 # Degradação graciosa: prosseguir sem related_queries
+                related_call_made = False
             else:
                 if resp_rq.status_code == 200:
                     try:
@@ -397,9 +503,9 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
                     except ValueError:
                         logger.warning("SerpAPI RELATED_QUERIES: resposta não é JSON válido")
                     else:
-                        if "error" not in raw_rq:
+                        if isinstance(raw_rq, dict) and "error" not in raw_rq:
                             rq_data = raw_rq.get("related_queries", {})
-                            rising_list = rq_data.get("rising", [])
+                            rising_list = rq_data.get("rising", []) if isinstance(rq_data, dict) else []
                             if isinstance(rising_list, list):
                                 for item in rising_list:
                                     if isinstance(item, dict):
@@ -407,12 +513,16 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
                                             "keyword": item.get("query", item.get("keyword", "")),
                                             "score": item.get("extracted_value", item.get("value", 0)),
                                         })
-                                related_queries.sort(key=lambda x: x["score"], reverse=True)
+                                # Mixed numeric/"Breakout" scores sort without TypeError:
+                                # non-numeric (Breakout) first, then numeric descending.
+                                related_queries.sort(key=_related_score_sort_key)
                 else:
                     logger.warning("SerpAPI RELATED_QUERIES: HTTP %s", resp_rq.status_code)
 
-            # 2ª call gasta (mesmo se falhou — a SerpAPI conta sempre)
-            reservation.charge(1)
+            # 2ª call gasta só quando a call foi realmente feita (a exceção de
+            # rede significa que a SerpAPI nunca recebeu o pedido).
+            if related_call_made:
+                reservation.charge(1)
 
         # Parse e cache (sempre reescrever, mesmo em force_refresh)
         result = _parse_serpapi_response(raw_ts)
@@ -456,7 +566,7 @@ def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
         # SerpAPI counts the request even when it returns an HTTP or JSON error.
         reservation.charge(1)
         if response.status_code != 200:
-            return {"error": f"SerpAPI RELATED_QUERIES: HTTP {response.status_code}"}
+            return {"error": http_errors.compose("SerpAPI RELATED_QUERIES", response.status_code, response)}
 
         try:
             raw = response.json()
@@ -465,7 +575,8 @@ def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
         if not isinstance(raw, dict):
             return {"error": "SerpAPI RELATED_QUERIES: resposta inválida"}
         if "error" in raw:
-            return {"error": f"SerpAPI RELATED_QUERIES: {raw['error']}"}
+            message = http_errors.provider_error_message(raw)
+            return {"error": f"SerpAPI RELATED_QUERIES: {message or 'erro reportado pelo fornecedor'}"}
 
         result = {"related_queries": _parse_related_queries(raw)}
         _write_related_cache(keyword, result)

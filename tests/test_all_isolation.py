@@ -34,7 +34,7 @@ def test_all_isolates_one_failing_keyword(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: dict(TRENDS))
     monkeypatch.setattr(run.serp_seo, "fetch", lambda kw: dict(SEO))
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 1, "max": 2}})
-    monkeypatch.setattr(run, "_csv_data", lambda path: dict(CSV))
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
     results = run._run_all(["ok", "boom"], send=False)
@@ -57,7 +57,7 @@ def test_sunday_loop_uses_the_same_isolation(monkeypatch, tmp_path):
     monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: dict(TRENDS))
     monkeypatch.setattr(run.serp_seo, "fetch", lambda kw: dict(SEO))
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 1, "max": 2}})
-    monkeypatch.setattr(run, "_csv_data", lambda path: dict(CSV))
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
     results = run._run_sunday(send=False)

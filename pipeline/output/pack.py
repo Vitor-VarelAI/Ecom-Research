@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
-from datetime import date
+import re
+from datetime import date, datetime
 from typing import Any
 
 from pipeline.run_state import atomic_write_json, atomic_write_text, utc_now_iso
@@ -26,6 +28,89 @@ def _slugify(keyword: str) -> str:
 def _keyword_hash(keyword: str) -> str:
     """Stable SHA-256 (12 hex chars) of the raw keyword for filename identity."""
     return hashlib.sha256(keyword.encode("utf-8")).hexdigest()[:12]
+
+
+# Observed peak labels arrive as English timeline dates ("Aug 6, 2026") or,
+# in fixtures/ISO exports, as ISO dates / year-month strings.  Month
+# abbreviations map explicitly so parsing is locale-independent.
+_PEAK_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_MONTH_DAY_YEAR = re.compile(r"^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$")
+_MONTH_YEAR = re.compile(r"^([A-Za-z]{3,9})\.?\s+(\d{4})$")
+
+
+def _parse_peak(value: Any) -> date | None:
+    """Parse an observed Trends peak label into a date.
+
+    Accepts ISO dates (``2026-08-06``), year-month (``2026-11``) and the
+    English timeline labels SerpAPI emits (``Aug 6, 2026``, ``Aug 2026``).
+    Returns None for anything unparseable, so callers never invent a deadline.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    match = _MONTH_DAY_YEAR.fullmatch(text)
+    if match:
+        month = _PEAK_MONTHS.get(match.group(1).casefold()[:3])
+        if month:
+            try:
+                return date(int(match.group(3)), month, int(match.group(2)))
+            except ValueError:
+                return None
+    match = _MONTH_YEAR.fullmatch(text)
+    if match:
+        month = _PEAK_MONTHS.get(match.group(1).casefold()[:3])
+        if month:
+            return date(int(match.group(2)), month, 1)
+    return None
+
+
+def _launch_deadline(trends_data: dict[str, Any] | None, run_date: date) -> str | None:
+    """Deadline text when a seasonal peak is strictly after ``run_date``.
+
+    Unparseable, past or equal peaks produce no deadline — the raw observed
+    peak stays visible in the seasonality evidence instead of being echoed as
+    an actionable date.
+    """
+    if not isinstance(trends_data, dict) or "error" in trends_data or not trends_data.get("seasonal"):
+        return None
+    peak_date = _parse_peak(trends_data.get("peak"))
+    if peak_date is None or peak_date <= run_date:
+        return None
+    return f"lançar antes de {peak_date.isoformat()}"
+
+
+def _peak_status(trends_data: dict[str, Any] | None, run_date: date) -> str | None:
+    """Timing label for an observed seasonal peak relative to ``run_date``.
+
+    - parsed strictly after ``run_date`` → ``futuro`` (upcoming window);
+    - parsed on or before ``run_date`` → ``histórico`` (already observed);
+    - unparseable → ``não verificado`` (observed, but no timing evidence).
+
+    Returns None when there is no seasonal-peak evidence, so callers render
+    nothing instead of inventing timing advice.
+    """
+    if not isinstance(trends_data, dict) or "error" in trends_data or not trends_data.get("seasonal"):
+        return None
+    peak_date = _parse_peak(trends_data.get("peak"))
+    if peak_date is None:
+        return "não verificado"
+    if peak_date > run_date:
+        return "futuro"
+    return "histórico"
 
 
 def _pack_paths(
@@ -70,13 +155,23 @@ def _pack_paths(
     )
 
 
-def _format_trends_section(trends_data: dict[str, Any]) -> str:
+def _format_trends_section(trends_data: dict[str, Any], run_date: date) -> str:
     if "error" in trends_data:
         return f"- sem dados: {trends_data['error']}"
     lines = [
         f"- Direção 90 dias: {trends_data.get('direction', '?')} ({trends_data.get('slope_pct', 0.0):+.1f}%)",
-        f"- Sazonalidade: {'sim (pico: ' + str(trends_data.get('peak')) + ')' if trends_data.get('seasonal') else 'não'}",
     ]
+    if trends_data.get("seasonal"):
+        peak = str(trends_data.get("peak"))
+        status = _peak_status(trends_data, run_date)
+        if status == "futuro":
+            lines.append(f"- Sazonalidade: sim (pico: {peak}, futuro)")
+        elif status == "histórico":
+            lines.append(f"- Sazonalidade: sim (pico: {peak}, histórico — pico já passado)")
+        else:
+            lines.append(f"- Sazonalidade: sim (pico: {peak}, não verificado — sem data de pico)")
+    else:
+        lines.append("- Sazonalidade: não")
     top_geos = trends_data.get("top_geos", [])
     if top_geos:
         lines.append("- Geos quentes: " + ", ".join(f"{item.get('geo', '?')} ({item.get('value', 0)})" for item in top_geos))
@@ -117,7 +212,7 @@ def _format_ads_section(ads_data: dict[str, Any]) -> str:
         return f"- sem dados: {ads_data['error']}"
     lines = [
         f"- Fonte: {ads_data.get('source', 'Facebook Ad Library via Apify')}",
-        f"- Total de ads ativos para o nicho: {ads_data.get('total_ads', 0)}",
+        f"- Evidência global de ads ativos para o nicho: {ads_data.get('total_ads', 0)}",
     ]
     top_ads = ads_data.get("top_ads", [])
     if top_ads:
@@ -137,6 +232,12 @@ def _format_ads_section(ads_data: dict[str, Any]) -> str:
         lines.append("- Exemplos de copy: sem dados")
     lines.append(f"- Saturação: {ads_data.get('saturation', '?')}")
     lines.append(f"- Amostra: {ads_data.get('raw_ads_count', 0)}/{ads_data.get('sample_limit', 100)}; capped={ads_data.get('sample_capped', False)}")
+    lines.append(
+        f"- Filtrados: inativos={ads_data.get('filtered_inactive_count', 0)} | "
+        f"irrelevantes={ads_data.get('filtered_irrelevant_count', 0)} | "
+        f"total excluídos={ads_data.get('filtered_out_count', 0)} | "
+        f"retidos={ads_data.get('total_ads', 0)}"
+    )
     return "\n".join(lines)
 
 
@@ -208,12 +309,18 @@ def _build_market_rows(trends_data: dict[str, Any], ads_data: dict[str, Any]) ->
 
 def _format_market_signals(rows: list[dict[str, Any]]) -> str:
     lines = [
-        "| country | Trends demand | advertisers observed | ads observed |",
-        "|---------|----------------|----------------------|--------------|",
+        "| country | Trends demand | advertisers observed (top-ad sample) | ads observed (top-ad sample) |",
+        "|---------|----------------|---------------------------------------|-----------------------------|",
     ]
     lines.extend(
         f"| {row['country']} | {row['trends_demand']} | {row['advertisers_observed']} | {row['ads_observed']} |"
         for row in rows
+    )
+    lines.append(
+        "- Nota: a evidência de Ads Library é descoberta global (query country=ALL) — "
+        "não prova fit PT/ES/FR; contagens de anunciantes e ads vêm apenas de "
+        "top_ads (top-ad sample), não da coorte global retida; células em branco "
+        "('—') significam desconhecido, não zero."
     )
     return "\n".join(lines)
 
@@ -243,32 +350,69 @@ def _format_cohort_section(ad_cohort: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+_ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+
+
+def _valid_price_range(price: Any) -> bool:
+    """True quando um price_range tem moeda ISO de 3 letras e min/max finitos
+    e positivos, com min <= max.  Nunca se assume moeda ausente (nem EUR);
+    min/max ausentes, não numéricos, NaN/Inf, não positivos ou invertidos
+    (min > max) tornam o range inválido — nunca se renderiza um range
+    invertido."""
+    if not isinstance(price, dict):
+        return False
+    currency = price.get("currency")
+    if not isinstance(currency, str) or not _ISO_CURRENCY_RE.fullmatch(currency):
+        return False
+    for key in ("min", "max"):
+        value = price.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            return False
+    if float(price["min"]) > float(price["max"]):
+        return False
+    return True
+
+
 def _format_decision(
     keyword: str,
     score_result: dict[str, Any],
     trends_data: dict[str, Any],
     ads_data: dict[str, Any],
     landing_price_data: dict[str, Any] | None,
+    run_date: date,
 ) -> str:
     label = score_result.get("label", "DADOS INSUFICIENTES")
-    if label == "AVANÇAR":
-        vender = "SIM"
-    elif label == "OBSERVAR":
-        vender = "OBSERVAR"
-    elif label == "DESCARTAR":
-        vender = "NÃO"
-    else:
-        vender = "DADOS INSUFICIENTES"
 
     seasonal = ""
-    if "error" not in trends_data and trends_data.get("seasonal"):
-        seasonal = f" — lançar antes de {trends_data.get('peak', 'pico')}"
-    lines = [f"{keyword} — DECISÃO", f"Vender?    {vender}{seasonal}", "Mercado:   decisão manual"]
+    deadline = _launch_deadline(trends_data, run_date)
+    if deadline:
+        seasonal = f" — {deadline}"
+    lines = [
+        f"{keyword} — DECISÃO",
+        f"Sinal advisory: {label}{seasonal}",
+        "Mercado:   decisão manual",
+        "Validação: revisão manual obrigatória antes de qualquer ação (produto, mercado, margem, campanha)",
+    ]
 
-    if landing_price_data and "price_range" in landing_price_data:
+    if landing_price_data and "price_range" in landing_price_data and _valid_price_range(landing_price_data.get("price_range")):
         price = landing_price_data["price_range"]
-        target = round(price["min"] / 3, 2)
-        lines.append(f"Preço:     €{price['min']:.2f}–€{price['max']:.2f} → sourcing manual: margem ok se custo < €{target:.2f}")
+        currency = str(price["currency"]).upper()
+        target = round(float(price["min"]) / 3, 2)
+        min_v = float(price["min"])
+        max_v = float(price["max"])
+        if currency == "EUR":
+            lines.append(f"Preço:     €{min_v:.2f}–€{max_v:.2f} → sourcing manual: margem ok se custo < €{target:.2f}")
+        else:
+            lines.append(
+                f"Preço:     {currency} {min_v:.2f}–{currency} {max_v:.2f} "
+                f"(moeda do mercado de origem) → margem: custo < {currency} {target:.2f}"
+            )
+            lines.append(
+                "Nota:      preços observados em moeda do mercado de origem (não EUR) — "
+                "não comparar diretamente com EUR/Portugal sem conversão"
+            )
     elif landing_price_data and "error" in landing_price_data:
         lines.append(f"Preço:     sem dados ({landing_price_data['error']})")
     else:
@@ -277,9 +421,13 @@ def _format_decision(
     advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
     if advertisers:
         top = advertisers[0]
-        lines.append(f"Prova:     {top.get('page_name', '?')}: {top.get('active_ads', 0)} variantes ativas, anúncio mais antigo com {top.get('oldest_ad_days', 0)} dias")
+        lines.append(
+            f"Prova global: {top.get('page_name', '?')}: "
+            f"{top.get('active_ads', 0)} variantes ativas na coorte global, "
+            f"anúncio mais antigo com {top.get('oldest_ad_days', 0)} dias"
+        )
     else:
-        lines.append("Prova:     sem escala detetada")
+        lines.append("Prova global: sem escala detetada")
 
     if label == "DADOS INSUFICIENTES" or "error" in ads_data:
         risk = "repetir quando o Apify estiver disponível"
@@ -400,10 +548,10 @@ def generate(
     md_content = f"""# RESEARCH PACK — {keyword} — {run_date.isoformat()}
 
 ## DECISÃO
-{_format_decision(keyword, score_result, trends_data, ads_data, landing_price_data)}
+{_format_decision(keyword, score_result, trends_data, ads_data, landing_price_data, run_date)}
 
 ## Trend Signal (Google Trends via SerpAPI)
-{_format_trends_section(trends_data)}
+{_format_trends_section(trends_data, run_date)}
 
 ## Sugestões de keywords — aprovação manual
 {_format_suggestions(suggested_keywords)}
@@ -479,7 +627,10 @@ def generate_digest_line(
     ads_data: dict[str, Any] | None = None,
     landing_price_data: dict[str, Any] | None = None,
     trends_data: dict[str, Any] | None = None,
+    run_date: date | None = None,
 ) -> str:
+    if run_date is None:
+        run_date = date.today()
     score_value = score_result.get("score", 0)
     label = score_result.get("label", "DADOS INSUFICIENTES")
     if ads_data is None:
@@ -487,10 +638,11 @@ def generate_digest_line(
     advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
     proof = f"{advertisers[0].get('page_name', '?')} ({advertisers[0].get('active_ads', 0)} variantes)" if advertisers else "sem escala detetada"
     seasonal = ""
-    if trends_data and "error" not in trends_data and trends_data.get("seasonal"):
-        seasonal = f" (lançar antes de {trends_data.get('peak', 'pico')})"
+    deadline = _launch_deadline(trends_data, run_date)
+    if deadline:
+        seasonal = f" ({deadline})"
     return (
         f"{keyword} — Score: {score_value}/100 ({label})\n"
-        f"Vender? {('SIM' if label == 'AVANÇAR' else 'NÃO' if label == 'DESCARTAR' else label)}{seasonal} | "
-        f"Mercado: decisão manual | Prova: {proof}"
+        f"Sinal advisory: {label}{seasonal} | "
+        f"Mercado: decisão manual | Prova global: {proof} (coorte global) | Ação: validação manual"
     )

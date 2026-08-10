@@ -43,7 +43,7 @@ def _install_stack(monkeypatch, tmp_path, boom_attempts_before_success=1):
     monkeypatch.setattr(run.trends, "fetch", trends)
     monkeypatch.setattr(run.serp_seo, "fetch", lambda kw: dict(SEO))
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 1, "max": 2}})
-    monkeypatch.setattr(run, "_csv_data", lambda path: dict(CSV))
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     generated = []
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
     return calls, generated, state

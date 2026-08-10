@@ -40,7 +40,7 @@ def test_apify_failure_continues_paid_sources_without_false_descartar(monkeypatc
     monkeypatch.setattr(run.trends, "fetch", trends)
     monkeypatch.setattr(run.serp_seo, "fetch", seo)
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: calls.__setitem__("landing", 1))
-    monkeypatch.setattr(run, "_csv_data", lambda path: CSV)
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
     result = run.run_keyword("mochila")
@@ -56,7 +56,7 @@ def test_zero_ads_skips_seo_and_landing_but_fetches_related_once(monkeypatch):
     monkeypatch.setattr(run.trends, "fetch_related", lambda keyword: calls.__setitem__("related", calls["related"] + 1) or {"related_queries": [{"keyword": "mochila escolar", "score": 100}]})
     monkeypatch.setattr(run.serp_seo, "fetch", lambda keyword: calls.__setitem__("seo", 1))
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: calls.__setitem__("landing", 1))
-    monkeypatch.setattr(run, "_csv_data", lambda path: CSV)
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
     result = run.run_keyword("mochila")
@@ -64,6 +64,72 @@ def test_zero_ads_skips_seo_and_landing_but_fetches_related_once(monkeypatch):
     assert calls == {"apify": 1, "related": 1, "seo": 0, "landing": 0}
     assert result["score_result"]["label"] == "DESCARTAR"
     assert result["suggested_keywords"][0]["status"] == "proposed"
+
+
+def test_run_keyword_filters_irrelevant_related_queries_end_to_end(monkeypatch, tmp_path):
+    """The product-relevance filter runs once over a copy of trends_data
+    before suggestions and pack rendering: a related query sharing only the
+    geographic token (``volta a portugal 2026`` for ``camisolas portugal``)
+    must never surface in suggestions, pack Markdown, pack JSON or digest —
+    and the bounded audit (raw/retained counts, head token, policy) is
+    persisted in the run artifact without the excluded query text."""
+    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
+    packs_dir.mkdir()
+    data_dir.mkdir()
+
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+        run_date = run_date or date.today()
+        slug = run.pack._slugify(keyword)
+        base = f"{run_date.isoformat()}--{slug}"
+        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+
+    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
+    monkeypatch.setattr(run.apify_ads, "fetch", lambda keyword: {**ADS, "total_ads": 5})
+    monkeypatch.setattr(
+        run.trends, "fetch",
+        lambda keyword: {
+            "direction": "subida", "slope_pct": 10.0, "seasonal": False, "top_geos": [],
+            "related_queries": [
+                {"keyword": "camisola portugal preta", "score": 100},
+                {"keyword": "volta a portugal 2026", "score": 90},
+                {"keyword": "camisolas de algodão", "score": 80},
+            ],
+        },
+    )
+    monkeypatch.setattr(run.serp_seo, "fetch", lambda keyword: SEO)
+    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 10, "max": 20}})
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
+
+    result = run.run_keyword("camisolas portugal")
+
+    # Suggestions: ranking preserved within retained candidates, proposed.
+    assert [s["keyword"] for s in result["suggested_keywords"]] == [
+        "camisola portugal preta",
+        "camisolas de algodão",
+    ]
+    assert all(s["status"] == "proposed" for s in result["suggested_keywords"])
+
+    # Pack JSON: filtered list + bounded audit, never the excluded query text.
+    json_path = result["md_path"].replace("/packs/", "/data/").replace(".md", ".json")
+    raw = json.load(open(json_path, encoding="utf-8"))
+    rendered = [q["keyword"] for q in raw["trends"]["related_queries"]]
+    assert "volta a portugal 2026" not in rendered
+    audit = raw["trends"]["related_queries_filter"]
+    assert audit["raw_count"] == 3
+    assert audit["retained_count"] == 2
+    assert audit["head_token"] == "camisolas"
+    assert "volta a portugal 2026" not in json.dumps(raw)
+
+    # Pack Markdown renders only retained queries.
+    content = open(result["md_path"], encoding="utf-8").read()
+    assert "volta a portugal 2026" not in content
+    assert "camisola portugal preta" in content
+    assert "camisolas de algodão" in content
+
+    # Digest uses the filtered suggestions.
+    digest = run._digest_text([result], "TESTE", run_date=date.today())
+    assert "volta a portugal 2026" not in digest
+    assert "camisola portugal preta" in digest
 
 
 def _write_previous(tmp_path, keyword="mochila", label="OBSERVAR"):
@@ -254,3 +320,129 @@ def test_monthly_has_one_forced_trends_call_and_no_apify_or_landing(monkeypatch,
     assert len(trends_calls) == 1
     assert trends_calls[0][1] == {"timeseries_only": True, "force_refresh": True}
     assert results[0]["score_result"]["label"] in {"OBSERVAR", "AVANÇAR", "DESCARTAR"}
+
+
+# ── Landing URL privacy end-to-end ─────────────────────────────────────────
+
+
+def test_run_keyword_persists_only_sanitized_landing_urls(monkeypatch, tmp_path):
+    """A URL crua de landing (com userinfo/query/fragment) só pode ser usada
+    no fetch real.  O result, o pack JSON e o checkpoint/manifesto guardam
+    sempre a forma sanitizada (scheme + host + porta segura + path)."""
+    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
+    packs_dir.mkdir()
+    data_dir.mkdir()
+    raw_url = "https://user:pass@shop.example/produto?api_key=TOPSECRET&utm_source=fb#frag"
+
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+        run_date = run_date or date.today()
+        slug = run.pack._slugify(keyword)
+        base = f"{run_date.isoformat()}--{slug}"
+        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+
+    consumed = []
+
+    def fetch_prices(ads_data):
+        # A função de preços consome a URL crua (é o fetch real).
+        consumed.append(ads_data["top_ads"][0]["landing_url"])
+        return {"price_range": {"min": 10.0, "max": 20.0, "currency": "EUR", "sources": 1}}
+
+    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
+    monkeypatch.setattr(
+        run.apify_ads, "fetch",
+        lambda keyword: {**ADS, "top_ads": [{**ADS["top_ads"][0], "landing_url": raw_url}]},
+    )
+    monkeypatch.setattr(run.trends, "fetch", lambda keyword: TRENDS)
+    monkeypatch.setattr(run.serp_seo, "fetch", lambda keyword: SEO)
+    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", fetch_prices)
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
+
+    result = run.run_keyword("mochila")
+
+    # O fetch consumiu a URL crua exactamente como veio do Apify.
+    assert consumed == [raw_url]
+    # O result já carrega a URL sanitizada.
+    persisted = result["ads_data"]["top_ads"][0]["landing_url"]
+    assert persisted == "https://shop.example/produto"
+    assert "TOPSECRET" not in persisted and "user:pass" not in persisted
+
+    # Pack JSON serializado: nunca a URL crua, sempre a sanitizada.
+    json_path = result["md_path"].replace("/packs/", "/data/").replace(".md", ".json")
+    raw_pack = open(json_path, encoding="utf-8").read()
+    assert "https://shop.example/produto" in raw_pack
+    assert "TOPSECRET" not in raw_pack
+    assert "user:pass" not in raw_pack
+    assert "api_key=TOPSECRET" not in raw_pack
+    assert "utm_source=fb" not in raw_pack
+    assert "#frag" not in raw_pack
+
+    # Pack Markdown também.
+    md_content = open(result["md_path"], encoding="utf-8").read()
+    assert "TOPSECRET" not in md_content
+    assert "user:pass" not in md_content
+
+
+def test_run_keyword_failure_branch_also_sanitizes(monkeypatch, tmp_path):
+    """Mesmo com landing a falhar, o ads_data serializado no result nunca\n    carrega a URL crua (branch zero-ads/apify-error incluídos)."""
+    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
+    packs_dir.mkdir()
+    data_dir.mkdir()
+    raw_url = "https://loja.example/x?token=secret#h"
+
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+        run_date = run_date or date.today()
+        slug = run.pack._slugify(keyword)
+        base = f"{run_date.isoformat()}--{slug}"
+        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+
+    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
+    monkeypatch.setattr(
+        run.apify_ads, "fetch",
+        lambda keyword: {**ADS, "total_ads": 0, "ad_ids": [], "top_ads": [], "advertisers": []},
+    )
+    monkeypatch.setattr(run.trends, "fetch_related", lambda keyword: {"related_queries": []})
+    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"error": "x"})
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
+
+    result = run.run_keyword("mochila")
+
+    blob = json.dumps(result["ads_data"])
+    assert "secret" not in blob and "token=" not in blob
+
+
+def test_run_keyword_keeps_public_ad_library_link_with_ad_id(monkeypatch, tmp_path):
+    """A referência pública da Ad Library (``link`` com ad-ID) é permitida e
+    sobrevive intacta à serialização — só a landing_url é sanitizada."""
+    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
+    packs_dir.mkdir()
+    data_dir.mkdir()
+    library_link = "https://www.facebook.com/ads/library/?id=123456789"
+
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+        run_date = run_date or date.today()
+        slug = run.pack._slugify(keyword)
+        base = f"{run_date.isoformat()}--{slug}"
+        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+
+    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
+    monkeypatch.setattr(
+        run.apify_ads, "fetch",
+        lambda keyword: {**ADS, "top_ads": [
+            {**ADS["top_ads"][0], "landing_url": "https://shop.example/p?token=hush", "link": library_link}
+        ]},
+    )
+    monkeypatch.setattr(run.trends, "fetch", lambda keyword: TRENDS)
+    monkeypatch.setattr(run.serp_seo, "fetch", lambda keyword: SEO)
+    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 10.0, "max": 20.0, "currency": "EUR", "sources": 1}})
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
+
+    result = run.run_keyword("mochila")
+
+    ad = result["ads_data"]["top_ads"][0]
+    assert ad["landing_url"] == "https://shop.example/p"      # sanitizada
+    assert ad["link"] == library_link                          # pública, mantida
+
+    json_path = result["md_path"].replace("/packs/", "/data/").replace(".md", ".json")
+    raw_pack = open(json_path, encoding="utf-8").read()
+    assert library_link in raw_pack
+    assert "token=hush" not in raw_pack

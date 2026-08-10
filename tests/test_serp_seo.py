@@ -183,6 +183,7 @@ class TestSerpSEOParse:
         # Primeira call — vai à API
         result1 = serp_seo.fetch("cache-seo-test")
         assert call_count == 1
+        assert "_cached_at" not in result1  # fresh adapter output has no cache metadata
         assert quota.get_usage()["calls"] == 1
 
         # Segunda call — cache hit
@@ -191,3 +192,174 @@ class TestSerpSEOParse:
         assert "_cached_at" not in result2
         assert result2["ads_count"] == 2
         assert quota.get_usage()["calls"] == 1  # cache hit: zero gastos
+
+
+class TestSerpSEOShapes:
+    """HTTP-200 com shapes malformados nunca crasham: raiz não-dict devolve
+    erro estruturado sanitizado; nested organic/ads/PAA degradam a dados
+    seguros (listas vazias / contagem 0) em vez de AttributeError/TypeError."""
+
+    def _fetch(self, monkeypatch, tmp_path, payload, keyword="mochila shapes"):
+        monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        monkeypatch.setattr(serp_seo, "CACHE_DIR", str(tmp_path))
+
+        class MockResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return payload
+
+        monkeypatch.setattr(serp_seo.requests, "get", lambda url, params, timeout: MockResponse())
+        _isolate_quota(monkeypatch, tmp_path)
+        return serp_seo.fetch(keyword)
+
+    @pytest.mark.parametrize("bad_root", [[], None, "texto", 42, True])
+    def test_non_dict_root_returns_structured_error(self, monkeypatch, tmp_path, bad_root):
+        result = self._fetch(monkeypatch, tmp_path, bad_root)
+        assert "error" in result
+        assert "raiz não é objeto JSON" in result["error"]
+        assert "organic_results" not in result
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"organic_results": "garbage"},                 # non-list organic
+            {"organic_results": [{"position": 1}, "x"]},    # non-dict item
+            {"organic_results": [{"position": 1}, None]},   # None item
+            {"organic_results": []},
+        ],
+    )
+    def test_malformed_organic_degrades_safely(self, monkeypatch, tmp_path, payload):
+        result = self._fetch(monkeypatch, tmp_path, payload)
+        assert "error" not in result
+        assert isinstance(result["organic_results"], list)
+        assert all(isinstance(item, dict) for item in result["organic_results"])
+        assert result["seo_opportunity"] in ("alta", "média", "baixa")
+
+    @pytest.mark.parametrize(
+        "ads_field",
+        [{"ads": "garbage"}, {"shopping_ads": 7}, {"inline_ads": {"x": 1}}, {}],
+    )
+    def test_malformed_ads_degrades_to_zero(self, monkeypatch, tmp_path, ads_field):
+        payload = {"organic_results": [], **ads_field}
+        result = self._fetch(monkeypatch, tmp_path, payload)
+        assert "error" not in result
+        assert result["ads_count"] == 0
+
+    @pytest.mark.parametrize(
+        "paa_field",
+        [{"related_questions": "garbage"}, {"related_questions": [{"question": "ok"}, "x"]}],
+    )
+    def test_malformed_paa_degrades_to_list(self, monkeypatch, tmp_path, paa_field):
+        payload = {"organic_results": [], **paa_field}
+        result = self._fetch(monkeypatch, tmp_path, payload)
+        assert "error" not in result
+        assert isinstance(result["paa_questions"], list)
+        assert all(isinstance(q, str) for q in result["paa_questions"])
+
+    def test_nested_organic_values_missing_do_not_crash(self, monkeypatch, tmp_path):
+        payload = {"organic_results": [{"position": 1}]}  # sem link/title
+        result = self._fetch(monkeypatch, tmp_path, payload)
+        assert "error" not in result
+        assert result["organic_results"][0]["domain"] == ""
+        assert result["organic_results"][0]["title"] == ""
+
+
+class TestSerpSEOChargesExactlyOncePerResponse:
+    """Quota SERP SEO: uma vez que ``requests.get`` devolve uma resposta, a
+    call é cobrada exactamente uma vez — mesmo para HTTP de erro, JSON
+    inválido ou payload de erro do provider (a SerpAPI conta-a).  Não há
+    cobrança quando faltam credenciais ou o transporte levanta antes de
+    qualquer resposta."""
+
+    def _fetch_with(self, monkeypatch, tmp_path, make_response):
+        monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        monkeypatch.setattr(serp_seo, "CACHE_DIR", str(tmp_path))
+        _isolate_quota(monkeypatch, tmp_path)
+        monkeypatch.setattr(serp_seo.requests, "get", lambda *a, **k: make_response())
+        return serp_seo.fetch("quota-charge-test")
+
+    def test_http_error_charges_exactly_once(self, monkeypatch, tmp_path):
+        class MockResponse:
+            status_code = 429
+            text = ""
+
+        result = self._fetch_with(monkeypatch, tmp_path, lambda: MockResponse())
+        assert "error" in result
+        assert quota.get_usage()["calls"] == 1
+
+    def test_invalid_json_charges_exactly_once(self, monkeypatch, tmp_path):
+        class MockResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                raise ValueError("não é JSON")
+
+        result = self._fetch_with(monkeypatch, tmp_path, lambda: MockResponse())
+        assert "error" in result
+        assert "JSON" in result["error"]
+        assert quota.get_usage()["calls"] == 1
+
+    def test_provider_error_payload_charges_exactly_once(self, monkeypatch, tmp_path):
+        class MockResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {"error": "rate limit exceeded"}
+
+        result = self._fetch_with(monkeypatch, tmp_path, lambda: MockResponse())
+        assert "error" in result
+        assert quota.get_usage()["calls"] == 1
+
+    def test_non_dict_root_charges_exactly_once(self, monkeypatch, tmp_path):
+        class MockResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return ["raiz não-objeto"]
+
+        result = self._fetch_with(monkeypatch, tmp_path, lambda: MockResponse())
+        assert "error" in result
+        assert quota.get_usage()["calls"] == 1
+
+    def test_success_charges_exactly_once(self, monkeypatch, tmp_path):
+        class MockResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {"organic_results": [], "ads": [], "related_questions": []}
+
+        result = self._fetch_with(monkeypatch, tmp_path, lambda: MockResponse())
+        assert "error" not in result
+        assert quota.get_usage()["calls"] == 1
+
+    def test_transport_exception_charges_nothing(self, monkeypatch, tmp_path):
+        """Exceção de rede antes de qualquer resposta: a SerpAPI nunca viu o
+        pedido, nada é cobrado."""
+        def raise_network(*args, **kwargs):
+            raise serp_seo.requests.ConnectionError("net down")
+
+        monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        monkeypatch.setattr(serp_seo, "CACHE_DIR", str(tmp_path))
+        _isolate_quota(monkeypatch, tmp_path)
+        monkeypatch.setattr(serp_seo.requests, "get", raise_network)
+        result = serp_seo.fetch("quota-transport-test")
+        assert "error" in result
+        assert quota.get_usage()["calls"] == 0
+
+    def test_missing_credentials_charge_nothing(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("SERPAPI_KEY", raising=False)
+        monkeypatch.setattr(serp_seo, "CACHE_DIR", str(tmp_path))
+        _isolate_quota(monkeypatch, tmp_path)
+        result = serp_seo.fetch("quota-no-key-test")
+        assert "error" in result
+        assert quota.get_usage()["calls"] == 0

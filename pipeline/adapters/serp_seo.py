@@ -26,12 +26,17 @@ import requests
 
 from pipeline import quota
 
+from pipeline.adapters import http_errors
+
 logger = logging.getLogger(__name__)
 
 SERPAPI_URL = "https://serpapi.com/search"
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 CACHE_DIR = os.path.join(REPO_ROOT, "data", "cache")
 CACHE_TTL = 30 * 24 * 3600  # 30 dias em segundos
+# Tolerância a skew de relógio: timestamps de cache mais de 5 minutos no
+# futuro são inválidos (miss) — um relógio adiantado nunca serve cache fresca.
+CLOCK_SKEW_TOLERANCE = 5 * 60
 REQUEST_TIMEOUT = 15
 
 # Domínios de marketplaces conhecidos (PT/ES/BR)
@@ -60,19 +65,43 @@ def _cache_path(keyword: str) -> str:
     return os.path.join(CACHE_DIR, f"{_slugify(keyword)}_serp.json")
 
 
+def _valid_organic_item(item: Any) -> bool:
+    """One cached organic entry must be a dict whose ``position`` is a finite
+    number (not bool) and whose ``domain``/``title`` are strings — exactly the
+    shape ``_parse_serp_response`` produces and pack rendering consumes.  A
+    malformed entry (non-dict, NaN position, non-str title) would crash or
+    poison pack rendering, so it makes the whole payload a miss."""
+    if not isinstance(item, dict):
+        return False
+    position = item.get("position")
+    if isinstance(position, bool) or not isinstance(position, (int, float)):
+        return False
+    if not math.isfinite(float(position)):
+        return False
+    if not isinstance(item.get("domain"), str):
+        return False
+    if not isinstance(item.get("title"), str):
+        return False
+    return True
+
+
 def _valid_payload(data: dict[str, Any]) -> bool:
-    """A SEO cache hit must carry the full parsed shape: ``organic_results``
-    as a list, ``ads_count`` as a finite number, ``paa_questions`` as a list
-    and ``seo_opportunity`` as a non-empty string.  Anything else is a miss
-    — malformed valid JSON must never be served nor suppress a refresh."""
-    if not isinstance(data.get("organic_results"), list):
+    """A SEO cache hit must carry the full parsed shape, deeply validated:
+    ``organic_results`` a list of well-formed entries (dict, finite numeric
+    position, string domain/title), ``ads_count`` a finite number,
+    ``paa_questions`` a list of strings and ``seo_opportunity`` a non-empty
+    string.  Anything else is a miss — malformed valid JSON must never be
+    served (it could crash pack rendering later) nor suppress a refresh."""
+    organic = data.get("organic_results")
+    if not isinstance(organic, list) or not all(_valid_organic_item(item) for item in organic):
         return False
     ads_count = data.get("ads_count")
     if isinstance(ads_count, bool) or not isinstance(ads_count, (int, float)):
         return False
     if not math.isfinite(float(ads_count)):
         return False
-    if not isinstance(data.get("paa_questions"), list):
+    paa = data.get("paa_questions")
+    if not isinstance(paa, list) or not all(isinstance(item, str) for item in paa):
         return False
     opportunity = data.get("seo_opportunity")
     if not isinstance(opportunity, str) or not opportunity:
@@ -111,7 +140,11 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
     if isinstance(cached_ts, bool) or not isinstance(cached_ts, (int, float)):
         logger.warning("SERP cache: timestamp inválido para keyword=%s", keyword)
         return None
-    if not math.isfinite(float(cached_ts)) or time.time() - cached_ts > CACHE_TTL:
+    if (
+        not math.isfinite(float(cached_ts))
+        or cached_ts > time.time() + CLOCK_SKEW_TOLERANCE
+        or time.time() - cached_ts > CACHE_TTL
+    ):
         logger.info("SERP cache: expirada/inválida para keyword=%s", keyword)
         return None
     if not _valid_payload(data):
@@ -123,12 +156,13 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
 
 
 def _write_cache(keyword: str, data: dict[str, Any]) -> None:
-    """Escreve dados na cache com timestamp."""
-    data["_cached_at"] = time.time()
+    """Escreve dados na cache com timestamp sem mutar o resultado fresco."""
+    data_to_write = dict(data)
+    data_to_write["_cached_at"] = time.time()
     path = _cache_path(keyword)
     try:
         with open(path, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data_to_write, f, ensure_ascii=False, indent=2)
         logger.info("SERP cache: escrita para keyword=%s", keyword)
     except OSError as e:
         logger.warning("SERP cache: erro ao escrever — %s", e)
@@ -188,10 +222,15 @@ def _parse_serp_response(data: dict[str, Any]) -> dict[str, Any]:
     Extrai informação relevante da resposta raw da SerpAPI Google SERP.
     Devolve dict com organic_results, ads_count, paa_questions, seo_opportunity.
     """
-    # Top 10 orgânicos
+    # Top 10 orgânicos — tolerante a shapes malformados (organic_results
+    # não-lista, itens não-dict, ``link`` ausente) nunca crasham.
     organic_raw = data.get("organic_results", [])
     organic_results: list[dict[str, Any]] = []
+    if not isinstance(organic_raw, list):
+        organic_raw = []
     for r in organic_raw[:10]:
+        if not isinstance(r, dict):
+            continue
         link = r.get("link", "")
         organic_results.append({
             "position": r.get("position", 0),
@@ -199,9 +238,10 @@ def _parse_serp_response(data: dict[str, Any]) -> dict[str, Any]:
             "title": r.get("title", ""),
         })
 
-    # Ads count
-    ads_results = data.get("ads", []) or data.get("shopping_ads", []) or data.get("inline_ads", [])
-    ads_count = len(ads_results) if isinstance(ads_results, list) else 0
+    # Ads count — ``ads``/``shopping_ads``/``inline_ads`` podem faltar ou ser
+    # não-lista; qualquer shape inválido degrada para 0, nunca crasha.
+    ads_raw = data.get("ads") or data.get("shopping_ads") or data.get("inline_ads")
+    ads_count = len(ads_raw) if isinstance(ads_raw, list) else 0
 
     # PAA (People Also Ask) — top 3
     related_questions = data.get("related_questions", [])
@@ -268,27 +308,38 @@ def fetch(keyword: str) -> dict[str, Any]:
         except Exception as exc:
             # Never propagate or log raw exception text/URL: it can echo the
             # request, including the api_key query parameter.  Log only the
-            # exception type; return a stable sanitized message.
+            # exception type; return a stable sanitized message.  A transport
+            # exception means SerpAPI never received the request — nothing is
+            # charged.
             logger.warning("SerpAPI SERP: erro de rede (%s)", type(exc).__name__)
             return {"error": f"Erro de rede na SerpAPI (SERP) ({type(exc).__name__})"}
 
-        if resp.status_code == 403:
-            return {"error": "SerpAPI SERP: chave inválida ou quota esgotada (HTTP 403)"}
+        # A call foi realmente feita: a SerpAPI conta-a mesmo quando o HTTP ou
+        # o JSON falham (como nas Trends).  Cobra exactamente uma vez, logo
+        # após a resposta — nunca em dobro, nunca antes de haver resposta.
+        reservation.charge(1)
+
         if resp.status_code != 200:
             logger.warning("SerpAPI SERP: HTTP %s", resp.status_code)
-            return {"error": f"SerpAPI SERP: HTTP {resp.status_code}"}
+            return {"error": http_errors.compose(
+                "SerpAPI SERP", resp.status_code, resp,
+                fallback="SerpAPI SERP: chave inválida ou quota esgotada (HTTP 403)"
+                if resp.status_code == 403 else None,
+            )}
 
         try:
             raw = resp.json()
         except ValueError:
             return {"error": "SerpAPI SERP: resposta não é JSON válido"}
+        if not isinstance(raw, dict):
+            # HTTP 200 mas raiz não-objeto: nunca ``.get``/``in`` sobre uma
+            # raiz não-dict — erro estruturado sanitizado, nunca crash.
+            return {"error": "SerpAPI SERP: resposta inválida (raiz não é objeto JSON)"}
 
-        # Verificar erro da própria SerpAPI
+        # Verificar erro da própria SerpAPI (mensagem sanitizada e limitada)
         if "error" in raw:
-            return {"error": f"SerpAPI SERP: {raw['error']}"}
-
-        # Registar a call na quota (só após sucesso, como antes)
-        reservation.charge(1)
+            message = http_errors.provider_error_message(raw)
+            return {"error": f"SerpAPI SERP: {message or 'erro reportado pelo fornecedor'}"}
 
         result = _parse_serp_response(raw)
         _write_cache(keyword, result)

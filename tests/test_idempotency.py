@@ -51,7 +51,7 @@ def _install_full_stack(monkeypatch, tmp_path):
     monkeypatch.setattr(run.trends, "fetch_related", lambda *a, **k: calls.__setitem__("related", calls["related"] + 1) or {"related_queries": []})
     monkeypatch.setattr(run.serp_seo, "fetch", lambda kw: calls.__setitem__("seo", calls["seo"] + 1) or dict(SEO))
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: calls.__setitem__("landing", calls["landing"] + 1) or {"price_range": {"min": 10, "max": 20}})
-    monkeypatch.setattr(run, "_csv_data", lambda path: dict(CSV))
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     generated = []
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
     return calls, generated
@@ -174,7 +174,7 @@ def test_mid_batch_crash_resumes_only_missing_keywords(monkeypatch, tmp_path):
     monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: dict(TRENDS))
     monkeypatch.setattr(run.serp_seo, "fetch", lambda kw: dict(SEO))
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 1, "max": 2}})
-    monkeypatch.setattr(run, "_csv_data", lambda path: dict(CSV))
+    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
     attempts = {"n": 0}

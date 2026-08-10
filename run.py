@@ -24,10 +24,11 @@ except ImportError:
 
 from pipeline import provenance, quota, run_state
 from pipeline.adapters import apify_ads, keyword_csv, landing_price, serp_seo, trends
+from pipeline.adapters.url_sanitize import sanitize_ads_data
 from pipeline.delivery import telegram
 from pipeline.output import pack
 from pipeline.scoring import score
-from pipeline.suggestions import extract_keyword_suggestions
+from pipeline.suggestions import extract_keyword_suggestions, filter_relevant_related_queries
 
 logging.basicConfig(
     level=logging.INFO,
@@ -471,10 +472,13 @@ def _load_previous_pack(keyword: str) -> dict[str, Any] | None:
     return _read_pack_json(os.path.join(data_dir, best[1]))
 
 
-def _csv_data(csv_path: str | None) -> dict[str, Any]:
+def _csv_data(csv_path: str | None, keyword: str) -> dict[str, Any]:
+    """Parse do export do Keyword Planner seleccionando a linha da keyword
+    pedida (matching exacto normalizado); erro explícito se a keyword não
+    existir no CSV — nunca as métricas de outra linha."""
     path = csv_path or _find_latest_csv()
     if path:
-        return keyword_csv.parse(path)
+        return keyword_csv.parse(path, keyword=keyword)
     return {"error": "Nenhum CSV encontrado em data/ — exporta do Google Keyword Planner e coloca em data/"}
 
 
@@ -531,7 +535,7 @@ def run_keyword(
         else:
             trends_data = trends.fetch(keyword)
             seo_data = serp_seo.fetch(keyword)
-        csv_data = _csv_data(csv_path)
+        csv_data = _csv_data(csv_path, keyword)
         score_result = _incomplete_score(trends_data, csv_data, ads_data)
     elif ads_data.get("total_ads", 0) == 0:
         landing_data = {"error": "sem dados: zero ads; landing não consultada"}
@@ -540,7 +544,7 @@ def run_keyword(
         else:
             trends_data = trends.fetch_related(keyword)
         seo_data = {"error": "SEO não executado: zero ads ativos"}
-        csv_data = _csv_data(csv_path)
+        csv_data = _csv_data(csv_path, keyword)
         score_result = _forced_zero_score()
     else:
         landing_data = landing_price.fetch_prices_from_ads(ads_data)
@@ -550,10 +554,24 @@ def run_keyword(
         else:
             trends_data = trends.fetch(keyword)
             seo_data = serp_seo.fetch(keyword)
-        csv_data = _csv_data(csv_path)
+        csv_data = _csv_data(csv_path, keyword)
         score_result = score.compute(trends_data, csv_data, ads_data)
 
+    # Product-relevance gate: apply the filter once over a *copy* of
+    # trends_data before both suggestion extraction and pack rendering
+    # (full / zero-ads / related-only branches converge here), so raw related
+    # queries sharing only a geographic token can never surface in
+    # JSON/Markdown/digest.  The trends cache object is never mutated.
+    trends_data = filter_relevant_related_queries(keyword, trends_data)
     suggested = extract_keyword_suggestions(keyword, trends_data)
+
+    # Landing URL privacy: the raw landing URL (userinfo/query/fragment) was
+    # consumed above exclusively by ``fetch_prices_from_ads`` for the actual
+    # fetch.  From here on — result dict, pack JSON/Markdown, manifests and
+    # digests — ads_data is replaced by a copy whose ``top_ads[].landing_url``
+    # is sanitized to scheme + host + safe port + path.  The raw object is
+    # never mutated and never serialized.
+    ads_data = sanitize_ads_data(ads_data)
     result = {
         "keyword": keyword,
         "score_result": score_result,
@@ -580,7 +598,9 @@ def run_keyword(
     return result
 
 
-def _digest_text(results: list[dict[str, Any]], title: str | None = None) -> str:
+def _digest_text(results: list[dict[str, Any]], title: str | None = None, run_date: date | None = None) -> str:
+    if run_date is None:
+        run_date = date.today()
     lines = [title] if title else []
     for result in results:
         if result.get("error") and result.get("preserved"):
@@ -588,7 +608,10 @@ def _digest_text(results: list[dict[str, Any]], title: str | None = None) -> str
             continue
         keyword = result.get("keyword", "?")
         score_result = result.get("score_result", {"score": 0, "label": "DADOS INSUFICIENTES"})
-        lines.append(pack.generate_digest_line(keyword, score_result, result.get("ads_data", {}), trends_data=result.get("trends_data", {})))
+        lines.append(pack.generate_digest_line(
+            keyword, score_result, result.get("ads_data", {}),
+            trends_data=result.get("trends_data", {}), run_date=run_date,
+        ))
         suggestions = result.get("suggested_keywords", [])[:3]
         if suggestions:
             lines.append("Sugestões (aprovação manual): " + ", ".join(item["keyword"] for item in suggestions))
@@ -654,7 +677,7 @@ def _run_batch(
             by_keyword = {r["keyword"]: r for r in results}
             results = [by_keyword[kw] for kw in keywords if kw in by_keyword]
 
-            digest = _digest_text(results, title)
+            digest = _digest_text(results, title, run_date=date.today())
             if any(_is_technical_fatal(r) for r in results):
                 # Deferred: never Telegram-deliver a technical-partial digest.
                 delivery = {"status": "deferred", "chunks_total": 0, "chunks_sent": 0, "errors": []}
@@ -732,6 +755,10 @@ def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
 
                 changes, advertiser_deltas = _compare_ads(previous_ads, current_ads)
                 cohort = _ad_cohort(previous_ads, current_ads, baseline_date=previous.get("date"))
+                # Landing URL privacy: only the actual fetch may use the raw
+                # landing URL.  What is persisted in the result/pack/checkpoint
+                # is the sanitized copy (scheme + host + safe port + path).
+                current_ads = sanitize_ads_data(current_ads)
                 trends_data = previous.get("trends", {})
                 csv_data = previous.get("keyword_planner", {})
                 seo_data = previous.get("seo", {})
@@ -796,6 +823,9 @@ def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
                     continue
                 trends_data = trends.fetch(keyword, timeseries_only=True, force_refresh=True)
                 ads_data = previous.get("facebook_ads", {})
+                # Landing URL privacy: legacy packs may carry raw landing URLs;
+                # what is re-persisted in the new pack is always sanitized.
+                ads_data = sanitize_ads_data(ads_data)
                 csv_data = previous.get("keyword_planner", {})
                 seo_data = previous.get("seo", {})
                 landing_data = previous.get("landing_price")
@@ -837,7 +867,7 @@ def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
                     **_run_metadata("monthly", run_id, _source_states("monthly", result, previous)),
                 )
                 results.append(result)
-            digest = _digest_text(results, f"RE-SCORE MENSAL — {date.today().isoformat()}")
+            digest = _digest_text(results, f"RE-SCORE MENSAL — {date.today().isoformat()}", run_date=date.today())
             delivery = _deliver_digest(digest, run_id, send=send)
             store.save(run_id, _finish_manifest(manifest, results, digest, delivery))
         except Exception:
@@ -1065,7 +1095,8 @@ def _run_keyword_action(keyword: str, csv_path: str | None = None, send: bool = 
             result = run_keyword(keyword, csv_path=csv_path, mode="keyword", run_id=run_id)
             score_result = result["score_result"]
             digest_line = pack.generate_digest_line(
-                keyword, score_result, result.get("ads_data", {}), trends_data=result.get("trends_data", {})
+                keyword, score_result, result.get("ads_data", {}),
+                trends_data=result.get("trends_data", {}), run_date=date.today(),
             )
             print(f"\n=== {keyword} ===")
             print(f"Score: {score_result.get('score', 0)}/100 ({score_result.get('label', 'DADOS INSUFICIENTES')})")

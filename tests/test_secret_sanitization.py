@@ -92,7 +92,7 @@ def test_serp_seo_network_error_is_sanitized(monkeypatch, tmp_path, caplog):
     assert quota.get_usage()["calls"] == 0
 
 
-def test_http_error_logs_status_only_not_body(monkeypatch, tmp_path, caplog):
+def test_http_error_returns_sanitized_message_logs_status_only(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("SERPAPI_KEY", "fake-key")
     _isolate_quota(monkeypatch, tmp_path)
     monkeypatch.setattr(serp_seo.requests, "get", lambda *a, **k: type("R", (), {
@@ -100,7 +100,10 @@ def test_http_error_logs_status_only_not_body(monkeypatch, tmp_path, caplog):
         "text": '{"error": "api_key=SECRET echoed in body"}',
     })())
     result = serp_seo.fetch("kw-secret-429")
-    assert result["error"] == "SerpAPI SERP: HTTP 429"
+    # The provider message field is parsed, sanitized (credential pair
+    # redacted) and bounded — never the raw body, token or URL.
+    assert result["error"] == "SerpAPI SERP: HTTP 429 — [removido] echoed in body"
+    assert "SECRET" not in json.dumps(result)
     assert "SECRET" not in caplog.text
     assert "echoed in body" not in caplog.text
 
@@ -144,7 +147,7 @@ def test_secret_exception_never_reaches_pack_manifest_or_digest(monkeypatch, tmp
     monkeypatch.setattr(run_module.serp_seo.requests, "get", lambda *a, **k: (_ for _ in ()).throw(
         requests.ConnectionError("api_key=SECRET broken")))
     monkeypatch.setattr(run_module.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 1, "max": 2}})
-    monkeypatch.setattr(run_module, "_csv_data", lambda path: dict(CSV))
+    monkeypatch.setattr(run_module, "_csv_data", lambda path, keyword: dict(CSV))
     generated = []
     monkeypatch.setattr(run_module.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
 

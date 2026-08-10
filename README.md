@@ -1,6 +1,6 @@
 # ECOM-RESEARCH
 
-CLI determinístico para transformar uma keyword num research pack. O pipeline usa anúncios ativos existentes como prova de procura; o score organiza sinais, mas não escolhe produto, país ou campanha. Qualquer sugestão é advisory e precisa de aprovação manual.
+CLI determinístico para transformar uma keyword num research pack. O pipeline usa anúncios ativos globais existentes como evidência de procura; o score organiza sinais, mas não escolhe produto, país ou campanha. Qualquer sugestão é advisory e precisa de aprovação manual.
 
 ## Setup
 
@@ -18,7 +18,7 @@ O modo full requer `APIFY_API_TOKEN` e `SERPAPI_KEY`. O repositório não conté
 - `FIRECRAWL_KEY`: fallback opcional para landings sem preço no HTML.
 - `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`: entrega opcional, sempre send-only.
 
-O volume e CPC vêm de um export CSV manual do Google Keyword Planner colocado em `data/`. Sem CSV, o pipeline degrada graciosamente, mas o score perde esse sinal.
+O volume e CPC vêm de um export manual do Google Keyword Planner colocado em `data/`. O parser aceita o formato real em UTF-16 LE com BOM, tabulação e preâmbulo de título/data, além do CSV UTF-8 legado, e liga cada keyword à sua linha de produto exacta após normalização. Sem CSV, o pipeline degrada graciosamente, mas o score perde esse sinal.
 
 ## Uso
 
@@ -39,7 +39,7 @@ A precedência de selectores é fixa: `auto > sunday > wednesday > monthly > all
 
 ```mermaid
 flowchart TD
-    Cron["Cron externo opcional<br/>08:00 · --auto --digest"] --> CLI["run.py<br/>configuração, argumentos e orquestração"]
+    Cron["Cron · host Europe/Berlin 09:00<br/>TZ=Europe/Lisbon · 08:00 Lisboa · --auto --digest"] --> CLI["run.py<br/>configuração, argumentos e orquestração"]
     User["Execução manual"] --> CLI
     Keywords["config/keywords.txt"] --> CLI
     KeywordCSV["Google Keyword Planner CSV"] --> Full
@@ -106,15 +106,15 @@ Os locks de run (um por `run_id`) e de quota (`data/quota.json.lock`) são bloqu
 
 O JSON do pack ganha metadados aditivos: `run_id`, `mode`, `generated_at`/`completed_at`, `scoring_version`, `scoring_config`, `source_states` e `source_policies`. As chaves antigas (`keyword`, `date`, `score`, `trends`, `keyword_planner`, `facebook_ads`, `seo`, `suggested_keywords`, `ad_cohort`) permanecem como aliases. O Markdown ganha uma secção concisa **Proveniência** sem alterar o conteúdo das recomendações. Os estados de fonte são `valid` (um zero-ads Apify conta como leitura válida, e um run zero-ads regista Trends como `related_queries_only` mesmo quando a lista vem vazia), `stale` (evidência reutilizada de quarta/mensal), `missing` (não aplicável ou não tentado) e `failed` (erro de request/parse). As políticas de fonte (TTL, quota, timeout, retries=0, fallback) são persistidas sem segredos.
 
-No dia 1, se o Trends falhar para uma keyword, o pack anterior é preservado: não é escrito nenhum pack de substituição, a falha aparece no digest e no run state, e a keyword permanece na watchlist OBSERVAR. Payloads de erro do Trends nunca são cacheados; entradas de erro legadas são tratadas como miss e removidas.
+No dia 1, se o Trends falhar para uma keyword, o pack anterior é preservado: não é escrito nenhum pack de substituição, a falha aparece no digest e no run state, e a keyword permanece na watchlist OBSERVAR. A timeseries do Trends usa timeout de 60s, refletido na política de proveniência; payloads de erro nunca são cacheados e entradas de erro legadas são tratadas como miss e removidas.
 
 ## Facebook Ad Library via Apify
 
 Cada keyword faz uma única chamada POST, com custo do actor limitado a uma invocação e sample de 100, com timeout de conexão/leitura `(10, 135)`, `count=100` e uma URL global da Ad Library com `active_status=active`, `ad_type=all`, `country=ALL`, `is_targeted_country=false`, `media_type=all`, `search_type=keyword_unordered` e `q` URL-encoded. Não há retries.
 
-A resposta é normalizada localmente com filtros determinísticos: status inativo é removido, texto é accent-folded, uma keyword exige o token e queries com vários tokens exigem pelo menos 60% de cobertura, com a frase exata sempre aceite. Duplicados são removidos por `ad_archive_id`, depois URL, depois `page_id + copy + date`. O pack guarda amostra, descartes, duplicados, IDs, top ads, advertisers e saturação; o limite de 100 permite que `alta` (>50) seja atingível.
+A resposta é normalizada localmente com filtros determinísticos e relevância fail-closed: status inativo é removido, texto é accent-folded, uma keyword exige o token e queries com vários tokens exigem pelo menos 60% de cobertura, com a frase exata sempre aceite; anúncios sem prova global do product head nos campos de intenção comercial são rejeitados. Duplicados são removidos por `ad_archive_id`, depois URL, depois `page_id + copy + date`. O pack guarda amostra, descartes, duplicados, IDs, top ads, advertisers, `global_market_proven` e saturação; o limite de 100 permite que `alta` (>50) seja atingível.
 
-Um resultado vazio é sucesso e força `DESCARTAR`, sem SEO nem landing. Ainda faz uma call Related Queries da SerpAPI, cacheada por 30 dias e contada na quota, para propor alternativas. Uma falha do Apify continua Trends, SEO e CSV, mas produz `DADOS INSUFICIENTES` e nunca um `DESCARTAR` falso.
+Um resultado vazio é sucesso e força `DESCARTAR`, sem SEO nem landing. Ainda faz uma call Related Queries da SerpAPI, cacheada por 30 dias e contada na quota, aplicando relevância fail-closed do produto antes de propor alternativas. Uma falha do Apify continua Trends, SEO e CSV, mas produz `DADOS INSUFICIENTES` e nunca um `DESCARTAR` falso.
 
 ## Custos e modos
 
@@ -130,15 +130,15 @@ A quarta compara `ad_ids` e advertisers, mas se o Apify falhar relata o erro e p
 
 `pipeline/suggestions.py` normaliza resultados Related Queries numéricos e `Breakout`, ordena Breakout primeiro e depois valores numéricos descendentes, remove vazios, a keyword original, duplicados, URLs e interrogativas. O JSON guarda `suggested_keywords`; o Markdown usa a secção **Sugestões de keywords — aprovação manual** e declara que nada foi adicionado a `config/keywords.txt`.
 
-A secção **Sinais por mercado — decisão manual** lista PT, ES, FR e os top geos de Trends com `country`, `Trends demand`, `advertisers observed` e `ads observed`. Não existe ranking automático de país. O digest diz `Mercado: decisão manual`.
+A evidência da Ad Library é global (`country=ALL`) e o campo `global_market_proven` descreve apenas essa prova global, nunca fit local. A secção **Sinais por mercado — decisão manual** lista PT, ES, FR e os top geos de Trends com `country`, `Trends demand`, `advertisers observed (top-ad sample)` e `ads observed (top-ad sample)`; essas duas contagens vêm apenas de `top_ads`, não da coorte global retida, e `—` continua a significar desconhecido. A selecção de mercado continua manual e não existe ranking automático de país. O digest diz `Mercado: decisão manual` e `Prova global`.
 
 ## Landings e Telegram
 
-Preços usam exclusivamente `top_ads[].landing_url`; links da Ad Library são rejeitados. São tentadas no máximo três landings, primeiro por HTTP e depois por Firecrawl, com falhas isoladas e sem retries. Quarta e mensal reutilizam o resultado anterior.
+Preços usam exclusivamente `top_ads[].landing_url`; links da Ad Library são rejeitados. A moeda é sempre derivada da fonte (`priceCurrency` ou símbolo/código explícito), nunca é assumida sem evidência, e preços de moedas diferentes nunca são combinados num range. São tentadas no máximo três landings, primeiro por HTTP e depois por Firecrawl, com falhas isoladas e sem retries. Quarta e mensal reutilizam o resultado anterior.
 
-Telegram é send-only: cada mensagem é plain text, no máximo 4000 caracteres, dividida em quebras de linha quando possível. O payload contém apenas `chat_id`, `text` e `disable_web_page_preview=true`. Falta de credenciais, timeout, HTTP diferente de 200, JSON inválido ou `ok != true` imprime o digest completo no stdout e não interrompe o pipeline. O token nunca é escrito em logs.
+Telegram é send-only: cada mensagem é plain text, no máximo 4000 caracteres, dividida em quebras de linha quando possível. O payload contém apenas `chat_id`, `text` e `disable_web_page_preview=true`. Falta de credenciais, timeout, HTTP diferente de 200, JSON inválido ou `ok != true` imprime o digest completo no stdout e não interrompe o pipeline. O token nunca é escrito em logs; o token Telegram exposto deve ainda ser rotacionado pelo utilizador.
 
-O progresso de entrega é persistido em `data/digests/<run_id>.json`: texto, hash, chunks enviados e um estado sanitizado (credenciais em falta, timeout, HTTP/JSON/API, sucesso, parcial). Num rerun, chunks registados como enviados nunca são reenviados; apenas os não enviados são retomados. Cada chunk bem-sucedido é persistido imediatamente. O token nunca é persistido. Um estado existente que seja ilegível, de outro conteúdo (hash/texto divergente) ou com chunks inconsistentes é fail-closed: nada é enviado, o caller devolve um erro sanitizado `state_corrupt` e imprime o digest no stdout, e o ficheiro suspeito nunca é sobrescrito (evita aceitar duas vezes o mesmo chunk). Janela de crash aceite: entre o Telegram aceitar um chunk e a persistência local, um crash pode duplicar esse chunk.
+O progresso de entrega é persistido em `data/digests/<run_id>.json`: texto, hash, chunks enviados e um estado sanitizado. Antes de cada envio, o estado `in_flight` é escrito atomicamente; se a persistência falhar, nada é enviado. Depois da aceitação remota, o chunk é marcado como enviado. Se essa escrita falhar ou um processo cair na janela entre aceitação e confirmação local, o run fica `state_ambiguous` e qualquer rerun recusa reenviar até resolução manual, evitando duplicações automáticas. Estados ilegíveis, de outro conteúdo ou inconsistentes também são fail-closed (`state_corrupt`). O token e o chat ID nunca são persistidos.
 
 ## Saída
 
@@ -160,20 +160,15 @@ As recomendações são operacionais, não decisões automáticas: `AVANÇAR` pr
 git diff --check
 ```
 
-Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **289 testes verdes**.
+Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **561 testes verdes**.
 
-## Ativação live
+## Estado live
 
-O código não instala cron automaticamente. Antes de ativar:
-
-1. Configurar e testar `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`.
-2. Validar o CSV real do Keyword Planner.
-3. Executar uma única keyword live e rever manualmente o Markdown/JSON, incluindo relevância, dedupe, custo Apify, landing e sugestões.
-4. Regenerar antes de produção qualquer credencial que tenha sido partilhada numa conversa.
-5. Só então instalar o cron diário das 08:00:
+O smoke live de uma keyword e uma entrega de um digest Telegram foram concluídos com sucesso. O host atual usa `Europe/Berlin`; o serviço cron está ativo e habilitado (`active`/`enabled`) e existe exactamente um job. Com `TZ=Europe/Lisbon`, o job das 09:00 do host corresponde às 08:00 de Lisboa e executa `--auto --digest`:
 
 ```cron
-0 8 * * * cd /home/vitor/projects/Ecom-Research && /home/vitor/projects/Ecom-Research/.venv/bin/python run.py --auto --digest >> /home/vitor/projects/Ecom-Research/data/cron.log 2>&1
+TZ=Europe/Lisbon
+0 9 * * * cd /home/vitor/projects/Ecom-Research && /home/vitor/projects/Ecom-Research/.venv/bin/python run.py --auto --digest >> /home/vitor/projects/Ecom-Research/data/cron.log 2>&1
 ```
 
-O cron verifica a data diariamente, mas só atua ao domingo, à quarta-feira e no dia 1 do mês.
+O cron verifica a data diariamente, mas só atua ao domingo, à quarta-feira e no dia 1 do mês. O token Telegram exposto deve ainda ser rotacionado pelo utilizador.

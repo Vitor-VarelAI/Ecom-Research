@@ -32,6 +32,7 @@ def test_fetch_related_is_one_quota_counted_cached_call(monkeypatch, tmp_path):
     second = trends.fetch_related("mochila")
 
     assert first["related_queries"][1]["score"] == "Breakout"
+    assert "_cached_at" not in first
     assert second == first
     assert len(calls) == 1
     assert quota.get_usage()["calls"] == 1  # exactly one charge for one call

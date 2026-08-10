@@ -9,6 +9,7 @@ filtering, relevance checks, and grouping happen locally and deterministically.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import unicodedata
@@ -19,6 +20,10 @@ from urllib.parse import quote, urlparse
 
 import requests
 
+from pipeline import suggestions
+from pipeline.adapters import http_errors
+from pipeline.adapters.url_sanitize import sanitize_url as _sanitize_url
+
 logger = logging.getLogger(__name__)
 
 APIFY_RUN_URL = (
@@ -28,6 +33,88 @@ APIFY_RUN_URL = (
 FACEBOOK_AD_LIBRARY_URL = "https://www.facebook.com/ads/library/"
 SAMPLE_LIMIT = 100
 REQUEST_TIMEOUT = (10, 135)
+
+# Maior epoch Unix que ``datetime.fromtimestamp`` aceita (9999-12-31T23:59:59
+# UTC); timestamps de ads acima disso são malformados e devolvem None.
+_MAX_EPOCH_SECONDS = 253402300799
+
+# Second (fail-closed) relevance gate: the source keyword's product-head
+# token must appear in a commercial-intent field.  Creative
+# title/headline/link-block text and the landing/destination URL are the only
+# fields that count; body/copy text alone never satisfies this gate.
+HIGH_INTENT_TEXT_FIELDS = (
+    "title",
+    "headline",
+    "link_description",
+    "ad_creative_link_titles",
+    "ad_creative_link_descriptions",
+)
+
+# Geographic qualifiers are stricter than the head token: they must be
+# proven in product-identity fields only — the creative title/headline,
+# ad creative link titles and the landing/destination/link URL path or
+# domain.  Generic shipping/context fields (link_description, ad creative
+# link descriptions) and body/copy, advertiser/page name or caption text
+# never prove geographic market intent, so a Benfica or compression shirt
+# whose title and URL say nothing about Portugal but whose
+# link_description mentions delivery to Portugal must not satisfy
+# ``camisola de portugal``.
+GEO_PROOF_TEXT_FIELDS = (
+    "title",
+    "headline",
+    "ad_creative_link_titles",
+)
+
+HIGH_INTENT_URL_FIELDS = (
+    "landing_url",
+    "destination_url",
+    "link_url",
+    "website_url",
+    "call_to_action_link",
+    "ad_creative_link_urls",
+    "snapshot_links",
+    "links",
+    "link",
+)
+
+# Folded country-name tokens that act as geographic country/market
+# qualifiers.  A query token in this set must appear in the strict
+# geo-proof fields (see ``GEO_PROOF_TEXT_FIELDS`` plus the landing/
+# destination/link URL path or domain), so ``camisola portugal`` cannot
+# be satisfied by a generic compression or Benfica shirt whose title/URL
+# is non-Portugal but whose body or link_description merely mentions
+# delivery to Portugal.  The set is deliberately small and explicit: the
+# project's core markets (PT/ES/FR) plus BR, accent/case folded; country
+# adjectives/demonyms (português/espanhol/...) are not included because
+# they describe language/origin in ad copy too loosely to prove market
+# intent, and non-geographic modifiers (personalizada, aromáticas) are
+# never required here.
+GEOGRAPHIC_QUALIFIERS = frozenset({
+    "portugal",
+    "espanha",
+    "franca",
+    "brasil",
+})
+
+# Structured, deterministic description of the local relevance policy so
+# artifacts can audit why a sample shrank without storing raw payloads.
+RELEVANCE_POLICY = (
+    "gate1: full phrase or >=60% token coverage across copy+advertiser text; "
+    "gate2: product-head token selected by suggestions.product_head_token "
+    "(accent/case folded, exact token equality or a single trailing 's' "
+    "plural variant only — suggestions.tokens_equivalent) present in "
+    "high-intent fields "
+    "(title, headline, link_description, ad_creative_link_titles, "
+    "ad_creative_link_descriptions, landing/link/destination URLs); "
+    "every geographic country/market qualifier token (portugal, espanha, "
+    "franca, brasil; accent/case folded) must also appear in geo-proof "
+    "fields only (product title/headline, ad creative link titles, "
+    "landing/destination/link URL path or domain); body/copy, "
+    "advertiser/page name, caption and link_description/ad creative link "
+    "descriptions never satisfy geography; non-geographic modifiers are "
+    "never required; body/copy alone never satisfies gate2; "
+    "inactive ads excluded first"
+)
 
 
 def _get_token() -> str | None:
@@ -74,7 +161,36 @@ def _as_text(value: Any) -> str:
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    if not value or not isinstance(value, str):
+    """Parse an ad date; None for anything malformed — never raises.
+
+    Numeric values are treated as Unix epoch seconds (millisecond values are
+    scaled).  NaN/Infinity, timestamps beyond the ``datetime`` range, bools
+    and integers too large to convert to float all return None; a date
+    before 1970 is bogus for an ad and also returns None.
+    """
+    if not value or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        # Actor build 2.7.19 emits ``start_date``/``end_date`` as Unix epoch
+        # integers; millisecond values need scaling before conversion.
+        try:
+            timestamp = float(value)
+        except (OverflowError, ValueError, TypeError):
+            return None  # ex.: int demasiado grande para float(10**400)
+        if not math.isfinite(timestamp):
+            return None
+        if timestamp < 0:
+            return None
+        if abs(timestamp) >= 1e11:
+            timestamp /= 1000.0
+        if timestamp > _MAX_EPOCH_SECONDS:
+            return None  # além do range do datetime (ano 9999)
+        try:
+            parsed = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return parsed.astimezone(timezone.utc)
+    if not isinstance(value, str):
         return None
     candidate = value.strip()
     if not candidate:
@@ -94,8 +210,11 @@ def _parse_datetime(value: Any) -> datetime | None:
 
 def _days_active(ad: dict[str, Any], now: datetime) -> int:
     reported = _first_value(ad, "days_active", "active_days")
-    if isinstance(reported, (int, float)):
-        return max(0, int(reported))
+    if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+        try:
+            return max(0, int(reported))
+        except (OverflowError, ValueError):
+            pass  # NaN/Infinity → tratado como ausente; cai para as outras fontes
 
     reported_text = _as_text(_first_value(ad, "reported_active_time"))
     if reported_text:
@@ -137,7 +256,16 @@ def _is_inactive(ad: dict[str, Any], now: datetime) -> bool:
 
     stop_value = _first_value(ad, "ad_delivery_stop_time", "stop_date", "end_date")
     stop_date = _parse_datetime(stop_value)
-    return stop_date is not None and stop_date <= now
+    if stop_date is None or stop_date > now:
+        return False
+    # The actor reports a stop/end date as an observation boundary for
+    # currently active ads, not proof of inactivity: an explicit active
+    # flag outweighs a past end date, while absence of any affirmative
+    # active flag lets the past end date filter the ad.
+    for key in ("is_active", "active"):
+        if ad.get(key) is True:
+            return False
+    return True
 
 
 def _copy_text(ad: dict[str, Any]) -> str:
@@ -148,10 +276,104 @@ def _copy_text(ad: dict[str, Any]) -> str:
         "body",
         "ad_text",
         "text",
+        "title",
+        "caption",
         "description",
         "message",
     )
     return _as_text(value)
+
+
+def _iter_high_intent_urls(ad: dict[str, Any]) -> Iterable[str]:
+    """Yield the sanitized form (scheme/hostname/path) of every URL found in
+    the commercial-intent URL fields.
+
+    Relevance proof tokenizes only the sanitized landing URL — never the raw
+    query or fragment, which can carry arbitrary tokens
+    (``?country=portugal&query=camisola``) that would fabricate product or
+    geographic proof.  Reuses the shared ``url_sanitize.sanitize_url``;
+    invalid/Ad Library URLs are dropped.
+    """
+    for field in HIGH_INTENT_URL_FIELDS:
+        value = ad.get(field)
+        if value in (None, "", [], {}):
+            continue
+        for raw_url in _iter_urls(value):
+            safe = _sanitize_url(raw_url)
+            if safe:
+                yield safe
+
+
+def _high_intent_text(ad: dict[str, Any]) -> str:
+    """Folded text of every commercial-intent field, URLs included.
+
+    Deliberately excludes body/copy and advertiser/page text: an ad whose
+    body merely mentions the keyword must not pass the second gate.
+    """
+    parts: list[str] = []
+    for field in HIGH_INTENT_TEXT_FIELDS:
+        value = ad.get(field)
+        if value not in (None, "", [], {}):
+            parts.append(_as_text(value))
+    parts.extend(_iter_high_intent_urls(ad))
+    return _fold(" ".join(part for part in parts if part))
+
+
+def _geo_proof_text(ad: dict[str, Any]) -> str:
+    """Folded text of the strict geographic-proof fields only.
+
+    Product title/headline, ad creative link titles and the
+    landing/destination/link URL path or domain.  Deliberately excludes
+    body/copy, advertiser/page name, caption and the generic
+    link_description/ad creative link descriptions: shipping/context text
+    that merely mentions a country must never prove geographic market
+    intent (Benfica or compression shirts whose link block says "envio
+    para Portugal").
+    """
+    parts: list[str] = []
+    for field in GEO_PROOF_TEXT_FIELDS:
+        value = ad.get(field)
+        if value not in (None, "", [], {}):
+            parts.append(_as_text(value))
+    parts.extend(_iter_high_intent_urls(ad))
+    return _fold(" ".join(part for part in parts if part))
+
+
+def _matches_high_intent(keyword: str, ad: dict[str, Any]) -> bool:
+    """Second gate: product-head token in commercial-intent fields; every
+    geographic qualifier in strict geo-proof fields.
+
+    ``suggestions.product_head_token`` selects the first source token that is
+    neither a stopword nor a geographic qualifier, so ``portugal camisolas``
+    requires ``camisolas`` in a commercial-intent field.  Each query token
+    recognized as a geographic
+    country/market qualifier (see ``GEOGRAPHIC_QUALIFIERS``) must appear
+    in the stricter geo-proof fields (product title/headline, ad creative
+    link titles, landing/destination/link URL path or domain), so
+    ``camisola portugal`` needs ``camisola`` in a commercial-intent field
+    and ``portugal`` in a geo-proof field.  Token matching uses the shared
+    ``suggestions.tokens_equivalent`` rule (exact or a single trailing
+    ``s`` — ``camisola``~``camisolas``; never arbitrary shared prefixes),
+    so ``pasta``~``pastelaria``, ``arte``~``artesa`` or ``sol``~``sola``
+    stay unrelated.  A generic compression or Benfica shirt whose
+    title/URL is non-Portugal but whose body or link_description merely
+    mentions delivery to Portugal stays rejected.  Non-geographic
+    modifiers (``personalizada``, ``aromáticas``) stay exempt —
+    mochila/caneca/velas keep their fail-closed but usable behavior.
+    """
+    query_tokens = list(dict.fromkeys(_tokens(keyword)))
+    product_head = suggestions.product_head_token(keyword)
+    if not query_tokens or product_head is None:
+        return False
+    field_tokens = list(dict.fromkeys(_tokens(_high_intent_text(ad))))
+    if not any(suggestions.tokens_equivalent(product_head, token) for token in field_tokens):
+        return False
+    geo_tokens = list(dict.fromkeys(_tokens(_geo_proof_text(ad))))
+    return all(
+        token not in GEOGRAPHIC_QUALIFIERS
+        or any(suggestions.tokens_equivalent(token, geo) for geo in geo_tokens)
+        for token in query_tokens
+    )
 
 
 def _is_relevant(keyword: str, ad: dict[str, Any]) -> bool:
@@ -169,6 +391,7 @@ def _is_relevant(keyword: str, ad: dict[str, Any]) -> bool:
             "headline",
             "ad_creative_link_titles",
             "ad_creative_link_descriptions",
+            "link_description",
             "ad_creative_link_captions",
             "caption",
             "primary_text",
@@ -256,7 +479,7 @@ def _ad_library_url(ad: dict[str, Any], ad_id: str) -> str:
 
 def _countries(ad: dict[str, Any]) -> list[str]:
     values: list[str] = []
-    for field in ("countries", "country", "ad_reached_countries", "country_codes"):
+    for field in ("targeted_or_reached_countries", "countries", "country", "ad_reached_countries", "country_codes"):
         raw_value = ad.get(field)
         if isinstance(raw_value, list):
             for item in raw_value:
@@ -313,7 +536,7 @@ def _normalise_ad(ad: dict[str, Any], now: datetime) -> dict[str, Any]:
     copy = _copy_text(ad)
     reported_active_time = _as_text(_first_value(ad, "reported_active_time"))
     countries = _countries(ad)
-    platforms = _first_value(ad, "publisher_platforms", "platforms") or []
+    platforms = _first_value(ad, "publisher_platform", "publisher_platforms", "platforms") or []
     if isinstance(platforms, str):
         platforms = [platforms]
     return {
@@ -334,32 +557,61 @@ def _empty_success(raw_count: int, filtered_out: int, duplicates_removed: int, c
     return {
         "source": "Facebook Ad Library via Apify",
         "query": "",
+        "evidence_scope": "global",
+        "query_country": "ALL",
         "sample_limit": SAMPLE_LIMIT,
         "sample_capped": capped,
         "raw_ads_count": raw_count,
         "filtered_out_count": filtered_out,
+        "filtered_inactive_count": 0,
+        "filtered_irrelevant_count": filtered_out,
+        "relevance_policy": RELEVANCE_POLICY,
         "duplicates_removed": duplicates_removed,
         "total_ads": 0,
         "ad_ids": [],
         "top_ads": [],
         "advertisers": [],
-        "market_proven": False,
+        "global_market_proven": False,
         "copy_examples": [],
         "saturation": "baixa",
     }
 
 
+def _merged_view(raw: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic internal view: top-level fields overlaid over ``snapshot``.
+
+    Actor build 2.7.19 nests creative fields (``body``, ``title``, ``caption``,
+    ``link_description``, ``link_url``, page fields) under ``snapshot`` while
+    keeping the authoritative values (``is_active``, ``start_date``,
+    ``end_date``, ``publisher_platform``, ``targeted_or_reached_countries``,
+    ``ad_library_url``) at the top level.  Downstream logic reads one flat
+    dict: snapshot keys are promoted first, then top-level keys override
+    duplicate keys, so a top-level ``page_name`` always beats the snapshot's.
+    """
+    view: dict[str, Any] = {}
+    snapshot = raw.get("snapshot")
+    if isinstance(snapshot, dict):
+        view.update(snapshot)
+    view.update(raw)
+    return view
+
+
 def _normalise(keyword: str, raw_ads: list[dict[str, Any]]) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     filtered: list[tuple[str, dict[str, Any]]] = []
-    filtered_out = 0
+    filtered_inactive = 0
+    filtered_irrelevant = 0
     for raw in raw_ads:
-        if _is_inactive(raw, now) or not _is_relevant(keyword, raw):
-            filtered_out += 1
+        ad = _merged_view(raw)
+        if _is_inactive(ad, now):
+            filtered_inactive += 1
             continue
-        normalised = _normalise_ad(raw, now)
+        if not _is_relevant(keyword, ad) or not _matches_high_intent(keyword, ad):
+            filtered_irrelevant += 1
+            continue
+        normalised = _normalise_ad(ad, now)
         filtered.append((
-            _stable_key(raw, normalised["ad_archive_id"], normalised["link"], normalised["landing_url"]),
+            _stable_key(ad, normalised["ad_archive_id"], normalised["link"], normalised["landing_url"]),
             normalised,
         ))
 
@@ -408,16 +660,21 @@ def _normalise(keyword: str, raw_ads: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "source": "Facebook Ad Library via Apify",
         "query": keyword,
+        "evidence_scope": "global",
+        "query_country": "ALL",
         "sample_limit": SAMPLE_LIMIT,
         "sample_capped": sample_capped,
         "raw_ads_count": len(raw_ads),
-        "filtered_out_count": filtered_out,
+        "filtered_out_count": filtered_inactive + filtered_irrelevant,
+        "filtered_inactive_count": filtered_inactive,
+        "filtered_irrelevant_count": filtered_irrelevant,
+        "relevance_policy": RELEVANCE_POLICY,
         "duplicates_removed": duplicate_count,
         "total_ads": len(ads),
         "ad_ids": [ad["ad_archive_id"] for ad in ads if ad["ad_archive_id"]],
         "top_ads": top_ads,
         "advertisers": advertisers,
-        "market_proven": any(item["active_ads"] >= 5 for item in advertiser_groups.values()),
+        "global_market_proven": any(item["active_ads"] >= 5 for item in advertiser_groups.values()),
         "copy_examples": copy_examples,
         "saturation": "alta" if len(ads) > 50 else "média" if len(ads) >= 10 else "baixa",
     }
@@ -436,7 +693,10 @@ def fetch(keyword: str) -> dict[str, Any]:
     )
     params = {"clean": "true", "format": "json"}
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"urls": [library_url], "count": SAMPLE_LIMIT}
+    # Actor build 2.7.19's input schema declares ``requestListSources`` and
+    # prefills ``urls`` as a list of objects; a bare string URL fails schema
+    # validation ("Items in input.urls ... do not contain valid URLs").
+    payload = {"urls": [{"url": library_url}], "count": SAMPLE_LIMIT}
 
     try:
         response = requests.post(
@@ -454,7 +714,9 @@ def fetch(keyword: str) -> dict[str, Any]:
 
     if response.status_code not in (200, 201):
         logger.warning("Apify Ads: HTTP %s", response.status_code)
-        return {"error": f"Apify: HTTP {response.status_code}"}
+        # Read only the documented ``error``/``error.message`` fields from the
+        # body, sanitized and bounded — never the raw body or its tokens.
+        return {"error": http_errors.compose("Apify", response.status_code, response)}
 
     try:
         payload_data = response.json()

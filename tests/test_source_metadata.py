@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pipeline import provenance
+from pipeline.adapters import trends
 import run as run_module
 
 ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 3, "ad_ids": ["a1"],
@@ -26,6 +27,7 @@ def test_policies_are_credential_free_and_snapshot_is_isolated():
     policies = provenance.snapshot()
     assert policies["apify_ads"]["retries"] == 0
     assert policies["trends"]["ttl_days"] == 30
+    assert policies["trends"]["timeout_s"] == trends.REQUEST_TIMEOUT == 60
     assert policies["landing_price"]["max_fetches"] == 3
     serialized = str(policies)
     assert "token" not in serialized and "Bearer" not in serialized and "http" not in serialized.replace("timeout", "").replace("url", "")
@@ -135,7 +137,7 @@ def test_zero_ad_run_end_to_end_records_related_queries_only(monkeypatch):
     )
     monkeypatch.setattr(run_module.serp_seo, "fetch", lambda keyword: calls.__setitem__("seo", 1))
     monkeypatch.setattr(run_module.landing_price, "fetch_prices_from_ads", lambda data: calls.__setitem__("landing", 1))
-    monkeypatch.setattr(run_module, "_csv_data", lambda path: CSV)
+    monkeypatch.setattr(run_module, "_csv_data", lambda path, keyword: CSV)
     generated = []
     monkeypatch.setattr(run_module.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
 

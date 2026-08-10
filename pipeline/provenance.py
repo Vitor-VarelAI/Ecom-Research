@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pipeline.adapters import trends
+
 SOURCE_POLICIES: dict[str, dict[str, Any]] = {
     "apify_ads": {
         "timeout": "(10, 135)",
@@ -31,7 +33,7 @@ SOURCE_POLICIES: dict[str, dict[str, Any]] = {
     },
     "trends": {
         "ttl_days": 30,
-        "timeout_s": 15,
+        "timeout_s": trends.REQUEST_TIMEOUT,
         "retries": 0,
         "quota_per_call": 1,
         "quota_limit": 230,
