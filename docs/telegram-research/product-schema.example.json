@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "product_id": "e942e8bf7f30",
+  "research_date": "2026-08-16",
+  "product_name": "mochila personalizada",
+  "normalized_name": "mochila personalizada",
+  "score": {
+    "value": 87,
+    "maximum": 100,
+    "source": "existing_scoring_output",
+    "scoring_version": null
+  },
+  "commercial_status": {
+    "advisory_signal": "AVANÇAR",
+    "market_decision": "DECISÃO MANUAL",
+    "is_final": false
+  },
+  "validation_stage": {
+    "current": "SUPPLIER_RESEARCH",
+    "workflow_gate": "RESEARCH_ALLOWED",
+    "next": "TEST_WITHOUT_SALE",
+    "hard_block": false,
+    "blocking_reasons": []
+  },
+  "final_status": "AVANÇAR_PARA_PESQUISA_DE_FORNECEDOR",
+  "evidence": [
+    {
+      "evidence_id": null,
+      "type": "GLOBAL_PROOF",
+      "name": "Maternelle Perú",
+      "url": null,
+      "cohort": "global",
+      "confirmed_fields": [
+        "name",
+        "variants"
+      ],
+      "checked_at": null
+    }
+  ],
+  "variants": {
+    "count": 4,
+    "status": "CONFIRMED_FROM_EXISTING_RESEARCH"
+  },
+  "keywords": [],
+  "image_url": null,
+  "image_provenance": {
+    "supplier_id": null,
+    "source_page_url": null,
+    "usage_validated": false
+  },
+  "hashtags": [
+    "#mochila_personalizada",
+    "#avancar",
+    "#pesquisa_fornecedor",
+    "#research_2026_08_16",
+    "#portugal",
+    "#dropshipping"
+  ],
+  "suppliers": [],
+  "costs": {
+    "currency": "EUR",
+    "product": null,
+    "shipping": null,
+    "vat": null,
+    "vat_recoverable": null,
+    "customs_duties": null,
+    "payment_fees": null,
+    "expected_returns": null,
+    "total_landed_customer_cost": null,
+    "input_status": "INCOMPLETE"
+  },
+  "margins": {
+    "observed_sale_price": null,
+    "recommended_sale_price": null,
+    "scenarios": {
+      "conservative": {
+        "gross_margin": null,
+        "gross_margin_percent": null,
+        "advertising_allowance": null,
+        "break_even_cac": null,
+        "estimated_profit_per_order": null,
+        "status": "INCOMPLETE"
+      },
+      "base": {
+        "gross_margin": null,
+        "gross_margin_percent": null,
+        "advertising_allowance": null,
+        "break_even_cac": null,
+        "estimated_profit_per_order": null,
+        "status": "INCOMPLETE"
+      },
+      "optimistic": {
+        "gross_margin": null,
+        "gross_margin_percent": null,
+        "advertising_allowance": null,
+        "break_even_cac": null,
+        "estimated_profit_per_order": null,
+        "status": "INCOMPLETE"
+      }
+    }
+  },
+  "target_markets": [
+    {
+      "country": "PT",
+      "priority": 1,
+      "commercial_enabled": true,
+      "legal_scope_enabled": true
+    },
+    {
+      "country": "GB",
+      "priority": 2,
+      "commercial_enabled": true,
+      "legal_scope_enabled": false
+    },
+    {
+      "country": "US",
+      "priority": 3,
+      "commercial_enabled": true,
+      "legal_scope_enabled": false
+    }
+  ],
+  "shipping": {
+    "PT": {
+      "ships_to_market": null,
+      "warehouse_country": null,
+      "cost": null,
+      "estimated_days_min": null,
+      "estimated_days_max": null,
+      "checked_at": null
+    },
+    "GB": {
+      "ships_to_market": null,
+      "warehouse_country": null,
+      "cost": null,
+      "estimated_days_min": null,
+      "estimated_days_max": null,
+      "checked_at": null
+    },
+    "US": {
+      "ships_to_market": null,
+      "warehouse_country": null,
+      "cost": null,
+      "estimated_days_min": null,
+      "estimated_days_max": null,
+      "checked_at": null
+    }
+  },
+  "dropshipping_status": "FORNECEDOR EM FALTA",
+  "legal_gate": {
+    "scope": "EU_PORTUGAL",
+    "status": "DOCUMENTAÇÃO EM FALTA",
+    "potential_commercial": "AVANÇAR",
+    "dropshipping_viability": "FORNECEDOR EM FALTA",
+    "eu_conformity": "DOCUMENTAÇÃO EM FALTA",
+    "destination_country_conformity": {
+      "PT": "DOCUMENTAÇÃO EM FALTA"
+    },
+    "blocks_current_stage": false,
+    "blocks_sale": true,
+    "blocks_scale": true,
+    "last_checked_at": null
+  },
+  "packaging": {
+    "status": "PACKAGING NÃO VALIDADO",
+    "primary": null,
+    "secondary": null,
+    "transport": null,
+    "materials": [],
+    "restricted_substances": null,
+    "recyclability": null,
+    "reusability": null,
+    "recycled_content": null,
+    "minimization": null,
+    "labelling": null,
+    "consumer_information": null,
+    "declaration_of_conformity": null
+  },
+  "EPR": {
+    "PT": {
+      "status": "EPR EM FALTA",
+      "producer": null,
+      "registration_number": null,
+      "scheme": null,
+      "authorized_representative": null,
+      "reporting_obligations": null,
+      "estimated_costs": null
+    }
+  },
+  "GPSR": {
+    "status": "DOCUMENTAÇÃO EM FALTA",
+    "manufacturer": null,
+    "importer": null,
+    "eu_responsible_operator": null,
+    "product_identifier": null,
+    "risk_assessment": null,
+    "technical_documentation": null,
+    "warnings": null,
+    "instructions": null,
+    "required_languages": [],
+    "complaints_process": null,
+    "recall_process": null
+  },
+  "product_specific_rules": {
+    "status": "REGRA AINDA NÃO DEFINIDA",
+    "product_category": null,
+    "materials": [],
+    "intended_use": null,
+    "target_audience": null,
+    "rules": []
+  },
+  "intellectual_property": {
+    "status": "VERIFICAÇÃO MANUAL NECESSÁRIA",
+    "trademark_searches": [],
+    "design_searches": [],
+    "licences": [],
+    "evidence": []
+  },
+  "safety_gate_results": {
+    "search_status": "PESQUISA_NECESSÁRIA",
+    "queries": [],
+    "matches": [],
+    "checked_at": null,
+    "source_url": "https://ec.europa.eu/safety-gate-alerts/screen/home"
+  },
+  "missing_documents": [
+    "identificação do fabricante",
+    "operador económico responsável na UE",
+    "avaliação de risco",
+    "documentação técnica",
+    "composição e materiais",
+    "dados da embalagem",
+    "registo EPR aplicável"
+  ],
+  "sources": [
+    {
+      "source_id": null,
+      "type": "USER_SUPPLIED_EVIDENCE_NAME",
+      "title": "Maternelle Perú",
+      "url": null,
+      "authority": null,
+      "country": null,
+      "published_at": null,
+      "effective_at": null,
+      "transition_end_at": null,
+      "status": "NAME_ONLY",
+      "checked_at": null,
+      "confidence": "LIMITED",
+      "evidence_excerpt": null
+    }
+  ],
+  "confidence": {
+    "score": "HIGH",
+    "global_evidence_name": "MEDIUM",
+    "supplier": "NONE",
+    "financial_viability": "NONE",
+    "legal": "NONE"
+  },
+  "last_checked_at": null,
+  "user_decision": null,
+  "decision_history": [],
+  "telegram": {
+    "render_mode": null,
+    "chat_id": null,
+    "message_id": null,
+    "payload_hash": null,
+    "delivery_status": "NOT_SENT",
+    "revision": 0,
+    "last_edited_at": null
+  }
+}

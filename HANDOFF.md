@@ -1,94 +1,136 @@
 # HANDOFF — Ecom Research
 
-## Estado
+## Estado atual
 
-O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula de score, pesos, thresholds, labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`), decisões de mercado, comandos existentes e direcção send-only do Telegram não mudaram. A qualificação dos dados de entrada ficou mais restrita para rejeitar falsos positivos, e o digest passou a apresentar `AVANÇAR` explicitamente como sinal advisory em vez de instrução de venda.
+O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula de score, pesos, thresholds e labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`) não foi alterada. O código de produção continua a enviar um digest plain text através de `sendMessage`; nenhuma parte do plano Telegram Rich foi implementada nesta sessão.
 
-A validação diferencial inicial contra `155a3fabfe20b7f6aa02721601727214d5f28b17` confirmou que o envelope de robustez — `run_id`, timestamps, proveniência, nomes sem colisões e estado de entrega — não alterava o comportamento de negócio. As correções operacionais posteriores mudaram intencionalmente a elegibilidade da evidência, o tratamento de moeda e a redação advisory, portanto as 71 comparações exactas dessa fase inicial já não descrevem o diff completo atual. A fórmula de score permanece inalterada; o comportamento atual está coberto por 561 testes e pelos artefactos live.
+Foi concluída uma investigação técnica e comercial para evoluir o relatório semanal. O pacote completo está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis consolidados em [`docs/telegram-research/REPORT.md`](docs/telegram-research/REPORT.md).
 
-### Hardening operacional final
+## Decisão Telegram
 
-### Review ronda 3 (achados pendentes, não bloqueantes)
+A Bot API oficial confirma:
 
-A ronda 3 da revisão independente levantou achados que ficam para análise posterior, depois de observarmos os primeiros digests automáticos. Nenhum foi confirmado como bloqueante nesta sessão, mas devem ser reavaliados com evidência real:
+- Bot API 10.1, 11/06/2026: Rich Messages e `sendRichMessage`;
+- Bot API 10.2, 14/07/2026: blocos estruturados, tabelas, `details`, media, collages e slideshows;
+- `editMessageText` aceita `rich_message`;
+- `reply_markup`, botões URL e callbacks são suportados.
 
-1. Packs legados reutilizados nos modos quarta/mensal podem carregar `source_url` de landing não sanitizada (`run.py` sanitiza `ads_data`, mas não o `landing_price` reutilizado).
-2. `quota.py` falha aberta se a escrita da quota falhar (ex.: disco cheio): o charge reporta sucesso sem persistir.
-3. Fetches de landing aceitam qualquer hostname HTTP(S) com redirects — sem defesa SSRF (hosts privados/loopback).
-4. `keyword_csv._read_text` ainda pode levantar `UnicodeDecodeError` em UTF-8-BOM malformado, violando o contrato never-raise.
-5. Números gigantes/não finitos em caches e scores relacionados (`trends`, `serp_seo`) sem guarda total.
-6. `_is_inactive` no Apify ignora `is_active: false` quando `end_date` é futuro/ausente.
-7. Sem resolver operacional para estados Telegram `state_ambiguous` — bloqueio permanente até intervenção manual no ficheiro.
+A recomendação aprovada para planeamento é:
+
+1. `sendRichMessage` como renderer principal;
+2. `sendMessage` com HTML como fallback integral;
+3. resumo semanal separado;
+4. uma mensagem por produto;
+5. long polling persistente no host atual;
+6. apenas um `Telegram user_id` autorizado;
+7. Mini App adiada.
+
+O outbound pode continuar a usar `requests`. O runtime inbound deve ser decidido num spike entre `python-telegram-bot` e uma implementação mínima, sem reescrever o protocolo de entrega atual.
+
+## Decisões do operador
+
+- Imagens só podem vir de fornecedor validado e com utilização permitida.
+- O botão do relatório completo fica oculto enquanto os packs não tiverem URL pública validada.
+- Pesquisa de fornecedores usa apenas páginas públicas, sem contas ou APIs pagas nesta fase.
+- Prioridades comerciais: Portugal, Reino Unido e Estados Unidos.
+- Legal Gate atual: União Europeia/Portugal; regras UK/US ficam fora do âmbito jurídico desta fase.
+- Restantes Estados-Membros continuam configuráveis individualmente.
+
+## Legal Gate progressivo
+
+O modelo inicial foi corrigido para não rejeitar oportunidades prematuramente. Estado jurídico e fase comercial são dimensões independentes:
+
+```text
+Descoberta → Pesquisa de fornecedor → Teste sem venda → Venda teste → Escala
+```
+
+Uma lacuna documental bloqueia apenas a fase em que é material. EPR/packaging aplicáveis continuam obrigatórios antes da primeira venda; CE só é exigido quando a categoria o determina; Safety Gate sem resultados não aprova nem bloqueia sozinho.
+
+Estado preliminar dos cinco produtos:
+
+- mochila personalizada: avançar para pesquisa de fornecedor;
+- caneca personalizada: avançar para pesquisa; documentação de contacto alimentar aplicável antes da venda;
+- tapete yoga: avançar para pesquisa; composição e regras aplicáveis antes da venda;
+- velas aromáticas: avançar para pesquisa; composição/classificação/avisos antes da venda;
+- camisola Portugal: pesquisa jurídica permitida, mas validar propriedade intelectual antes de publicidade com símbolos ou nomes potencialmente protegidos.
+
+## Fornecedores e margens
+
+Não existe fornecedor confirmado para venda. Há páginas individuais `CANDIDATE` no AliExpress para mochila, caneca, tapete e velas, e páginas de categoria/pesquisa noutras plataformas. Preço, MOQ, stock, shipping PT/GB/US, prazo, devoluções e documentação continuam por validar.
+
+O modelo financeiro separa receita líquida, IVA de venda/recuperável, importação/IOSS, HS/CN, shipping, fulfilment, pagamentos, devoluções, contribuição antes de anúncios e CAC break-even. Nenhum preço, margem ou threshold comercial foi inventado.
+
+## Documentação criada
+
+- `docs/telegram-research/01-current-system-and-bot-api.md` — matriz oficial da Bot API.
+- `docs/telegram-research/01b-current-system-diagnosis.md` — implementação atual e blast radius.
+- `docs/telegram-research/02-options-compatibility-recommendation.md` — comparação A/B/C.
+- `docs/telegram-research/03-mockups-and-interactions.md` — resumo e cinco produtos.
+- `docs/telegram-research/03b-telegram-payloads.md` — payloads Rich, edição e fallback.
+- `docs/telegram-research/04-data-callbacks-and-persistence.md` — long polling, decisões e idempotência.
+- `docs/telegram-research/product-schema.example.json` — schema completo.
+- `docs/telegram-research/05-suppliers-and-margins.md` — evidência pública e fórmulas.
+- `docs/telegram-research/06-legal-gate-and-monitoring.md` — gate progressivo UE/PT.
+- `docs/telegram-research/07-implementation-plan-and-tests.md` — fases, esforço e testes.
+- `docs/telegram-research/REPORT.md` — índice dos 22 entregáveis.
 
 ## Próxima sessão
 
-Foram concluídas as correções de relevância comercial, correspondência exata do CSV por produto, filtragem das sugestões Trends, proveniência e sanitização dos erros HTTP, moeda e URLs de landing, packs advisory e estado write-ahead do Telegram. URLs persistidas perdem query strings potencialmente sensíveis, moedas diferentes não são combinadas e estados de entrega ambíguos bloqueiam retries automáticos para evitar duplicação.
+Não começar pela Mini App nem pela automação de fornecedores. A ordem recomendada é:
 
-O fluxo Telegram mantém o token fora de logs, estado persistido e exceções; `.env` está a `0600` e ignorado pelo Git. `data/digests/` passa a ser criado/apertado a `0700` e os ficheiros de estado nascem a `0600`. A rotação do token exposto ficou adiada pelo operador e continua pendente, sem bloquear a operação.
+1. executar a Fase 0 do plano: fixtures de contrato, chat de teste e spike do runtime inbound;
+2. implementar modelo/renderers Rich e HTML com TDD;
+3. generalizar write-ahead de chunks para itens de mensagem;
+4. só depois introduzir long polling e decisões;
+5. fornecedores/margem e Legal Gate entram em releases separados.
 
-## Onde está cada fluxo
+Estimativa sem Mini App: 18–31 dias-agente; núcleo Telegram Rich/multi-mensagem: 5–8 dias-agente.
 
-- `run.py`: parser, precedência de modos, execução full/domingo/quarta/mensal/auto, idempotência e checkpoints por keyword.
-- `pipeline/run_state.py`: identidade determinística, manifestos, escritas atómicas e locks de run.
-- `pipeline/provenance.py`: estados `valid`, `missing`, `stale` e `failed`, mais políticas não secretas das fontes.
-- `pipeline/output/pack.py`: Markdown/JSON run-scoped, metadados de proveniência e marcador `artifact_complete`.
-- `pipeline/delivery/telegram.py`: send-only, chunks de 4000 caracteres, estado persistido e resume apenas dos chunks não enviados.
-- `pipeline/quota.py`: quota SerpAPI/Firecrawl com escrita atómica e transacções bloqueantes/fail-closed.
-- `pipeline/adapters/`: contratos, caches, timeouts e fallbacks por fonte; payloads inválidos ou de erro não são reutilizados como cache válido.
-- `pipeline/scoring/score.py`: cálculo inalterado; `SCORING_VERSION` e snapshot da configuração são apenas metadados.
+## Garantias existentes a preservar
 
-O diagrama e a descrição completa da arquitectura estão em `README.md`.
+- `run_id` determinístico e zero repetição de fontes pagas em reentrega;
+- write-ahead antes da chamada Telegram;
+- timeout/5xx/resposta ilegível mantém estado ambíguo e bloqueia reenvio;
+- tokens e URLs sensíveis fora de logs e estado;
+- batch tecnicamente incompleto não é entregue;
+- fallback stdout completo;
+- scoring permanece advisory.
 
-## Garantias agora cobertas
+## Riscos anteriores ainda pendentes
 
-- Precedência fixa: `auto > sunday > wednesday > monthly > all > keyword`; selectores ou CSV ignorados produzem avisos determinísticos.
-- Um `run_id` concluído não repete fontes pagas, packs ou digests. Domingo e `--all` gravam checkpoints e repetem apenas keywords com falha técnica.
-- Falha mensal do Trends preserva o último pack `OBSERVAR`, portanto a keyword não desaparece da watchlist.
-- Packs de modos/keywords diferentes não colidem; formatos legados continuam a ser lidos, mas novos packs usam nomes run-scoped.
-- Manifestos, packs, caches e estados Telegram malformados são rejeitados sem serem tratados como evidência válida.
-- Excepções de rede e falhas técnicas são sanitizadas; tokens e URLs sensíveis não entram em packs, manifestos, digests ou logs.
-- O estado Telegram distingue sucesso, parcial, falha, configuração ausente e estado corrompido; chunks confirmados localmente não são reenviados.
-- Quota e runs usam locks bloqueantes e fail-closed. Não existem retries novos nem alterações aos limites de chamadas.
+- packs legados podem reutilizar `source_url` de landing não sanitizada;
+- quota pode falhar aberta se a persistência falhar;
+- fetch de landing ainda precisa de defesa SSRF;
+- CSV malformado pode levantar `UnicodeDecodeError`;
+- valores gigantes/não finitos não têm guarda total em todos os caches;
+- `_is_inactive` pode ignorar `is_active: false` em casos específicos;
+- `state_ambiguous` Telegram continua sem resolver operacional automático;
+- token Telegram anteriormente exposto continua a precisar de rotação pelo operador.
 
-## Verificação
+## Verificação desta sessão
+
+Não foi executada a suite de produção porque só foram alterados documentos. Foi validado:
+
+- `product-schema.example.json` como JSON;
+- os quatro payloads JSON de `03b-telegram-payloads.md`;
+- presença exata das 22 secções no `REPORT.md`;
+- links internos dos documentos;
+- ausência de alterações fora de documentação.
+
+Antes de qualquer implementação:
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
 .venv/bin/python -m compileall -q run.py pipeline
-.venv/bin/python run.py --help
 git diff --check
 ```
 
-Último resultado: **561 testes passaram**; `compileall`, CLI help e `git diff --check` passaram. Todos os testes de rede usam mocks.
-
-Validação final:
-
-- baseline de robustez: commit `155a3fabfe20b7f6aa02721601727214d5f28b17`, **135 testes**;
-- estado atual endurecido, **561 testes**;
-- fórmula de score inalterada; elegibilidade da evidência, moeda e redação advisory corrigidas intencionalmente;
-- smoke live, CSV real, entrega Telegram e scheduler validados.
-
-## Riscos e decisões pendentes
-
-1. Um crash depois de uma chamada paga e antes do checkpoint pode repetir essa chamada; exactly-once por fonte exigiria reservas/checkpoints externos ao processo.
-2. O Telegram continua sem exactly-once remoto: se a aceitação ocorrer sem confirmação local, o estado write-ahead fica ambíguo e os retries são bloqueados até resolução manual, evitando duplicação automática.
-3. O lock de quota fica activo durante o pedido ao provider. Isto preserva limites duros, mas serializa processos e pode aumentar latência.
-4. Um batch com excepção técnica adia o Telegram final até todas as keywords terminarem; o digest parcial fica no stdout e no manifesto.
-5. Uma segunda execução intencional no mesmo dia, com os mesmos inputs, é tratada como repetição. Um eventual `--force` precisa de decisão de produto.
-6. CSV, ads históricos e preços reutilizados são marcados como stale, mas não expiram decisões automaticamente; impor TTL mudaria regras de negócio.
-7. `data/runs/` e `data/digests/` ainda não têm política de retenção. `data/digests/` passou a `0700` (owner-only) nesta sessão; `data/runs/` continua com o umask default.
-
-## Próxima sessão
-
-1. **Aguardar os digests automáticos do cron** (domingo, quarta e dia 1 às 08:00 Lisboa) e observar o comportamento real em `data/cron.log`.
-2. Reavaliar os achados da ronda 3 (lista acima) com base nas falhas observadas nos digests; corrigir apenas o que se confirmar relevante.
-3. Rodar o token Telegram quando o operador estiver disponível e repetir apenas o teste de configuração/entrega, sem voltar a executar fontes pagas.
-4. Decidir, sem bloquear produção, se são necessários `--force`, TTLs obrigatórios e retenção dos manifestos/digests.
-
-O CSV real, o smoke live, a entrega Telegram e o cron diário `run.py --auto --digest` já estão validados. A aprovação humana continua obrigatória para produto, mercado, sugestões e passagem para ad-machine.
+O último baseline anterior continua registado com 561 testes verdes.
 
 ## Suggested skills
 
-- `diagnose` — para qualquer divergência observada no smoke live.
-- `tdd` — para alterações futuras aos modos, adapters, idempotência ou entrega.
-- `security-review` — antes de alterar persistência de credenciais, Telegram ou integrações externas.
+- `tdd` — implementar cada slice Rich/callback com red-green-refactor.
+- `diagnose` — qualquer divergência de entrega, polling ou estado ambíguo.
+- `security-review` — antes de ativar callbacks, URL/media externos ou armazenamento de decisões.
+- `assess-impact` — antes de alterar `telegram.py`, `run_state.py` e o manifesto.
+- `request-review` — depois de cada release executável.
