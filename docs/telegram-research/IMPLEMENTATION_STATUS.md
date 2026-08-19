@@ -107,6 +107,26 @@ A aplicação não reenviou no retry, mas o resultado visual Rich não satisfaz 
 
 O modo operacional desta release é, por isso, HTML multi-mensagem.
 
+## Diagnóstico follow-up — duplicação visual Rich
+
+Data: 2026-08-19 (follow-up ao smoke; documentação apenas — sem alterações a código, testes, `.env` ou dados). Para este diagnóstico não foi enviada nenhuma mensagem live nova: a observação cross-client reutilizou as mensagens existentes 17/18.
+
+Evidência retida e inspeção offline:
+
+- `/tmp/ecom-telegram-smoke-state/rich-smoke-20260819T094918Z.json` (`schema_version=2`): exatamente dois itens Rich (resumo + produto), ambos `sent` uma única vez, `message_id` 17 e 18 consecutivos, `in_flight=false`; a reexecução do mesmo state ID fez zero chamadas de rede.
+- Controlo HTML: `/tmp/ecom-telegram-smoke-state/html-smoke-20260819T095305Z.json` — `message_id` 19 e 20 renderizados corretamente, retry com zero chamadas de rede.
+- Inspeção offline de payloads/requests: um `sendRichMessage` por item, sem campo de texto irmão no payload e sem conteúdo duplicado; os testes atuais cobrem contagem de requests e idempotência (request count e resume sem duplicação).
+
+Observação cross-client:
+
+- O operador visualizou as mensagens existentes 17/18 num segundo cliente Telegram: cada uma aparece exatamente uma vez nesse cliente, enquanto o cliente original mostrava cada item duplicado visualmente.
+
+Conclusão:
+
+- A duplicação é uma incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação; não há correção de código de produção justificada.
+- A decisão operacional mantém-se `TELEGRAM_RENDERER=html`; Rich permanece desativado para a coorte de clientes atual.
+- Não é reclamada uma versão específica de cliente nem internals de servidor: esses dados não foram capturados durante o diagnóstico.
+
 ## Ficheiros alterados
 
 - `.env.example`
@@ -202,7 +222,7 @@ Rollback de código: fazer `git revert <commit-final-desta-branch>` depois de ob
 
 ## Riscos e trabalho aberto
 
-- Rich foi aceite pela API mas duplicou visualmente cada item no smoke; investigar o endpoint/cliente antes de ativar.
+- Rich foi aceite pela API; a duplicação visual foi diagnosticada como incompatibilidade de renderização específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram), sem double-send da aplicação — Rich permanece desativado para a coorte de clientes atual.
 - A assinatura real de erro Rich que deve disparar fallback continua por confirmar; o classificador atual falha fechado quando não reconhece a descrição.
 - Batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência.
 - A identidade de produto continua baseada no hash da keyword e não sobrevive a renomeações; um identity store canónico fica fora desta release.

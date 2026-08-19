@@ -6,7 +6,7 @@ O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula 
 
 O outbound Telegram foi implementado e é agora HTML multi-mensagem determinístico por omissão: `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos (retenção, churn/sinais e deltas de anunciantes); `monthly` envia resumo seguido dos produtos afetados. O digest plain text integral continua impresso no stdout e guardado como audit text. O renderer resolve-se por `TELEGRAM_RENDERER` — documentado em `.env.example` e default de código `html`.
 
-O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado: no smoke autorizado, a API aceitou as mensagens e o retry fez zero chamadas de rede, mas a inspeção visual mostrou cada item duplicado no chat de teste. Rich só é reativado depois de a duplicação ser reproduzida, explicada e corrigida.
+O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). Rich só é reativado para uma coorte de clientes compatível, depois de a assinatura de erro que deve disparar fallback ser confirmada.
 
 A investigação técnica e comercial está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis em [`REPORT.md`](docs/telegram-research/REPORT.md) e o registo da implementação/smoke em [`IMPLEMENTATION_STATUS.md`](docs/telegram-research/IMPLEMENTATION_STATUS.md). Fora do âmbito continuam callbacks, long polling, Mini App, fornecedores/margens automáticos, Legal Gate executável e monitorização jurídica.
 
@@ -15,7 +15,7 @@ A investigação técnica e comercial está em [`docs/telegram-research/`](docs/
 A Bot API oficial confirma Rich Messages e `sendRichMessage` (10.1) e blocos estruturados, tabelas, `details` e media (10.2). A recomendação de planeamento previa `sendRichMessage` como renderer principal com HTML como fallback; o smoke autorizado inverteu a decisão operacional:
 
 1. `sendMessage` com HTML é o renderer operacional e default (código e `.env.example`): `TELEGRAM_RENDERER=html`;
-2. `sendRichMessage` está implementado (`pipeline/notifications/render_rich.py`) mas desativado — a API aceitou as mensagens e o retry fez zero chamadas de rede, mas cada item apareceu duplicado no chat de teste; a causa exata (endpoint/cliente Rich) continua por investigar;
+2. `sendRichMessage` está implementado (`pipeline/notifications/render_rich.py`) mas desativado — a API aceitou as mensagens e o retry fez zero chamadas de rede; o diagnóstico concluiu que a duplicação visual é uma incompatibilidade de renderização específica do cliente, não um reenvio da aplicação (Rich mantém-se desativado para a coorte de clientes atual);
 3. resumo separado seguido de uma mensagem por produto nos modos agregados;
 4. `keyword` envia uma única mensagem de produto;
 5. long polling e decisões (callbacks) ficam fora do âmbito desta release;
@@ -76,8 +76,8 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 
 Não começar pela Mini App, por callbacks/long polling nem pela automação de fornecedores — o núcleo multi-mensagem HTML já está entregue. A ordem recomendada é:
 
-1. reproduzir e explicar a duplicação visual Rich num chat de teste antes de qualquer reativação (Rich permanece desativado);
-2. confirmar a assinatura real de erro Rich que deve disparar fallback — o classificador atual falha fechado quando não reconhece a descrição;
+1. **concluído** — duplicação visual Rich diagnosticada como incompatibilidade de renderização específica do cliente, sem double-send da aplicação (ver follow-up em `docs/telegram-research/IMPLEMENTATION_STATUS.md`); Rich permanece desativado para a coorte de clientes atual;
+2. confirmar a assinatura real de erro Rich que deve disparar fallback — o classificador atual falha fechado quando não reconhece a descrição; é agora a prioridade seguinte;
 3. identity store canónico de produtos (o hash de keyword não sobrevive a renomeações) — fora desta release;
 4. só depois introduzir long polling e decisões, num spike entre `python-telegram-bot` e uma implementação mínima;
 5. fornecedores/margem e Legal Gate executável entram em releases separados.
@@ -101,7 +101,7 @@ Não começar pela Mini App, por callbacks/long polling nem pela automação de 
 - CSV malformado pode levantar `UnicodeDecodeError`;
 - valores gigantes/não finitos não têm guarda total em todos os caches;
 - `_is_inactive` pode ignorar `is_active: false` em casos específicos;
-- Rich foi aceite pela API mas duplicou visualmente cada item no smoke; investigar o endpoint/cliente antes de ativar;
+- Rich foi aceite pela API; a duplicação visual foi diagnosticada como incompatibilidade de renderização específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram), sem double-send da aplicação — Rich permanece desativado para a coorte de clientes atual;
 - a assinatura real de erro Rich que deve disparar fallback continua por confirmar (classificador fail-closed);
 - batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência;
 - itens com entrega ambígua exigem reconciliação manual antes de qualquer reenvio;
@@ -110,6 +110,8 @@ Não começar pela Mini App, por callbacks/long polling nem pela automação de 
 ## Verificação desta sessão
 
 Baseline completo da release: **680 testes verdes** (`680 passed`), `compileall` sem erros e `git diff --check` limpo. Todos os testes mockam rede; o único tráfego real foi o smoke autorizado no chat de teste, com Rich e HTML separados por state ID e sem ler credenciais para output.
+
+Sessão atual: documentação apenas — sem alterações a código/testes/`.env`/dados. O diagnóstico cross-client reutilizou as mensagens existentes 17/18, sem enviar novas mensagens live.
 
 Antes de qualquer alteração futura:
 
