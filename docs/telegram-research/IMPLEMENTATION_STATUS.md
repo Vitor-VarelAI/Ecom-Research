@@ -227,3 +227,29 @@ Rollback de código: fazer `git revert <commit-final-desta-branch>` depois de ob
 - Batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência.
 - A identidade de produto continua baseada no hash da keyword e não sobrevive a renomeações; um identity store canónico fica fora desta release.
 - Callbacks, long polling, Mini App, fornecedores automáticos, margens, Legal Gate executável e monitorização jurídica continuam fora do âmbito.
+
+## Follow-up — classificador de fallback Rich baseado em evidência (assinatura completa)
+
+Data: 2026-08-19 (slice de reconciliação de documentação; a implementação do classificador já estava no working tree). Sem chamada Telegram live neste slice: a assinatura foi confirmada offline a partir do envelope oficial da Bot API, de evidência de integrações open-source/live-verificadas e de allowlists exatas — ver [`08-rich-fallback-signature.md`](08-rich-fallback-signature.md). O registo histórico da release (680 testes) acima permanece válido para o seu slice; este follow-up documenta a assinatura completa e a reconciliação da documentação.
+
+### O que mudou no working tree
+
+- `pipeline/delivery/telegram.py`: as frases especulativas anteriores (`can't parse rich message`, `cannot parse rich message`, `unsupported rich message`, `rich message is not supported`) foram removidas. O classificador `_is_rich_unsupported` passou a exigir um 4xx definitivo consistente (status HTTP **ou** `error_code` inteiro no corpo; um 4xx do corpo vale mesmo com HTTP 200 + `ok=false`, e um 4xx HTTP sem `error_code` também vale) **e** uma `description` com um dos 13 tokens simbólicos exatos (token inteiro case-insensitive, allowlist em frozenset, nunca uma regex `RICH_MESSAGE_*` ampla) ou igual a uma das 3 descrições completas normalizadas exatas (`Not Found: method not found`, `Bad Request: unknown method`, `Bad Request: rich message must be non-empty`).
+- Fail-closed mantido: HTTP >=500 nunca corresponde mesmo com `error_code` 4xx no corpo (e o 5xx já é ambíguo a montante — `state_ambiguous`, marcador `in_flight` durável, nunca faz fallback); um `error_code` inteiro presente e não-4xx nunca corresponde mesmo com status HTTP 4xx; near-matches (ex.: `RICH_MESSAGE_EMAIL_INVALIDATED`), texto que apenas contém uma frase, chat/auth/rate/config, 4xx desconhecido e 429 nunca disparam fallback. A descrição Telegram raw continua fora de estado, logs e report.
+- `tests/test_delivery_v2.py`: **65 testes focados** de entrega — positivo token-a-token e por descrição exata, near-match negativo, 5xx com token negativo, HTTP 400 + `error_code` 500 negativo, HTTP 500 + `error_code` 400 ambíguo, texto que apenas contém a frase negativo, 429/4xx desconhecido negativos, ausência da descrição crua do estado/logs/report, e `RICH_MESSAGE_TEXT_TOO_LONG` com HTML acima dos 4096 a falhar fechado sem rede.
+
+### Limitação conhecida documentada (32768 Rich vs 4096 HTML)
+
+`sendRichMessage` aceita 32768 caracteres visíveis e `sendMessage` (HTML) apenas 4096. Um item que caiba no Rich mas exceda os 4096 do HTML falha fechado **sem** tentar a rede: o render do fragmento HTML levanta `NotificationTooLargeError`, o item fica `rejected` com `last_error_kind=render_failed` (report `error`/`render_failed`), `fallback_attempted=false` e o conteúdo **nunca é truncado** — o `payload_hash` durável continua a ser o do fragmento Rich completo. Rich→HTML é tentado no máximo uma vez por item; HTML nunca faz fallback.
+
+### Verificação deste slice
+
+```text
+65 passed (tests/test_delivery_v2.py)
+708 passed (tests/ completo)
+compileall_rc=0
+run.py --help: exit 0
+git diff --check: exit 0
+```
+
+Sem alterações a schema de estado (`schema_version=2`), defaults do renderer (`TELEGRAM_RENDERER=html`), `_send_item_once`, formato de estado, transição de fallback nem `.env`/dados. O risco "assinatura real de erro Rich continua por confirmar" do registo histórico acima está resolvido por este slice; a limitação dos 4096 do HTML fica como risco aberto conhecido. A próxima prioridade é o identity store canónico de produtos (o hash de keyword não sobrevive a renomeações); depois inbound polling/decisões; depois fornecedores/margens e Legal Gate executável em releases separados.

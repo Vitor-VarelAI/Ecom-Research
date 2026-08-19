@@ -19,8 +19,11 @@ import pytest
 from pipeline.delivery import telegram
 from pipeline.notifications import (
     NotificationBatch,
+    NotificationField,
+    NotificationItem,
     render_html,
     render_rich,
+    stable_product_id,
 )
 from tests.fixtures.telegram.build_helpers import (
     load_fixture,
@@ -238,7 +241,7 @@ def test_narrow_rich_rejection_falls_back_to_html_once(monkeypatch, tmp_path):
     calls = _install_post(
         monkeypatch,
         [
-            Response(200, {"ok": False, "error_code": 400, "description": "Bad Request: can't parse rich message"}),
+            Response(200, {"ok": False, "error_code": 400, "description": "Bad Request: RICH_MESSAGE_TEXT_TOO_LONG: message text is too long"}),
             Response(200, {"ok": True, "result": {"message_id": 7}}),
         ],
     )
@@ -261,28 +264,241 @@ def test_narrow_rich_rejection_falls_back_to_html_once(monkeypatch, tmp_path):
     )
 
 
-def test_rich_rejection_http_4xx_falls_back(monkeypatch, tmp_path):
+#: Evidence-backed Rich rejections: the 13 exact symbolic tokens, the 3 exact
+#: full descriptions, and the case/whitespace variants.  Every one must trigger
+#: exactly one HTML fallback through either valid 4xx gate.
+_POSITIVE_REJECTIONS = [
+    # entity tokens (live-verified / open-source integrations)
+    "Bad Request: RICH_MESSAGE_EMAIL_INVALID: Invalid email address",
+    "Bad Request: RICH_MESSAGE_URL_INVALID",
+    "Bad Request: RICH_MESSAGE_MENTION_INVALID",
+    "Bad Request: RICH_MESSAGE_HASHTAG_INVALID",
+    "Bad Request: RICH_MESSAGE_CASHTAG_INVALID",
+    "Bad Request: RICH_MESSAGE_BOT_COMMAND_INVALID",
+    "Bad Request: RICH_MESSAGE_PHONE_INVALID",
+    "Bad Request: RICH_MESSAGE_BANK_CARD_INVALID",
+    # structural rejections (live-verified)
+    "Bad Request: RICH_MESSAGE_BLOCKS_TOO_MANY",
+    "Bad Request: RICH_MESSAGE_DEPTH_INVALID",
+    "Bad Request: RICH_MESSAGE_TEXT_TOO_LONG",
+    "Bad Request: RICH_MESSAGE_MEDIA_TOO_MANY",
+    "Bad Request: RICH_MESSAGE_TABLE_COLS_TOO_MANY",
+    # capability rejections: exact normalized full descriptions
+    "Not Found: method not found",
+    "Bad Request: unknown method",
+    # format rejection observed in ecosystem reports
+    "Bad Request: rich message must be non-empty",
+    # whole-token / full-description matching is case-insensitive and
+    # strips surrounding whitespace
+    "  bad request: unknown method  ",
+    "Bad Request: rich_message_email_invalid",
+]
+
+
+@pytest.mark.parametrize("description", _POSITIVE_REJECTIONS)
+def test_evidence_backed_rejection_triggers_exactly_one_html_fallback(
+    monkeypatch, tmp_path, description
+):
+    """Every evidence-backed token, exact description, and normalization
+    variant triggers exactly one Rich request followed by one HTML request.
+    The thorough test above separately covers HTTP 200 + body error_code 400."""
     _env(monkeypatch, renderer="rich")
     batch = _batch(n_products=1)
+    state_id = "fb-evidence"
     calls = _install_post(
         monkeypatch,
         [
-            Response(400, {"ok": False, "description": "Bad Request: can't parse rich message"}),
-            Response(200, {"ok": True, "result": {"message_id": 8}}),
+            Response(400, {"ok": False, "description": description}),
+            Response(200, {"ok": True, "result": {"message_id": 9}}),
         ],
     )
 
-    report = telegram.deliver_batch(batch, "fb-2", str(tmp_path))
+    report = telegram.deliver_batch(batch, state_id, str(tmp_path))
 
-    assert report["delivered"] is True and report["fallback_used"] is True
+    assert report["delivered"] is True and report["status"] == "success"
+    assert report["fallback_used"] is True
     assert len(calls) == 2
+    assert calls[0]["url"].endswith("/sendRichMessage")
     assert calls[1]["url"].endswith("/sendMessage")
+    item = _state(str(tmp_path), state_id)["items"][0]
+    assert item["fallback_attempted"] is True
+    assert item["renderer"] == "html"
+    assert item["status"] == "sent"
+
+
+#: Definite rejections that must NEVER fall back: one Rich call, no HTML
+#: attempt, and the item fails closed.  Each entry is (response, error kind).
+_NEGATIVE_REJECTIONS = [
+    pytest.param(
+        Response(400, {"ok": False, "error_code": 400, "description": "Bad Request: RICH_MESSAGE_EMAIL_INVALIDATED"}),
+        "http_error",
+        id="near_match_token",
+    ),
+    pytest.param(
+        Response(400, {"ok": False, "description": "Bad Request: can't parse rich message"}),
+        "http_error",
+        id="removed_speculative_phrase",
+    ),
+    pytest.param(
+        Response(400, {"ok": False, "description": "Not Found: method not found: extra"}),
+        "http_error",
+        id="exact_phrase_with_extra_text",
+    ),
+    pytest.param(
+        Response(400, {"ok": False, "description": "Bad Request: chat not found"}),
+        "http_error",
+        id="chat_not_found",
+    ),
+    pytest.param(
+        Response(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"}),
+        "http_error",
+        id="auth_forbidden",
+    ),
+    pytest.param(
+        Response(429, {"ok": False, "description": "Too Many Requests: retry after 30"}),
+        "http_error",
+        id="http_429_rate_limit",
+    ),
+    pytest.param(
+        Response(400, {"ok": False, "description": "Bad Request: unknown rejection text"}),
+        "http_error",
+        id="unknown_4xx_text",
+    ),
+    pytest.param(
+        Response(400, {"ok": False, "error_code": 500, "description": "Bad Request: RICH_MESSAGE_EMAIL_INVALID"}),
+        "http_error",
+        id="http_400_error_code_500",
+    ),
+    pytest.param(
+        Response(200, {"ok": False, "error_code": 500, "description": "RICH_MESSAGE_EMAIL_INVALID"}),
+        "api_not_ok",
+        id="http_200_error_code_500_token",
+    ),
+    pytest.param(
+        Response(200, {"ok": False, "error_code": 403, "description": "Forbidden: bot was blocked by the user"}),
+        "api_not_ok",
+        id="http_200_error_code_403_nonmatch",
+    ),
+    pytest.param(
+        Response(200, {"ok": False}),
+        "api_not_ok",
+        id="ok_false_no_description",
+    ),
+]
+
+
+@pytest.mark.parametrize("response, expected_kind", _NEGATIVE_REJECTIONS)
+def test_definite_rejection_never_falls_back(monkeypatch, tmp_path, response, expected_kind):
+    """Whole-token and exact-description matching fail closed: a near-match
+    token, a removed speculative phrase, an exact phrase with extra text, a
+    rate limit, unknown 4xx text, an inconsistent non-4xx body error_code, and
+    generic ok=false bodies are all definite rejections — one Rich call, no
+    HTML attempt, and the item is durably rejected."""
+    _env(monkeypatch, renderer="rich")
+    batch = _batch(n_products=1)
+    state_id = "fb-neg" + str(abs(hash((response.status_code, str(response.payload)))) % 100000)
+    calls = _install_post(monkeypatch, response)
+
+    report = telegram.deliver_batch(batch, state_id, str(tmp_path))
+
+    assert report["delivered"] is False
+    assert report["status"] == "error"
+    assert report["errors"] == [expected_kind]
+    assert len(calls) == 1  # rich only, never html
+    assert calls[0]["url"].endswith("/sendRichMessage")
+    item = _state(str(tmp_path), state_id)["items"][0]
+    assert item["status"] == "rejected"
+    assert item["in_flight"] is False
+    assert item["fallback_attempted"] is False
+    assert item["renderer"] == "rich"
+    assert item["last_error_kind"] == expected_kind
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(
+            Response(500, {"ok": False, "description": "Internal: RICH_MESSAGE_EMAIL_INVALID"}),
+            id="http_500_recognized_token",
+        ),
+        pytest.param(
+            Response(500, {"ok": False, "error_code": 400, "description": "Bad Request: RICH_MESSAGE_EMAIL_INVALID"}),
+            id="http_500_error_code_400",
+        ),
+    ],
+)
+def test_http_5xx_stays_ambiguous_never_falls_back_and_rerun_refuses(monkeypatch, tmp_path, response):
+    """A 5xx outcome stays ambiguous even when the body carries a recognized
+    token (the remote may have accepted) or a 4xx error_code (inconsistent
+    body): never fall back, keep the durable in_flight marker, and block every
+    rerun."""
+    _env(monkeypatch, renderer="rich")
+    batch = _batch(n_products=1)
+    state_id = "fb-5xx" + str(abs(hash((response.status_code, str(response.payload)))) % 100000)
+    calls = _install_post(monkeypatch, response)
+
+    report = telegram.deliver_batch(batch, state_id, str(tmp_path))
+
+    assert report["delivered"] is False
+    assert report["status"] == "state_ambiguous"
+    assert report["errors"] == ["state_ambiguous"]
+    assert len(calls) == 1  # never a fallback after an ambiguous outcome
+    assert calls[0]["url"].endswith("/sendRichMessage")
+    durable = _state(str(tmp_path), state_id)
+    assert durable["items"][0]["in_flight"] is True
+    assert durable["items"][0]["status"] != "sent"
+    assert durable["items"][0]["fallback_attempted"] is False
+
+    second = telegram.deliver_batch(batch, state_id, str(tmp_path))
+    assert second["status"] == "state_ambiguous"
+    assert len(calls) == 1
+
+
+def test_text_too_long_rich_rejection_never_renders_oversized_html(monkeypatch, tmp_path):
+    """Rich caps at 32768 visible chars, HTML at 4096: a
+    RICH_MESSAGE_TEXT_TOO_LONG rejection on an item whose HTML render exceeds
+    4096 must fail closed — no HTML request, no truncation."""
+    _env(monkeypatch, renderer="rich")
+    long_value = "x" * 5000
+    item = NotificationItem(
+        kind="product",
+        title="produto com campo longo",
+        product=stable_product_id("produto com campo longo"),
+        footer_fields=(NotificationField(value=long_value),),
+    )
+    batch = NotificationBatch.build(mode="sunday", run_id="run-long", products=[item])
+    calls = _install_post(
+        monkeypatch,
+        Response(
+            400,
+            {"ok": False, "description": "Bad Request: RICH_MESSAGE_TEXT_TOO_LONG: message text is too long"},
+        ),
+    )
+
+    report = telegram.deliver_batch(batch, "fb-long", str(tmp_path))
+
+    assert report["delivered"] is False
+    assert report["status"] == "error"
+    assert report["errors"] == ["render_failed"]
+    assert report["items_sent"] == 0
+    assert len(calls) == 1  # rich rejection only; the oversized HTML is never sent
+    assert calls[0]["url"].endswith("/sendRichMessage")
+    item_state = _state(str(tmp_path), "fb-long")["items"][0]
+    assert item_state["status"] == "rejected"
+    assert item_state["last_error_kind"] == "render_failed"
+    assert item_state["in_flight"] is False
+    assert item_state["fallback_attempted"] is False
+    assert item_state["renderer"] == "rich"
+    # No truncation: the durable payload hash is still the full Rich fragment.
+    assert item_state["payload_hash"] == telegram._payload_hash(
+        _expected_fragment(batch, 0, "rich")
+    )
 
 
 def test_rich_rejection_description_never_persisted_logged_or_reported(monkeypatch, tmp_path, caplog):
     _env(monkeypatch, renderer="rich")
     batch = _batch(n_products=1)
-    description = "Bad Request: can't parse rich message"
+    description = "Bad Request: RICH_MESSAGE_EMAIL_INVALID: Invalid email address"
     calls = _install_post(
         monkeypatch,
         [
@@ -298,55 +514,10 @@ def test_rich_rejection_description_never_persisted_logged_or_reported(monkeypat
     assert description not in raw_state
     assert description not in caplog.text
     assert description not in json.dumps(report)
-
-
-def test_generic_4xx_no_fallback(monkeypatch, tmp_path):
-    _env(monkeypatch, renderer="rich")
-    batch = _batch(n_products=1)
-    calls = _install_post(monkeypatch, Response(400, {"ok": False, "description": "Bad Request: chat not found"}))
-
-    report = telegram.deliver_batch(batch, "no4xx", str(tmp_path))
-
-    assert report["delivered"] is False
-    assert report["status"] == "error"
-    assert report["errors"] == ["http_error"]
-    assert len(calls) == 1  # rich only, never html
-    assert calls[0]["url"].endswith("/sendRichMessage")
-    state = _state(str(tmp_path), "no4xx")
-    item = state["items"][0]
-    assert item["status"] == "rejected"
-    assert item["in_flight"] is False
-    assert item["fallback_attempted"] is False
-    assert item["renderer"] == "rich"
-    assert item["last_error_kind"] == "http_error"
-
-
-def test_ok_false_with_non_matching_description_no_fallback(monkeypatch, tmp_path):
-    _env(monkeypatch, renderer="rich")
-    batch = _batch(n_products=1)
-    calls = _install_post(
-        monkeypatch,
-        Response(200, {"ok": False, "error_code": 403, "description": "Forbidden: bot was blocked by the user"}),
-    )
-
-    report = telegram.deliver_batch(batch, "no-ok", str(tmp_path))
-
-    assert report["delivered"] is False
-    assert report["status"] == "error"
-    assert report["errors"] == ["api_not_ok"]
-    assert len(calls) == 1
-    assert calls[0]["url"].endswith("/sendRichMessage")
-
-
-def test_ok_false_generic_does_not_fallback_even_without_description(monkeypatch, tmp_path):
-    _env(monkeypatch, renderer="rich")
-    batch = _batch(n_products=1)
-    calls = _install_post(monkeypatch, Response(200, {"ok": False}))
-
-    report = telegram.deliver_batch(batch, "no-ok2", str(tmp_path))
-
-    assert report["delivered"] is False and report["errors"] == ["api_not_ok"]
-    assert len(calls) == 1
+    # Provider descriptions stay entirely sanitized, including symbolic tokens.
+    assert "RICH_MESSAGE_EMAIL_INVALID" not in raw_state
+    assert "RICH_MESSAGE_EMAIL_INVALID" not in caplog.text
+    assert "RICH_MESSAGE_EMAIL_INVALID" not in json.dumps(report)
 
 
 # ── Ambiguous outcomes: durable in_flight, block resend ───────────────────
@@ -433,7 +604,7 @@ def test_fallback_preflight_persist_failure_blocks_html_network(monkeypatch, tmp
     batch = _batch(n_products=2)
     calls = _install_post(
         monkeypatch,
-        Response(200, {"ok": False, "error_code": 400, "description": "Bad Request: can't parse rich message"}),
+        Response(200, {"ok": False, "error_code": 400, "description": "Bad Request: RICH_MESSAGE_BLOCKS_TOO_MANY"}),
     )
     # writes: 1 fresh, 2 item0 in_flight, 3 clear(rejected), 4 fallback preflight -> fails
     _failing_writes(monkeypatch, fail_count=4)

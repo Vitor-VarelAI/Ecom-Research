@@ -479,10 +479,11 @@ def send(text: str) -> bool:
 #    in_flight marker and block every rerun;
 # 5. definite rejections (HTTP 4xx, or valid dict JSON ``ok=false``) clear the
 #    marker and persist BEFORE any fallback/retry is allowed.  Only a narrow,
-#    sanitized rich_unsupported classifier (4xx + a description explicitly
-#    naming an unsupported/unparseable Rich method/message/tag) triggers one
-#    HTML attempt for that item; HTML never falls back again.  The raw
-#    description is never logged, persisted or reported;
+#    evidence-backed rich_unsupported classifier (4xx + a description carrying
+#    an exact Rich error token from the allowlist, or a description exactly
+#    equal to an evidence-backed full Bot API description) triggers one HTML
+#    attempt for that item; HTML never falls back again.  The raw description
+#    is never logged, persisted or reported;
 # 6. a legacy state without ``schema_version`` is never rewritten or
 #    auto-migrated: v1 ``status=success`` is a historical completed no-op,
 #    every other v1 status fails closed as state_legacy_migration.
@@ -497,16 +498,50 @@ _VALID_RENDERERS = frozenset({"rich", "html"})
 _DEFAULT_RENDERER = "html"  # safe rollout until live Rich acceptance exists
 _SCHEMA_VERSION = 2
 
-#: Narrow allowlist of rejection descriptions that identify a Rich method /
-#: message / tag the server cannot parse or does not support.  Only these may
-#: trigger the single HTML fallback; chat/auth/rate/config errors and unknown
-#: text never fall back.
-_RICH_UNSUPPORTED_PATTERNS = (
-    "can't parse rich message",
-    "cannot parse rich message",
-    "unsupported rich message",
-    "rich message is not supported",
+#: Exact symbolic error tokens (Telegram Bot API ``description``) that
+#: identify a Rich-message rejection the server cannot parse or does not
+#: support: entity tokens (live-verified/open-source integrations) and
+#: structural rejections (live-verified).  Matched case-insensitively as
+#: WHOLE tokens only, so a near-match such as ``RICH_MESSAGE_EMAIL_INVALIDATED``
+#: never matches ``RICH_MESSAGE_EMAIL_INVALID``.  There is no official
+#: structured Telegram error field; ``error_code`` (integer) plus human
+#: ``description`` is all the Bot API exposes.
+_RICH_UNSUPPORTED_TOKENS = frozenset(
+    {
+        # entity tokens (live-verified / open-source integrations)
+        "rich_message_email_invalid",
+        "rich_message_url_invalid",
+        "rich_message_mention_invalid",
+        "rich_message_hashtag_invalid",
+        "rich_message_cashtag_invalid",
+        "rich_message_bot_command_invalid",
+        "rich_message_phone_invalid",
+        "rich_message_bank_card_invalid",
+        # structural rejections (live-verified)
+        "rich_message_blocks_too_many",
+        "rich_message_depth_invalid",
+        "rich_message_text_too_long",
+        "rich_message_media_too_many",
+        "rich_message_table_cols_too_many",
+    }
 )
+
+#: Evidence-backed FULL Bot API ``description`` strings for Rich-method
+#: capability rejections and the Rich format rejection.  These are matched
+#: exactly: the whole normalized description (case-insensitive, surrounding
+#: whitespace stripped) must equal one of these — arbitrary text that merely
+#: contains a phrase never matches.  The speculative natural-language phrases
+#: previously used here are gone: they had no live evidence and are not part
+#: of the evidence-backed classifier.
+_RICH_UNSUPPORTED_DESCRIPTIONS = frozenset(
+    {
+        "not found: method not found",
+        "bad request: unknown method",
+        "bad request: rich message must be non-empty",
+    }
+)
+
+_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 def _payload_hash(fragment: dict[str, Any]) -> str:
@@ -773,26 +808,51 @@ def _send_item_once(
 
 
 def _is_rich_unsupported(status_code: int | None, body: Any) -> bool:
-    """Narrow fallback classifier: a definite rejection whose HTTP status or
-    ``error_code`` is 4xx AND whose ``description`` explicitly identifies an
-    unsupported/unparseable Rich method/message/tag.  Anything else (chat,
-    auth, rate, config errors, unknown text) is never a fallback trigger."""
-    is_4xx = status_code is not None and 400 <= status_code < 500
-    error_code_4xx = False
+    """Narrow evidence-backed fallback classifier.
+
+    A definite rejection triggers the single HTML fallback only when the
+    outcome is consistently 4xx (HTTP status or integer body ``error_code``)
+    AND the ``description`` either:
+
+    * contains one of the exact symbolic Rich error tokens
+      (``RICH_MESSAGE_*_INVALID`` entity/structural tokens) as a whole token,
+      case-insensitively — a near-match such as
+      ``RICH_MESSAGE_EMAIL_INVALIDATED`` never matches; or
+    * is exactly equal to an evidence-backed full Bot API description
+      (case-insensitive, surrounding whitespace stripped) — a description
+      that merely contains the phrase never matches.
+
+    The classifier fails closed on inconsistent responses: an HTTP status
+    >=500 never matches even when the body ``error_code`` is 4xx, and an
+    integer body ``error_code`` that exists and is not 4xx never matches even
+    when the HTTP status is 4xx.  HTTP 200 + body ``error_code`` 4xx and HTTP
+    4xx without a body ``error_code`` both remain valid 4xx gates.
+    Chat/auth/rate/config errors and unknown text never fall back."""
+    if status_code is not None and status_code >= 500:
+        return False
+    error_code = None
     description = ""
     if isinstance(body, dict):
-        error_code = body.get("error_code")
-        if isinstance(error_code, int) and not isinstance(error_code, bool):
-            error_code_4xx = 400 <= error_code < 500
+        raw_code = body.get("error_code")
+        if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+            error_code = raw_code
         raw = body.get("description")
         if isinstance(raw, str):
             description = raw
-    if not (is_4xx or error_code_4xx):
+    # Fail closed on inconsistent responses: an integer body error_code that
+    # exists and is not 4xx never matches, even when the HTTP status is 4xx.
+    if error_code is not None and not (400 <= error_code < 500):
+        return False
+    is_4xx = status_code is not None and 400 <= status_code < 500
+    if not (is_4xx or (error_code is not None and 400 <= error_code < 500)):
         return False
     if not description:
         return False
-    lowered = description.lower()
-    return any(pattern in lowered for pattern in _RICH_UNSUPPORTED_PATTERNS)
+    lowered = description.strip().lower()
+    tokens = {match.group(0) for match in _WORD_RE.finditer(lowered)}
+    if tokens & _RICH_UNSUPPORTED_TOKENS:
+        return True
+    return lowered in _RICH_UNSUPPORTED_DESCRIPTIONS
 
 
 def _sent_count_v2(state: dict[str, Any]) -> int:
@@ -987,7 +1047,6 @@ def deliver_batch(
         return _report_from_state(state, delivered=False)
 
     errors: list[str] = []
-    fallback_used = _fallback_used_v2(state)
     for item_state in state["items"]:
         if item_state["status"] == "sent":
             continue  # never re-send an item already recorded as sent
@@ -1072,7 +1131,6 @@ def deliver_batch(
                     state["status"] = "state_persist_failed"
                     state["errors"] = ["state_persist_failed"]
                     return _report_from_state(state, delivered=False)
-                fallback_used = True
                 continue  # same item, html attempt (html never falls back again)
             errors.append(kind)
             break

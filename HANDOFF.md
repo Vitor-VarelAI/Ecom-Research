@@ -6,7 +6,7 @@ O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula 
 
 O outbound Telegram foi implementado e é agora HTML multi-mensagem determinístico por omissão: `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos (retenção, churn/sinais e deltas de anunciantes); `monthly` envia resumo seguido dos produtos afetados. O digest plain text integral continua impresso no stdout e guardado como audit text. O renderer resolve-se por `TELEGRAM_RENDERER` — documentado em `.env.example` e default de código `html`.
 
-O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). Rich só é reativado para uma coorte de clientes compatível, depois de a assinatura de erro que deve disparar fallback ser confirmada.
+O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). A assinatura de erro que dispara o fallback Rich→HTML está completa e baseada em evidência (envelope oficial da Bot API, integrações open-source/live-verificadas e allowlists exatas — ver `docs/telegram-research/08-rich-fallback-signature.md`); Rich só é reativado para uma coorte de clientes compatível.
 
 A investigação técnica e comercial está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis em [`REPORT.md`](docs/telegram-research/REPORT.md) e o registo da implementação/smoke em [`IMPLEMENTATION_STATUS.md`](docs/telegram-research/IMPLEMENTATION_STATUS.md). Fora do âmbito continuam callbacks, long polling, Mini App, fornecedores/margens automáticos, Legal Gate executável e monitorização jurídica.
 
@@ -69,6 +69,7 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 - `docs/telegram-research/05-suppliers-and-margins.md` — evidência pública e fórmulas.
 - `docs/telegram-research/06-legal-gate-and-monitoring.md` — gate progressivo UE/PT.
 - `docs/telegram-research/07-implementation-plan-and-tests.md` — fases, esforço e testes.
+- `docs/telegram-research/08-rich-fallback-signature.md` — assinatura de rejeição Rich: classificador baseado em evidência (4xx definitivo consistente + token simbólico exato da allowlist ou descrição completa normalizada exata; fail-closed; limite 32768 Rich vs 4096 HTML).
 - `docs/telegram-research/REPORT.md` — índice dos 22 entregáveis.
 - `docs/telegram-research/IMPLEMENTATION_STATUS.md` — registo da implementação, smoke Rich/HTML e ativação/rollback.
 
@@ -77,8 +78,8 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 Não começar pela Mini App, por callbacks/long polling nem pela automação de fornecedores — o núcleo multi-mensagem HTML já está entregue. A ordem recomendada é:
 
 1. **concluído** — duplicação visual Rich diagnosticada como incompatibilidade de renderização específica do cliente, sem double-send da aplicação (ver follow-up em `docs/telegram-research/IMPLEMENTATION_STATUS.md`); Rich permanece desativado para a coorte de clientes atual;
-2. confirmar a assinatura real de erro Rich que deve disparar fallback — o classificador atual falha fechado quando não reconhece a descrição; é agora a prioridade seguinte;
-3. identity store canónico de produtos (o hash de keyword não sobrevive a renomeações) — fora desta release;
+2. **concluído** — assinatura de erro Rich que dispara o fallback: classificador estreito baseado em evidência, sem chamada Telegram live neste slice — 4xx definitivo consistente **e** token simbólico exato da allowlist (13) ou descrição completa normalizada exata (3); chat/auth/rate/unknown/near-match/inconsistente/5xx continuam fail-closed; Rich→HTML tenta no máximo uma vez e itens demasiado grandes para os 4096 do HTML falham fechado (`render_failed`) sem truncar (32768 Rich vs 4096 HTML). Documentado em `docs/telegram-research/08-rich-fallback-signature.md`;
+3. **próxima prioridade** — identity store canónico de produtos (o hash de keyword não sobrevive a renomeações) — fora desta release;
 4. só depois introduzir long polling e decisões, num spike entre `python-telegram-bot` e uma implementação mínima;
 5. fornecedores/margem e Legal Gate executável entram em releases separados.
 
@@ -102,16 +103,16 @@ Não começar pela Mini App, por callbacks/long polling nem pela automação de 
 - valores gigantes/não finitos não têm guarda total em todos os caches;
 - `_is_inactive` pode ignorar `is_active: false` em casos específicos;
 - Rich foi aceite pela API; a duplicação visual foi diagnosticada como incompatibilidade de renderização específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram), sem double-send da aplicação — Rich permanece desativado para a coorte de clientes atual;
-- a assinatura real de erro Rich que deve disparar fallback continua por confirmar (classificador fail-closed);
+- a assinatura de erro Rich que dispara fallback está resolvida (classificador baseado em evidência); limitação conhecida: um item até 32768 caracteres Rich que já não caiba nos 4096 do HTML falha fechado como `render_failed`, sem truncar conteúdo;
 - batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência;
 - itens com entrega ambígua exigem reconciliação manual antes de qualquer reenvio;
 - token Telegram anteriormente exposto continua a precisar de rotação pelo operador.
 
 ## Verificação desta sessão
 
-Baseline completo da release: **680 testes verdes** (`680 passed`), `compileall` sem erros e `git diff --check` limpo. Todos os testes mockam rede; o único tráfego real foi o smoke autorizado no chat de teste, com Rich e HTML separados por state ID e sem ler credenciais para output.
+Baseline completo da release: **708 testes verdes** (`708 passed`), `compileall` sem erros, `run.py --help` e `git diff --check` limpos. Todos os testes mockam rede; o único tráfego real foi o smoke autorizado no chat de teste (histórico, com **680 testes verdes**), com Rich e HTML separados por state ID e sem ler credenciais para output — Rich aceite pela API mas desativado após o diagnóstico de duplicação visual específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram).
 
-Sessão atual: documentação apenas — sem alterações a código/testes/`.env`/dados. O diagnóstico cross-client reutilizou as mensagens existentes 17/18, sem enviar novas mensagens live.
+Sessão atual (fallback-signature): o classificador Rich→HTML baseado em evidência e os seus testes já estavam no working tree (`pipeline/delivery/telegram.py` e `tests/test_delivery_v2.py`); esta sessão fez a reconciliação de documentação e a verificação — **65 testes focados de entrega** e **708 testes totais** verdes, sem nenhuma chamada Telegram live neste slice. Sem alterações a `.env`, dados, schema de estado, defaults do renderer nem transição de fallback. O diagnóstico cross-client anterior reutilizou as mensagens existentes 17/18, sem enviar novas mensagens live.
 
 Antes de qualquer alteração futura:
 
