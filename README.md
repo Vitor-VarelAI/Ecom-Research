@@ -17,6 +17,7 @@ O modo full requer `APIFY_API_TOKEN` e `SERPAPI_KEY`. O repositório não conté
 - `SERPAPI_KEY`: Trends e snapshot SEO.
 - `FIRECRAWL_KEY`: fallback opcional para landings sem preço no HTML.
 - `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`: entrega opcional, sempre send-only.
+- `TELEGRAM_RENDERER=html`: renderer do outbound (default de código e documentado; Rich permanece desativado).
 
 O volume e CPC vêm de um export manual do Google Keyword Planner colocado em `data/`. O parser aceita o formato real em UTF-16 LE com BOM, tabulação e preâmbulo de título/data, além do CSV UTF-8 legado, e liga cada keyword à sua linha de produto exacta após normalização. Sem CSV, o pipeline degrada graciosamente, mas o score perde esse sinal.
 
@@ -86,7 +87,7 @@ flowchart TD
     Pack --> Markdown["packs/*.md<br/>research pack"]
     Pack --> History
     Pack --> Digest["Digest do modo"]
-    Digest -->|--digest| Telegram["Telegram send-only"]
+    Digest -->|--digest| Telegram["Telegram<br/>HTML multi-mensagem"]
     Digest -->|fallback| Stdout["stdout"]
 
     SerpAPI -. cache de 30 dias .-> Cache["data/cache/"]
@@ -136,16 +137,16 @@ A evidência da Ad Library é global (`country=ALL`) e o campo `global_market_pr
 
 Preços usam exclusivamente `top_ads[].landing_url`; links da Ad Library são rejeitados. A moeda é sempre derivada da fonte (`priceCurrency` ou símbolo/código explícito), nunca é assumida sem evidência, e preços de moedas diferentes nunca são combinados num range. São tentadas no máximo três landings, primeiro por HTTP e depois por Firecrawl, com falhas isoladas e sem retries. Quarta e mensal reutilizam o resultado anterior.
 
-Telegram é send-only: cada mensagem é plain text, no máximo 4000 caracteres, dividida em quebras de linha quando possível. O payload contém apenas `chat_id`, `text` e `disable_web_page_preview=true`. Falta de credenciais, timeout, HTTP diferente de 200, JSON inválido ou `ok != true` imprime o digest completo no stdout e não interrompe o pipeline. O token nunca é escrito em logs; o token Telegram exposto deve ainda ser rotacionado pelo utilizador.
+Telegram é send-only e determinístico: o outbound é HTML multi-mensagem por omissão (`TELEGRAM_RENDERER=html`, default de código e documentado em `.env.example`). `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos; `monthly` envia resumo seguido dos produtos afetados. Rich está implementado mas desativado — no smoke autorizado a API aceitou as mensagens e o retry fez zero chamadas de rede, mas cada item apareceu duplicado no chat de teste. Não existem callbacks, botões, media nem long polling. O digest plain text integral é impresso no stdout e guardado como audit text no estado de entrega. Falta de credenciais ou qualquer erro não interrompe o pipeline; o token nunca é escrito em logs; o token Telegram exposto deve ainda ser rotacionado pelo utilizador.
 
-O progresso de entrega é persistido em `data/digests/<run_id>.json`: texto, hash, chunks enviados e um estado sanitizado. Antes de cada envio, o estado `in_flight` é escrito atomicamente; se a persistência falhar, nada é enviado. Depois da aceitação remota, o chunk é marcado como enviado. Se essa escrita falhar ou um processo cair na janela entre aceitação e confirmação local, o run fica `state_ambiguous` e qualquer rerun recusa reenviar até resolução manual, evitando duplicações automáticas. Estados ilegíveis, de outro conteúdo ou inconsistentes também são fail-closed (`state_corrupt`). O token e o chat ID nunca são persistidos.
+O progresso de entrega é persistido em `data/digests/<state_id>.json` com `schema_version=2` e estado por item: `item_id`, ordem, renderer durável, hash do payload, `in_flight`, `sent_at`, `message_id`, fallback e erro sanitizado, mais o audit text do digest. Antes de cada envio, o marcador `in_flight` é escrito atomicamente; se a persistência falhar, nada é enviado. Um item só fica `sent` depois de `ok=true` com resposta válida e `message_id` guardado; timeout, transporte, 5xx, JSON ilegível ou resposta malformada deixam o item ambíguo e qualquer rerun recusa reenviar até resolução manual, evitando duplicações automáticas. Itens confirmados nunca são reenviados; estados ilegíveis ou inconsistentes falham fechado (`state_corrupt`). O renderer de um batch já persistido é deliberadamente durável e não muda com a variável de ambiente. O token e o chat ID nunca são persistidos.
 
 ## Saída
 
 - `packs/YYYY-MM-DD--<modo>--<kw_hash12>--<keyword>--<run_id[:12]>.md` / `data/YYYY-MM-DD--<modo>--<kw_hash12>--<keyword>--<run_id[:12]>.json`: todos os packs atuais são run-scoped — o nome inclui o modo (keyword/all/sunday/wednesday/monthly), um hash estável de 12 hex da keyword (evita colisões entre `a/b` e `a-b`) e o prefixo do `run_id` (o mesmo run repetido resolve para o mesmo caminho). Ex.: `2026-08-09--sunday--9f3a2b1c0d4e--mochila-personalizada--abc123def456`.
 - Nomes legados `YYYY-MM-DD--<keyword>.md` / `.json` (e `--wednesday`/`--monthly`) continuam a ser lidos pelos selectors (compatibilidade read-only), mas já não são escritos.
 - `data/runs/<run_id>.json`: manifesto de cada ação lógica (idempotência, checkpoints por keyword e estado de entrega do digest).
-- `data/digests/<run_id>.json`: estado de entrega Telegram por run.
+- `data/digests/<state_id>.json`: estado de entrega v2 por item (`schema_version=2`), com audit text e `message_id` por mensagem.
 - `data/cache/`: cache de Trends/SEO/Related Queries por 30 dias (payloads de erro nunca são cacheados; entradas corrompidas ou com forma inválida são tratadas como miss).
 - `data/quota.json`: contador SerpAPI e créditos Firecrawl (escritas atómicas).
 
@@ -160,11 +161,11 @@ As recomendações são operacionais, não decisões automáticas: `AVANÇAR` pr
 git diff --check
 ```
 
-Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **561 testes verdes**.
+Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **680 testes verdes**.
 
 ## Estado live
 
-O smoke live de uma keyword e uma entrega de um digest Telegram foram concluídos com sucesso. O host atual usa `Europe/Berlin`; o serviço cron está ativo e habilitado (`active`/`enabled`) e existe exactamente um job. Com `TZ=Europe/Lisbon`, o job das 09:00 do host corresponde às 08:00 de Lisboa e executa `--auto --digest`:
+O smoke live de uma keyword e uma entrega de um digest Telegram foram concluídos com sucesso. O smoke autorizado do outbound multi-mensagem correu no chat de teste: HTML aprovado (exatamente duas mensagens, retry com zero chamadas de rede); Rich aceite pela API mas desativado porque cada item apareceu duplicado visualmente. O host atual usa `Europe/Berlin`; o serviço cron está ativo e habilitado (`active`/`enabled`) e existe exactamente um job. Com `TZ=Europe/Lisbon`, o job das 09:00 do host corresponde às 08:00 de Lisboa e executa `--auto --digest`:
 
 ```cron
 TZ=Europe/Lisbon

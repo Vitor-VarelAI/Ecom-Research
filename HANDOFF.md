@@ -2,30 +2,27 @@
 
 ## Estado atual
 
-O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula de score, pesos, thresholds e labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`) não foi alterada. O código de produção continua a enviar um digest plain text através de `sendMessage`; nenhuma parte do plano Telegram Rich foi implementada nesta sessão.
+O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula de score, pesos, thresholds e labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`) não foi alterada.
 
-Foi concluída uma investigação técnica e comercial para evoluir o relatório semanal. O pacote completo está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis consolidados em [`docs/telegram-research/REPORT.md`](docs/telegram-research/REPORT.md).
+O outbound Telegram foi implementado e é agora HTML multi-mensagem determinístico por omissão: `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos (retenção, churn/sinais e deltas de anunciantes); `monthly` envia resumo seguido dos produtos afetados. O digest plain text integral continua impresso no stdout e guardado como audit text. O renderer resolve-se por `TELEGRAM_RENDERER` — documentado em `.env.example` e default de código `html`.
+
+O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado: no smoke autorizado, a API aceitou as mensagens e o retry fez zero chamadas de rede, mas a inspeção visual mostrou cada item duplicado no chat de teste. Rich só é reativado depois de a duplicação ser reproduzida, explicada e corrigida.
+
+A investigação técnica e comercial está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis em [`REPORT.md`](docs/telegram-research/REPORT.md) e o registo da implementação/smoke em [`IMPLEMENTATION_STATUS.md`](docs/telegram-research/IMPLEMENTATION_STATUS.md). Fora do âmbito continuam callbacks, long polling, Mini App, fornecedores/margens automáticos, Legal Gate executável e monitorização jurídica.
 
 ## Decisão Telegram
 
-A Bot API oficial confirma:
+A Bot API oficial confirma Rich Messages e `sendRichMessage` (10.1) e blocos estruturados, tabelas, `details` e media (10.2). A recomendação de planeamento previa `sendRichMessage` como renderer principal com HTML como fallback; o smoke autorizado inverteu a decisão operacional:
 
-- Bot API 10.1, 11/06/2026: Rich Messages e `sendRichMessage`;
-- Bot API 10.2, 14/07/2026: blocos estruturados, tabelas, `details`, media, collages e slideshows;
-- `editMessageText` aceita `rich_message`;
-- `reply_markup`, botões URL e callbacks são suportados.
-
-A recomendação aprovada para planeamento é:
-
-1. `sendRichMessage` como renderer principal;
-2. `sendMessage` com HTML como fallback integral;
-3. resumo semanal separado;
-4. uma mensagem por produto;
-5. long polling persistente no host atual;
+1. `sendMessage` com HTML é o renderer operacional e default (código e `.env.example`): `TELEGRAM_RENDERER=html`;
+2. `sendRichMessage` está implementado (`pipeline/notifications/render_rich.py`) mas desativado — a API aceitou as mensagens e o retry fez zero chamadas de rede, mas cada item apareceu duplicado no chat de teste; a causa exata (endpoint/cliente Rich) continua por investigar;
+3. resumo separado seguido de uma mensagem por produto nos modos agregados;
+4. `keyword` envia uma única mensagem de produto;
+5. long polling e decisões (callbacks) ficam fora do âmbito desta release;
 6. apenas um `Telegram user_id` autorizado;
 7. Mini App adiada.
 
-O outbound pode continuar a usar `requests`. O runtime inbound deve ser decidido num spike entre `python-telegram-bot` e uma implementação mínima, sem reescrever o protocolo de entrega atual.
+O outbound continua a usar `requests`. O runtime inbound deve ser decidido num spike entre `python-telegram-bot` e uma implementação mínima, sem reescrever o protocolo de entrega atual.
 
 ## Decisões do operador
 
@@ -73,27 +70,27 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 - `docs/telegram-research/06-legal-gate-and-monitoring.md` — gate progressivo UE/PT.
 - `docs/telegram-research/07-implementation-plan-and-tests.md` — fases, esforço e testes.
 - `docs/telegram-research/REPORT.md` — índice dos 22 entregáveis.
+- `docs/telegram-research/IMPLEMENTATION_STATUS.md` — registo da implementação, smoke Rich/HTML e ativação/rollback.
 
 ## Próxima sessão
 
-Não começar pela Mini App nem pela automação de fornecedores. A ordem recomendada é:
+Não começar pela Mini App, por callbacks/long polling nem pela automação de fornecedores — o núcleo multi-mensagem HTML já está entregue. A ordem recomendada é:
 
-1. executar a Fase 0 do plano: fixtures de contrato, chat de teste e spike do runtime inbound;
-2. implementar modelo/renderers Rich e HTML com TDD;
-3. generalizar write-ahead de chunks para itens de mensagem;
-4. só depois introduzir long polling e decisões;
-5. fornecedores/margem e Legal Gate entram em releases separados.
-
-Estimativa sem Mini App: 18–31 dias-agente; núcleo Telegram Rich/multi-mensagem: 5–8 dias-agente.
+1. reproduzir e explicar a duplicação visual Rich num chat de teste antes de qualquer reativação (Rich permanece desativado);
+2. confirmar a assinatura real de erro Rich que deve disparar fallback — o classificador atual falha fechado quando não reconhece a descrição;
+3. identity store canónico de produtos (o hash de keyword não sobrevive a renomeações) — fora desta release;
+4. só depois introduzir long polling e decisões, num spike entre `python-telegram-bot` e uma implementação mínima;
+5. fornecedores/margem e Legal Gate executável entram em releases separados.
 
 ## Garantias existentes a preservar
 
 - `run_id` determinístico e zero repetição de fontes pagas em reentrega;
-- write-ahead antes da chamada Telegram;
-- timeout/5xx/resposta ilegível mantém estado ambíguo e bloqueia reenvio;
-- tokens e URLs sensíveis fora de logs e estado;
-- batch tecnicamente incompleto não é entregue;
-- fallback stdout completo;
+- estado de entrega v2 por item (`schema_version=2`) com write-ahead antes de cada chamada Telegram;
+- timeout/5xx/JSON ilegível/resposta malformada mantém o item ambíguo e bloqueia reenvio (fail-closed);
+- item `sent` nunca é reenviado; v1 `success` é no-op histórico;
+- tokens, chat ID, URL Bot API e descrição Telegram raw fora de logs, estado e report;
+- batch tecnicamente incompleto não é entregue ao Telegram (digest deferred no stdout);
+- digest plain text integral como audit text no estado v2;
 - scoring permanece advisory.
 
 ## Riscos anteriores ainda pendentes
@@ -104,28 +101,23 @@ Estimativa sem Mini App: 18–31 dias-agente; núcleo Telegram Rich/multi-mensag
 - CSV malformado pode levantar `UnicodeDecodeError`;
 - valores gigantes/não finitos não têm guarda total em todos os caches;
 - `_is_inactive` pode ignorar `is_active: false` em casos específicos;
-- `state_ambiguous` Telegram continua sem resolver operacional automático;
+- Rich foi aceite pela API mas duplicou visualmente cada item no smoke; investigar o endpoint/cliente antes de ativar;
+- a assinatura real de erro Rich que deve disparar fallback continua por confirmar (classificador fail-closed);
+- batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência;
+- itens com entrega ambígua exigem reconciliação manual antes de qualquer reenvio;
 - token Telegram anteriormente exposto continua a precisar de rotação pelo operador.
 
 ## Verificação desta sessão
 
-Não foi executada a suite de produção porque só foram alterados documentos. Foi validado:
+Baseline completo da release: **680 testes verdes** (`680 passed`), `compileall` sem erros e `git diff --check` limpo. Todos os testes mockam rede; o único tráfego real foi o smoke autorizado no chat de teste, com Rich e HTML separados por state ID e sem ler credenciais para output.
 
-- `product-schema.example.json` como JSON;
-- os quatro payloads JSON de `03b-telegram-payloads.md`;
-- presença exata das 22 secções no `REPORT.md`;
-- links internos dos documentos;
-- ausência de alterações fora de documentação.
-
-Antes de qualquer implementação:
+Antes de qualquer alteração futura:
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
 .venv/bin/python -m compileall -q run.py pipeline
 git diff --check
 ```
-
-O último baseline anterior continua registado com 561 testes verdes.
 
 ## Suggested skills
 
