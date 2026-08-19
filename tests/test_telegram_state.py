@@ -190,8 +190,10 @@ def test_tampered_state_fails_closed(monkeypatch, tmp_path, mutate):
 
 
 def test_corrupt_state_makes_caller_print_stdout_fallback(monkeypatch, tmp_path, capsys):
-    """The run-level fallback prints the digest when delivery reports corrupt."""
+    """The run-level delivery prints the full digest exactly once before the
+    network call; a fail-closed corrupt state never adds a second copy."""
     import run as run_module
+    from pipeline.notifications import KIND_PRODUCT, NotificationBatch, NotificationItem
 
     state_dir = str(tmp_path)
     state_path = os.path.join(state_dir, "run9.json")
@@ -199,8 +201,20 @@ def test_corrupt_state_makes_caller_print_stdout_fallback(monkeypatch, tmp_path,
         f.write('{"hash": "different"}')
     monkeypatch.setattr(run_module, "_digests_dir", lambda: state_dir)
 
-    report = run_module._deliver_digest("digest completo", "run9", send=True)
-    assert report["status"] == "state_corrupt"
+    item = NotificationItem(
+        kind=KIND_PRODUCT, title="digest completo", product="run9",
+        run_id="run9", batch_id="b", order=0,
+        audit_text="digest completo",
+    )
+    batch = NotificationBatch(
+        run_id="run9", mode="keyword", batch_id="b", items=(item,),
+        audit_text="digest completo",
+    )
+    report = run_module.deliver_notification_batch(batch, send=True)
+
+    # A legacy v1 state (no schema_version) fails closed via the explicit
+    # v1->v2 cutover; the digest was still printed exactly once before the call.
+    assert report["status"] == "state_legacy_migration"
     assert report["delivered"] is False
     assert capsys.readouterr().out == "digest completo\n"
 

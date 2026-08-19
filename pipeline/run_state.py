@@ -63,7 +63,13 @@ def file_sha256(path: str) -> str | None:
 
 
 def _atomic_write(path: str, payload: str, *, as_text: bool) -> None:
-    """Write payload to path atomically (same dir, fsync, os.replace)."""
+    """Atomically replace ``path`` and durably journal its directory entry.
+
+    Fsyncing only the temporary file does not guarantee that the subsequent
+    rename survives a power loss.  The parent directory is therefore fsynced
+    after ``os.replace``; a failure propagates so delivery fails closed rather
+    than treating a write-ahead marker as durable when it may not be.
+    """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".part")
@@ -73,6 +79,11 @@ def _atomic_write(path: str, payload: str, *, as_text: bool) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.replace(tmp_path, path)
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(tmp_path)

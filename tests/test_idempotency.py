@@ -132,17 +132,24 @@ def test_run_without_digest_then_digest_delivers_without_rerun(monkeypatch, tmp_
     assert calls["apify"] == 2
 
     delivered = []
-    monkeypatch.setattr(
-        run.telegram, "deliver",
-        lambda text, state_id=None, state_dir=None, on_chunk_sent=None: delivered.append((text, state_id))
-        or {"delivered": True, "status": "success", "chunks_total": 1, "chunks_sent": 1, "errors": []},
-    )
+
+    def deliver_batch(batch, state_id=None, state_dir=None, renderer=None, on_item_sent=None):
+        delivered.append((batch, state_id, state_dir))
+        return {"delivered": True, "status": "success", "schema_version": 2,
+                "items_total": len(batch.items), "items_sent": len(batch.items),
+                "errors": [], "renderer": None, "fallback_used": False}
+
+    monkeypatch.setattr(run.telegram, "deliver_batch", deliver_batch)
     results = run._run_sunday(send=True)
     assert calls["apify"] == 2  # research NOT rerun for delivery
     assert len(delivered) == 1
-    digest_text, state_id = delivered[0]
-    assert "DOMINGO" in digest_text
+    batch, state_id, state_dir = delivered[0]
+    assert "DOMINGO" in batch.audit_text
     assert state_id == run._compute_run_id("sunday", ["mochila", "bolsa"], None)
+    assert state_dir == run._digests_dir()
+    # The rebuilt batch is byte-identical to the persisted digest.
+    manifest = run._run_store().load(state_id)
+    assert batch.audit_text == manifest["digest"]["text"]
     # A later --digest call on the same completed run never re-sends.
     run._run_sunday(send=True)
     assert len(delivered) == 1

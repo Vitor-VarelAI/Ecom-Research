@@ -46,6 +46,25 @@ def test_atomic_write_text(tmp_path):
     assert open(path, encoding="utf-8").read() == "linha um\nlinha dois\n"
 
 
+def test_atomic_write_fsyncs_file_and_parent_directory(monkeypatch, tmp_path):
+    real_fsync = run_state.os.fsync
+    fsynced_modes = []
+
+    def record_fsync(fd):
+        fsynced_modes.append(os.fstat(fd).st_mode)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(run_state.os, "fsync", record_fsync)
+    run_state.atomic_write_text(os.path.join(str(tmp_path), "durable.txt"), "ok")
+
+    assert len(fsynced_modes) == 2
+    assert os.path.isfile(os.path.join(str(tmp_path), "durable.txt"))
+    # The first fsync is the temporary file; the second is the parent dir.
+    import stat
+    assert stat.S_ISREG(fsynced_modes[0])
+    assert stat.S_ISDIR(fsynced_modes[1])
+
+
 def test_file_sha256_missing_returns_none(tmp_path):
     assert run_state.file_sha256(os.path.join(str(tmp_path), "absent.csv")) is None
 

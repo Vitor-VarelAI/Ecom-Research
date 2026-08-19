@@ -126,8 +126,10 @@ def test_run_keyword_filters_irrelevant_related_queries_end_to_end(monkeypatch, 
     assert "camisola portugal preta" in content
     assert "camisolas de algodão" in content
 
-    # Digest uses the filtered suggestions.
-    digest = run._digest_text([result], "TESTE", run_date=date.today())
+    # Digest uses the filtered suggestions (built via the notification builder,
+    # the single source of the plain digest).
+    batch = run.build_batch(mode="all", run_id="test", results=[result], title="TESTE", run_date=date.today())
+    digest = batch.audit_text
     assert "volta a portugal 2026" not in digest
     assert "camisola portugal preta" in digest
 

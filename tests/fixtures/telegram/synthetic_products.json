@@ -1,0 +1,178 @@
+{
+  "summary": {
+    "title": "RESEARCH SEMANAL",
+    "subtitle": "16 de agosto de 2026",
+    "sections": [
+      {
+        "heading": "Resumo",
+        "as_table": true,
+        "fields": [
+          {"label": "Estado", "value": "Total", "is_header": true},
+          {"label": "AVANÇAR advisory", "value": "2"},
+          {"label": "OBSERVAR advisory", "value": "1"},
+          {"label": "DESCARTAR advisory", "value": "0"},
+          {"label": "AVANÇAR PARA PESQUISA", "value": "2"},
+          {"label": "TRIAGEM IP ANTES DE PUBLICIDADE", "value": "1"},
+          {"label": "APTOS PARA VENDA TESTE", "value": "0"}
+        ]
+      },
+      {
+        "heading": "ALTERAÇÕES LEGAIS",
+        "as_details": true,
+        "fields": [
+          {"label": "Âmbito", "value": "União Europeia / Portugal"},
+          {"label": "Comparação semanal", "value": "PESQUISA NECESSÁRIA"}
+        ]
+      }
+    ],
+    "footer_fields": [
+      {"label": "Relatório completo", "value": null, "meaning": "missing"},
+      {"label": "Última atualização dos dados", "value": "16/08/2026"}
+    ],
+    "footer": ["#research_2026_08_16 #portugal #dropshipping"]
+  },
+  "products": [
+    {
+      "keyword": "mochila personalizada",
+      "score": 87,
+      "label": "AVANÇAR",
+      "proof": "Maternelle Perú · 4 variantes · coorte global",
+      "sections": [
+        {
+          "heading": "Evidência global",
+          "fields": [
+            {"value": "Maternelle Perú · 4 variantes · coorte global"},
+            {"label": "Link", "value": null, "meaning": "missing"}
+          ]
+        },
+        {
+          "heading": "Comercial",
+          "as_table": true,
+          "fields": [
+            {"label": "Dropshipping", "value": null, "meaning": "supplier_missing"},
+            {"label": "PT / GB / US", "value": null, "meaning": "unvalidated"},
+            {"label": "Margem", "value": null, "meaning": "unvalidated"}
+          ]
+        },
+        {
+          "heading": "Legal Gate — UE/Portugal",
+          "fields": [
+            {"label": "Estado", "value": null, "meaning": "documentation_missing"},
+            {"label": "GPSR", "value": null, "meaning": "documentation_missing"},
+            {"label": "Safety Gate", "value": null, "meaning": "research_needed"}
+          ]
+        },
+        {
+          "heading": "Ver detalhes",
+          "as_details": true,
+          "fields": [
+            {"label": "Sugestões", "value": null, "meaning": "missing"},
+            {"label": "Dados técnicos", "value": null, "meaning": "unvalidated"},
+            {"label": "Fornecedor", "value": null, "meaning": "research_needed"}
+          ]
+        }
+      ],
+      "footer_fields": [
+        {"label": "Próxima fase", "value": "AVANÇAR PARA PESQUISA DE FORNECEDOR"},
+        {"label": "Venda teste", "value": null, "meaning": "pending_documentation"},
+        {"label": "Última atualização dos dados", "value": "16/08/2026"}
+      ],
+      "footer": ["#mochila_personalizada #avancar #pesquisa_fornecedor"]
+    },
+    {
+      "keyword": "camisola Portugal",
+      "score": 53,
+      "label": "OBSERVAR",
+      "proof": "WolfSports.pt · 2 variantes · coorte global",
+      "sections": [
+        {
+          "heading": "Evidência global",
+          "fields": [
+            {"value": "WolfSports.pt · 2 variantes · coorte global"},
+            {"label": "Link", "value": null, "meaning": "missing"}
+          ]
+        },
+        {
+          "heading": "Comercial",
+          "as_table": true,
+          "fields": [
+            {"label": "Dropshipping", "value": null, "meaning": "supplier_missing"},
+            {"label": "PT / GB / US", "value": null, "meaning": "unvalidated"},
+            {"label": "Margem", "value": null, "meaning": "unvalidated"}
+          ]
+        },
+        {
+          "heading": "Legal Gate — UE/Portugal",
+          "fields": [
+            {"label": "Estado", "value": null, "meaning": "documentation_missing"},
+            {"label": "GPSR", "value": null, "meaning": "documentation_missing"},
+            {"label": "Propriedade intelectual", "value": null, "meaning": "unvalidated"}
+          ]
+        },
+        {
+          "heading": "Ver detalhes",
+          "as_details": true,
+          "fields": [
+            {"label": "Sugestões", "value": null, "meaning": "missing"},
+            {"label": "Marcas/licenças", "value": null, "meaning": "research_needed"},
+            {"label": "Documentação em falta", "value": null, "meaning": "documentation_missing"}
+          ]
+        }
+      ],
+      "footer_fields": [
+        {"label": "Próxima fase", "value": "VALIDAR PROPRIEDADE INTELECTUAL ANTES DE PUBLICIDADE"},
+        {"label": "Pesquisa jurídica", "value": "PERMITIDA"},
+        {"label": "Venda teste", "value": "BLOQUEADA ATÉ À TRIAGEM"},
+        {"label": "Última atualização dos dados", "value": "16/08/2026"}
+      ],
+      "footer": ["#camisola_portugal #observar #validar_ip"]
+    },
+    {
+      "keyword": "velas aromáticas",
+      "score": 76,
+      "label": "AVANÇAR",
+      "proof": "Bioaroma Business · 1 variante · coorte global",
+      "sections": [
+        {
+          "heading": "Evidência global",
+          "fields": [
+            {"value": "Bioaroma Business · 1 variante · coorte global"},
+            {"label": "Link", "value": null, "meaning": "missing"}
+          ]
+        },
+        {
+          "heading": "Comercial",
+          "as_table": true,
+          "fields": [
+            {"label": "Dropshipping", "value": null, "meaning": "supplier_missing"},
+            {"label": "PT / GB / US", "value": null, "meaning": "unvalidated"},
+            {"label": "Margem", "value": null, "meaning": "unvalidated"}
+          ]
+        },
+        {
+          "heading": "Legal Gate — UE/Portugal",
+          "fields": [
+            {"label": "Estado", "value": null, "meaning": "documentation_missing"},
+            {"label": "GPSR", "value": null, "meaning": "documentation_missing"},
+            {"label": "Fragrância/CLP", "value": null, "meaning": "unvalidated"}
+          ]
+        },
+        {
+          "heading": "Ver detalhes",
+          "as_details": true,
+          "fields": [
+            {"label": "Composição da cera", "value": null, "meaning": "unvalidated"},
+            {"label": "Avisos e instruções", "value": null, "meaning": "documentation_missing"},
+            {"label": "Fornecedor", "value": null, "meaning": "research_needed"}
+          ]
+        }
+      ],
+      "footer_fields": [
+        {"label": "Próxima fase", "value": "AVANÇAR PARA PESQUISA DE FORNECEDOR"},
+        {"label": "Venda teste", "value": null, "meaning": "pending_documentation"},
+        {"label": "Última atualização dos dados", "value": "16/08/2026"}
+      ],
+      "footer": ["#velas_aromaticas #avancar #pesquisa_fornecedor"]
+    }
+  ]
+}

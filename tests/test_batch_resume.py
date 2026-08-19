@@ -52,9 +52,17 @@ def _install_stack(monkeypatch, tmp_path, boom_attempts_before_success=1):
 def _install_telegram(monkeypatch):
     delivered = []
     monkeypatch.setattr(
-        run.telegram, "deliver",
-        lambda text, state_id=None, state_dir=None, on_chunk_sent=None: delivered.append((text, state_id))
-        or {"delivered": True, "status": "success", "chunks_total": 1, "chunks_sent": 1, "errors": []},
+        run.telegram,
+        "deliver_batch",
+        lambda batch, state_id, state_dir: delivered.append((batch, state_id, state_dir))
+        or {
+            "delivered": True,
+            "status": "success",
+            "schema_version": 2,
+            "items_total": len(batch.items),
+            "items_sent": len(batch.items),
+            "errors": [],
+        },
     )
     return delivered
 
@@ -123,10 +131,11 @@ def test_partial_run_retries_only_failed_keyword_and_delivers_once(monkeypatch, 
 
     # Exactly one final digest after the failed keyword succeeded.
     assert len(delivered) == 1
-    digest_text, state_id = delivered[0]
+    batch, state_id, state_dir = delivered[0]
     assert state_id == run_id
-    assert "RESUMO DO DIA" in digest_text
-    assert "boom" in digest_text and "ok" in digest_text
+    assert state_dir == run._digests_dir()
+    assert "RESUMO DO DIA" in batch.audit_text
+    assert "boom" in batch.audit_text and "ok" in batch.audit_text
 
     manifest = store.load(run_id)
     assert manifest["state"] == "completed"

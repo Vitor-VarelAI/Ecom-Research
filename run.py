@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import unicodedata
+from dataclasses import replace
 from datetime import date, timedelta
 from typing import Any
 
@@ -26,6 +27,7 @@ from pipeline import provenance, quota, run_state
 from pipeline.adapters import apify_ads, keyword_csv, landing_price, serp_seo, trends
 from pipeline.adapters.url_sanitize import sanitize_ads_data
 from pipeline.delivery import telegram
+from pipeline.notifications import NotificationBatch, build_batch, notification_snapshot
 from pipeline.output import pack
 from pipeline.scoring import score
 from pipeline.suggestions import extract_keyword_suggestions, filter_relevant_related_queries
@@ -101,7 +103,7 @@ def _begin_manifest(run_id: str, mode: str, keywords: list[str], csv_path: str |
         "digest": {
             "text": "",
             "hash": None,
-            "delivery": {"status": "pending", "chunks_total": 0, "chunks_sent": 0, "errors": []},
+            "delivery": {"status": "pending", "schema_version": 2, "items_total": 0, "items_sent": 0, "errors": []},
         },
         "artifacts": {"md": [], "json": []},
     }
@@ -110,7 +112,12 @@ def _begin_manifest(run_id: str, mode: str, keywords: list[str], csv_path: str |
 def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
     keep = ("keyword", "md_path", "score_result", "preserved", "error", "status", "changes",
             "advertiser_deltas", "ad_cohort", "suggested_keywords")
-    return {key: result.get(key) for key in keep}
+    compact = {key: result.get(key) for key in keep}
+    # Minimal credential-free, URL-free notification snapshot so a completed
+    # run can rebuild its exact batch for a later --digest without rerunning
+    # any source (see pipeline.notifications.builder.notification_snapshot).
+    compact["notification_snapshot"] = notification_snapshot(result)
+    return compact
 
 
 def _finish_manifest(
@@ -148,23 +155,62 @@ def _manifest_completed(manifest: dict[str, Any] | None) -> bool:
     return bool(manifest and manifest.get("state") == "completed")
 
 
-def _deliver_digest(text: str, run_id: str, send: bool) -> dict[str, Any]:
-    """Deliver the digest with persisted state; stdout is the fallback."""
+def _noop_delivery(status: str, items_total: int) -> dict[str, Any]:
+    """v2-shaped report for runs that never call the network."""
+    return {
+        "status": status,
+        "schema_version": 2,
+        "items_total": items_total,
+        "items_sent": 0,
+        "errors": [],
+    }
+
+
+def deliver_notification_batch(batch: NotificationBatch, *, send: bool) -> dict[str, Any]:
+    """Print the full digest exactly once, then call the network only when
+    ``send`` is true.  Delivery failures never print a second copy: the
+    stdout trail, the v2 delivery state and the manifest share the same
+    audit text (``batch.audit_text``)."""
+    print(batch.audit_text)
     if not send:
-        print(text)
-        return {"status": "skipped", "chunks_total": 0, "chunks_sent": 0, "errors": []}
-    report = telegram.deliver(text, state_id=run_id, state_dir=_digests_dir())
-    if not report["delivered"]:
-        print(text)
-    return report
+        return _noop_delivery("skipped", len(batch.items))
+    return telegram.deliver_batch(batch, state_id=batch.run_id, state_dir=_digests_dir())
+
+
+def _rebuild_batch(manifest: dict[str, Any]) -> NotificationBatch:
+    """Reconstruct the exact deterministic batch from persisted compact
+    results (safe notification snapshots) — zero source calls.  The batch
+    audit text is forced to the persisted digest so historical manifests
+    without a snapshot still degrade safely to the original trail."""
+    logical_date = manifest.get("logical_date") or date.today().isoformat()
+    try:
+        run_date = date.fromisoformat(logical_date)
+    except ValueError:
+        run_date = date.today()
+    batch = build_batch(
+        mode=manifest["mode"],
+        run_id=manifest["run_id"],
+        results=list(manifest.get("results") or []),
+        run_date=run_date,
+    )
+    digest = (manifest.get("digest") or {}).get("text", "")
+    if digest:
+        batch = replace(batch, audit_text=digest)
+    return batch
 
 
 def _reuse_run(manifest: dict[str, Any], send: bool) -> list[dict[str, Any]]:
-    """Reuse a completed run: persisted digest/artifacts, zero adapter calls."""
+    """Reuse a completed run: persisted digest/artifacts, zero adapter calls.
+
+    If ``send`` is true and the persisted delivery is not already successful,
+    the exact deterministic batch is rebuilt from the persisted sanitized
+    result data (no paid sources) and delivered; a successful delivery is
+    never re-sent and no message call happens."""
     digest = (manifest.get("digest") or {}).get("text", "")
     delivery = (manifest.get("digest") or {}).get("delivery") or {}
     if send and delivery.get("status") != "success":
-        report = _deliver_digest(digest, manifest["run_id"], send=True)
+        batch = _rebuild_batch(manifest)
+        report = deliver_notification_batch(batch, send=True)
         manifest["digest"]["delivery"] = report
         _run_store().save(manifest["run_id"], manifest)
     elif not send:
@@ -334,11 +380,6 @@ def _run_metadata(mode: str, run_id: str, source_states: dict[str, Any]) -> dict
         "scoring_version": score.SCORING_VERSION,
         "scoring_config": score.scoring_config_snapshot(),
     }
-
-
-def send_digest(text: str) -> bool:
-    """Delegate delivery; the delivery adapter handles stdout fallback."""
-    return telegram.send(text)
 
 
 def _load_keywords() -> list[str]:
@@ -598,32 +639,11 @@ def run_keyword(
     return result
 
 
-def _digest_text(results: list[dict[str, Any]], title: str | None = None, run_date: date | None = None) -> str:
-    if run_date is None:
-        run_date = date.today()
-    lines = [title] if title else []
-    for result in results:
-        if result.get("error") and result.get("preserved"):
-            lines.append(f"{result.get('keyword', '?')} — fonte falhou; pack anterior preservado ({result['error']})")
-            continue
-        keyword = result.get("keyword", "?")
-        score_result = result.get("score_result", {"score": 0, "label": "DADOS INSUFICIENTES"})
-        lines.append(pack.generate_digest_line(
-            keyword, score_result, result.get("ads_data", {}),
-            trends_data=result.get("trends_data", {}), run_date=run_date,
-        ))
-        suggestions = result.get("suggested_keywords", [])[:3]
-        if suggestions:
-            lines.append("Sugestões (aprovação manual): " + ", ".join(item["keyword"] for item in suggestions))
-    return "\n".join(lines)
-
-
 def _run_batch(
     mode: str,
     keywords: list[str],
     csv_path: str | None,
     send: bool,
-    title: str,
 ) -> list[dict[str, Any]]:
     """Shared Sunday/--all batch loop with per-keyword checkpoints.
 
@@ -677,15 +697,16 @@ def _run_batch(
             by_keyword = {r["keyword"]: r for r in results}
             results = [by_keyword[kw] for kw in keywords if kw in by_keyword]
 
-            digest = _digest_text(results, title, run_date=date.today())
+            batch = build_batch(mode=mode, run_id=run_id, results=results, run_date=date.today())
+            digest = batch.audit_text
             if any(_is_technical_fatal(r) for r in results):
                 # Deferred: never Telegram-deliver a technical-partial digest.
-                delivery = {"status": "deferred", "chunks_total": 0, "chunks_sent": 0, "errors": []}
+                delivery = _noop_delivery("deferred", len(batch.items))
                 print(digest)
                 store.save(run_id, _finish_manifest(manifest, results, digest, delivery,
                                                     state="completed_with_errors", compact=False))
             else:
-                delivery = _deliver_digest(digest, run_id, send=send)
+                delivery = deliver_notification_batch(batch, send=send)
                 store.save(run_id, _finish_manifest(manifest, results, digest, delivery))
         except BaseException:
             store.save(run_id, {**manifest, "state": "failed"})
@@ -697,28 +718,7 @@ def _run_sunday(csv_path: str | None = None, send: bool = True) -> list[dict[str
     keywords = _consume_keywords()
     if not keywords:
         return []
-    return _run_batch("sunday", keywords, csv_path, send, f"DOMINGO — {date.today().isoformat()}")
-
-
-def _build_wednesday_digest(results: list[dict[str, Any]], date_str: str) -> str:
-    lines = [f"PULSE QUARTA — {date_str}"]
-    for result in results:
-        if result.get("preserved"):
-            lines.append(f"{result['keyword']} — Apify falhou; pack anterior preservado")
-        else:
-            line = f"{result['keyword']}: {', '.join(result.get('changes', []))}"
-            cohort = result.get("ad_cohort")
-            if cohort:
-                retention = cohort.get("ad_retention_pct")
-                retention_text = f"{retention:.1f}%" if retention is not None else "sem baseline"
-                line += f" | retenção ads {retention_text}"
-                signals = cohort.get("signals", [])
-                if signals:
-                    line += " | Sinais: " + ", ".join(signals)
-            if result.get("advertiser_deltas"):
-                line += " | " + ", ".join(result["advertiser_deltas"][:2])
-            lines.append(line)
-    return "\n".join(lines)
+    return _run_batch("sunday", keywords, csv_path, send)
 
 
 def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
@@ -792,8 +792,9 @@ def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
                     **_run_metadata("wednesday", run_id, _source_states("wednesday", result, previous)),
                 )
                 results.append(result)
-            digest = _build_wednesday_digest(results, date.today().isoformat())
-            delivery = _deliver_digest(digest, run_id, send=send)
+            batch = build_batch(mode="wednesday", run_id=run_id, results=results, run_date=date.today())
+            digest = batch.audit_text
+            delivery = deliver_notification_batch(batch, send=send)
             store.save(run_id, _finish_manifest(manifest, results, digest, delivery))
         except Exception:
             store.save(run_id, {**manifest, "state": "failed"})
@@ -867,8 +868,9 @@ def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
                     **_run_metadata("monthly", run_id, _source_states("monthly", result, previous)),
                 )
                 results.append(result)
-            digest = _digest_text(results, f"RE-SCORE MENSAL — {date.today().isoformat()}", run_date=date.today())
-            delivery = _deliver_digest(digest, run_id, send=send)
+            batch = build_batch(mode="monthly", run_id=run_id, results=results, run_date=date.today())
+            digest = batch.audit_text
+            delivery = deliver_notification_batch(batch, send=send)
             store.save(run_id, _finish_manifest(manifest, results, digest, delivery))
         except Exception:
             store.save(run_id, {**manifest, "state": "failed"})
@@ -973,7 +975,7 @@ def _run_all(keywords: list[str], csv_path: str | None = None, send: bool = True
     """Full run over all active keywords, with per-keyword exception isolation."""
     if not keywords:
         return []
-    return _run_batch("all", keywords, csv_path, send, f"RESUMO DO DIA — {date.today().isoformat()}")
+    return _run_batch("all", keywords, csv_path, send)
 
 
 def _auto_dispatch(send: bool = True, csv_path: str | None = None) -> list[dict[str, Any]]:
@@ -1094,18 +1096,13 @@ def _run_keyword_action(keyword: str, csv_path: str | None = None, send: bool = 
         try:
             result = run_keyword(keyword, csv_path=csv_path, mode="keyword", run_id=run_id)
             score_result = result["score_result"]
-            digest_line = pack.generate_digest_line(
-                keyword, score_result, result.get("ads_data", {}),
-                trends_data=result.get("trends_data", {}), run_date=date.today(),
-            )
+            batch = build_batch(mode="keyword", run_id=run_id, results=[result], run_date=date.today())
+            digest = batch.audit_text
             print(f"\n=== {keyword} ===")
             print(f"Score: {score_result.get('score', 0)}/100 ({score_result.get('label', 'DADOS INSUFICIENTES')})")
             print(f"Pack: {result['md_path']}")
-            if send:
-                delivery = _deliver_digest(digest_line, run_id, send=True)
-            else:
-                delivery = {"status": "skipped", "chunks_total": 0, "chunks_sent": 0, "errors": []}
-            store.save(run_id, _finish_manifest(manifest, [result], digest_line, delivery))
+            delivery = deliver_notification_batch(batch, send=send)
+            store.save(run_id, _finish_manifest(manifest, [result], digest, delivery))
         except Exception:
             store.save(run_id, {**manifest, "state": "failed"})
             raise
