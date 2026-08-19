@@ -23,7 +23,7 @@ def _temp_paths(tmp_path):
     packs_dir.mkdir(exist_ok=True)
     data_dir.mkdir(exist_ok=True)
 
-    def paths(keyword, run_date=None, mode=None, run_id=None):
+    def paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
         run_date = run_date or date.today()
         slug = pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"

@@ -8,6 +8,7 @@ from datetime import date as real_date
 import pytest
 
 import run
+from tests.fixtures.products_helpers import write_registry
 
 ADS = {
     "source": "Facebook Ad Library via Apify",
@@ -37,14 +38,15 @@ def _write_previous(tmp_path, keyword="mochila", label="OBSERVAR"):
         "suggested_keywords": [{"keyword": "mochila escolar", "score": 10, "status": "proposed"}],
     }
     (data_dir / f"{real_date.today().isoformat()}--mochila.json").write_text(json.dumps(previous), encoding="utf-8")
+    write_registry(tmp_path, ["mochila", "bolsa"])
 
 
 def _install_full_stack(monkeypatch, tmp_path):
-    """Point run at tmp_path, stub every adapter and count paid calls."""
+    """Point run at tmp_path, stub every adapter, count paid calls and
+    return the resolved registry products for direct run.py calls."""
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
-    config_dir = tmp_path / "config"
-    config_dir.mkdir(exist_ok=True)
-    (config_dir / "keywords.txt").write_text("mochila\nbolsa\n", encoding="utf-8")
+    registry = write_registry(tmp_path, ["mochila", "bolsa"])
+    products = list(registry.products)
     calls = {"apify": 0, "trends": 0, "seo": 0, "landing": 0, "related": 0}
     monkeypatch.setattr(run.apify_ads, "fetch", lambda kw: calls.__setitem__("apify", calls["apify"] + 1) or dict(ADS))
     monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: calls.__setitem__("trends", calls["trends"] + 1) or dict(TRENDS))
@@ -54,7 +56,7 @@ def _install_full_stack(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     generated = []
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
-    return calls, generated
+    return calls, generated, products
 
 
 def _sunday():
@@ -62,7 +64,7 @@ def _sunday():
 
 
 def test_completed_sunday_rerun_makes_no_adapter_calls(monkeypatch, tmp_path):
-    calls, _ = _install_full_stack(monkeypatch, tmp_path)
+    calls, _, _ = _install_full_stack(monkeypatch, tmp_path)
     first = run._run_sunday(send=False)
     assert calls["apify"] == 2 and calls["trends"] == 2
     second = run._run_sunday(send=False)
@@ -71,18 +73,18 @@ def test_completed_sunday_rerun_makes_no_adapter_calls(monkeypatch, tmp_path):
 
 
 def test_completed_all_rerun_makes_no_adapter_calls(monkeypatch, tmp_path):
-    calls, _ = _install_full_stack(monkeypatch, tmp_path)
-    run._run_all(["mochila", "bolsa"], send=False)
+    calls, _, products = _install_full_stack(monkeypatch, tmp_path)
+    run._run_all(products, send=False)
     assert calls["apify"] == 2
-    run._run_all(["mochila", "bolsa"], send=False)
+    run._run_all(products, send=False)
     assert calls["apify"] == 2
 
 
 def test_completed_keyword_rerun_makes_no_adapter_calls(monkeypatch, tmp_path, capsys):
-    calls, _ = _install_full_stack(monkeypatch, tmp_path)
-    run._run_keyword_action("mochila", send=False)
+    calls, _, products = _install_full_stack(monkeypatch, tmp_path)
+    run._run_keyword_action(products[0], send=False)
     assert calls["apify"] == 1
-    run._run_keyword_action("mochila", send=False)
+    run._run_keyword_action(products[0], send=False)
     assert calls["apify"] == 1
 
 
@@ -111,7 +113,7 @@ def test_completed_monthly_rerun_makes_no_trends_calls(monkeypatch, tmp_path):
 
 
 def test_direct_and_auto_sunday_share_run_identity(monkeypatch, tmp_path):
-    calls, _ = _install_full_stack(monkeypatch, tmp_path)
+    calls, _, products = _install_full_stack(monkeypatch, tmp_path)
 
     class FakeDate:
         @classmethod
@@ -127,7 +129,7 @@ def test_direct_and_auto_sunday_share_run_identity(monkeypatch, tmp_path):
 
 
 def test_run_without_digest_then_digest_delivers_without_rerun(monkeypatch, tmp_path):
-    calls, _ = _install_full_stack(monkeypatch, tmp_path)
+    calls, _, products = _install_full_stack(monkeypatch, tmp_path)
     run._run_sunday(send=False)
     assert calls["apify"] == 2
 
@@ -145,7 +147,7 @@ def test_run_without_digest_then_digest_delivers_without_rerun(monkeypatch, tmp_
     assert len(delivered) == 1
     batch, state_id, state_dir = delivered[0]
     assert "DOMINGO" in batch.audit_text
-    assert state_id == run._compute_run_id("sunday", ["mochila", "bolsa"], None)
+    assert state_id == run._compute_run_id("sunday", products, None)
     assert state_dir == run._digests_dir()
     # The rebuilt batch is byte-identical to the persisted digest.
     manifest = run._run_store().load(state_id)
@@ -156,15 +158,15 @@ def test_run_without_digest_then_digest_delivers_without_rerun(monkeypatch, tmp_
 
 
 def test_interrupted_running_state_is_finalized_without_reduplication(monkeypatch, tmp_path):
-    calls, _ = _install_full_stack(monkeypatch, tmp_path)
+    calls, _, products = _install_full_stack(monkeypatch, tmp_path)
     first = run._run_sunday(send=False)
     assert calls["apify"] == 2 and calls["trends"] == 2
     # Simulate a crash between the last checkpoint and the finalize: rewrite
-    # the completed manifest back to "running".  All keywords already reached
+    # the completed manifest back to "running".  All products already reached
     # a terminal outcome, so the rerun finalizes the run WITHOUT re-executing
     # any paid source.
     store = run._run_store()
-    run_id = run._compute_run_id("sunday", ["mochila", "bolsa"], None)
+    run_id = run._compute_run_id("sunday", products, None)
     manifest = store.load(run_id)
     manifest["state"] = "running"
     store.save(run_id, manifest)
@@ -176,6 +178,8 @@ def test_interrupted_running_state_is_finalized_without_reduplication(monkeypatc
 
 def test_mid_batch_crash_resumes_only_missing_keywords(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    registry = write_registry(tmp_path, ["mochila", "bolsa"])
+    products = list(registry.products)
     calls = []
     monkeypatch.setattr(run.apify_ads, "fetch", lambda kw: calls.append(kw) or dict(ADS))
     monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: dict(TRENDS))
@@ -186,24 +190,25 @@ def test_mid_batch_crash_resumes_only_missing_keywords(monkeypatch, tmp_path):
 
     attempts = {"n": 0}
 
-    def safe(keyword, csv_path=None, mode=None, run_id=None):
+    def safe(product, csv_path=None, mode=None, run_id=None):
         attempts["n"] += 1
         if attempts["n"] == 2:
             raise KeyboardInterrupt()  # crash between the first checkpoint and the second
-        return {"keyword": keyword, "status": "ok", "score_result": {"score": 50, "label": "OBSERVAR"}, "md_path": "pack.md"}
+        return {"product_id": product.product_id, "keyword": product.research_keyword,
+                "status": "ok", "score_result": {"score": 50, "label": "OBSERVAR"}, "md_path": "pack.md"}
 
     monkeypatch.setattr(run, "_safe_run_keyword", safe)
     with pytest.raises(KeyboardInterrupt):
-        run._run_all(["mochila", "bolsa"], send=False)
+        run._run_all(products, send=False)
 
     store = run._run_store()
-    run_id = run._compute_run_id("all", ["mochila", "bolsa"], None)
+    run_id = run._compute_run_id("all", products, None)
     manifest = store.load(run_id)
     assert manifest["state"] == "failed"
     assert [r["keyword"] for r in manifest["results"]] == ["mochila"]  # checkpoint preserved
 
-    # Resume: only the missing keyword is retried; the checkpointed one is reused.
-    results = run._run_all(["mochila", "bolsa"], send=False)
+    # Resume: only the missing product is retried; the checkpointed one is reused.
+    results = run._run_all(products, send=False)
     assert [r["keyword"] for r in results] == ["mochila", "bolsa"]
-    assert attempts["n"] == 3  # one retried keyword, not a full rerun
+    assert attempts["n"] == 3  # one retried product, not a full rerun
     assert store.load(run_id)["state"] == "completed"

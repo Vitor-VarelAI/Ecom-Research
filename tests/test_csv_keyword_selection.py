@@ -10,6 +10,7 @@ parse do CSV é real.
 from __future__ import annotations
 
 import run
+from tests.fixtures.products_helpers import write_registry
 
 ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 1, "ad_ids": ["a1"],
        "top_ads": [{"ad_archive_id": "a1", "advertiser": "Loja", "page_id": "p1", "days_active": 30}],
@@ -50,8 +51,10 @@ def test_shared_export_serves_distinct_keywords(monkeypatch, tmp_path):
     do mesmo export — a de volume baixo não herda a de maior volume."""
     csv_path = _write_export(tmp_path)
     _install_stack(monkeypatch, tmp_path)
+    registry = write_registry(tmp_path, ["mochila personalizada", "mochila viagem"])
+    products = list(registry.products)
 
-    results = run._run_all(["mochila personalizada", "mochila viagem"], csv_path=csv_path, send=False)
+    results = run._run_all(products, csv_path=csv_path, send=False)
 
     assert [r["keyword"] for r in results] == ["mochila personalizada", "mochila viagem"]
     assert results[0]["csv_data"]["volume"] == 5400
@@ -67,8 +70,10 @@ def test_missing_keyword_in_batch_errors_explicitly(monkeypatch, tmp_path):
     que nomeia a keyword — nunca as métricas de outra linha."""
     csv_path = _write_export(tmp_path)
     _install_stack(monkeypatch, tmp_path)
+    registry = write_registry(tmp_path, ["mochila personalizada", "keyword inexistente"])
+    products = list(registry.products)
 
-    results = run._run_all(["mochila personalizada", "keyword inexistente"], csv_path=csv_path, send=False)
+    results = run._run_all(products, csv_path=csv_path, send=False)
 
     assert results[0]["csv_data"]["volume"] == 5400
     missing = results[1]["csv_data"]

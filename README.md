@@ -19,6 +19,8 @@ O modo full requer `APIFY_API_TOKEN` e `SERPAPI_KEY`. O repositório não conté
 - `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`: entrega opcional, sempre send-only.
 - `TELEGRAM_RENDERER=html`: renderer do outbound (default de código e documentado; Rich permanece desativado para a coorte de clientes atual).
 
+O registo canónico de produtos é `config/products.json` (`schema_version=1`): cinco produtos com `product_id` imutável (preservado do antigo hash de 12 hex da keyword), um `research_keyword` ativo por produto e aliases para keywords históricas (camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta). `config/keywords.txt` permanece intacto e já não é lido em runtime.
+
 O volume e CPC vêm de um export manual do Google Keyword Planner colocado em `data/`. O parser aceita o formato real em UTF-16 LE com BOM, tabulação e preâmbulo de título/data, além do CSV UTF-8 legado, e liga cada keyword à sua linha de produto exacta após normalização. Sem CSV, o pipeline degrada graciosamente, mas o score perde esse sinal.
 
 ## Uso
@@ -32,7 +34,7 @@ O volume e CPC vêm de um export manual do Google Keyword Planner colocado em `d
 .venv/bin/python run.py --auto --digest
 ```
 
-`--sunday` lê as keywords ativas sem as reescrever. `--auto` executa todas as ações que coincidirem com a data: no dia 1 executa primeiro o re-score mensal; depois executa domingo ou quarta-feira quando aplicável. Cada ação produz o seu próprio digest.
+`--sunday` e `--all` usam os produtos ativos de `config/products.json`; o token posicional resolve por `product_id`, nome, `research_keyword` ou alias — um token desconhecido sai com erro (exit 2) antes de qualquer chamada de fonte/rede, e um registo ausente ou inválido falha fechado. `--auto` executa todas as ações que coincidirem com a data: no dia 1 executa primeiro o re-score mensal; depois executa domingo ou quarta-feira quando aplicável. Cada ação produz o seu próprio digest.
 
 A precedência de selectores é fixa: `auto > sunday > wednesday > monthly > all > keyword`, com `--digest` ortogonal. Selectores sombreados (ex.: `--sunday --monthly`) geram avisos determinísticos no stderr, sem transformar comandos legados em erros. `--csv` com um caminho inexistente é erro fatal apenas nos modos que consomem CSV (keyword, `--all`, `--sunday`, e `--auto` quando dispara o domingo); nos restantes é ignorado com aviso.
 
@@ -42,7 +44,7 @@ A precedência de selectores é fixa: `auto > sunday > wednesday > monthly > all
 flowchart TD
     Cron["Cron · host Europe/Berlin 09:00<br/>TZ=Europe/Lisbon · 08:00 Lisboa · --auto --digest"] --> CLI["run.py<br/>configuração, argumentos e orquestração"]
     User["Execução manual"] --> CLI
-    Keywords["config/keywords.txt"] --> CLI
+    Products["config/products.json<br/>registo canónico"] --> CLI
     KeywordCSV["Google Keyword Planner CSV"] --> Full
 
     CLI --> Mode{"Modo de execução"}
@@ -99,7 +101,7 @@ flowchart TD
 
 ## Idempotência e proveniência
 
-Cada ação lógica (domingo, quarta, dia 1, `--all`, keyword) tem um `run_id` determinístico derivado de data + modo + keywords ordenadas + `SCORING_VERSION` — sem credenciais, relógio ou `--digest`. O hash do CSV participa da identidade apenas nas ações que consomem o CSV (keyword, `--all`, `--sunday` — incluindo domingo via `--auto`), para que quarta e mensal permaneçam estáveis quando ficheiros CSV não relacionados mudam. Um run concluído reutiliza o digest e os artefactos persistidos em `data/runs/` sem voltar a gastar fontes pagas. `--auto` e a invocação direta do mesmo modo partilham a mesma identidade de run. Um run feito sem `--digest` permite um `--digest` posterior sem rerun de pesquisa.
+Cada ação lógica (domingo, quarta, dia 1, `--all`, keyword) tem um `run_id` determinístico derivado de data + modo + pares ordenados `(product_id, research_keyword)` + `SCORING_VERSION` — sem credenciais, relógio ou `--digest`. Mudar a query ativa de um produto (novo `research_keyword` no mesmo `product_id`) cria um run novo; uma alteração só de nome ou de aliases não participa na identidade e o histórico mantém-se. O hash do CSV participa da identidade apenas nas ações que consomem o CSV (keyword, `--all`, `--sunday` — incluindo domingo via `--auto`), para que quarta e mensal permaneçam estáveis quando ficheiros CSV não relacionados mudam. Um run concluído reutiliza o digest e os artefactos persistidos em `data/runs/` sem voltar a gastar fontes pagas. `--auto` e a invocação direta do mesmo modo partilham a mesma identidade de run. Um run feito sem `--digest` permite um `--digest` posterior sem rerun de pesquisa.
 
 Domingo e `--all` gravam o manifesto atomicamente após cada keyword (checkpoint por keyword). Um rerun de um manifesto `running`/`failed`/`completed_with_errors` reutiliza os resultados terminais (zero chamadas pagas para keywords já bem-sucedidas) e repete apenas as keywords com falha técnica ou ausentes do checkpoint. Um run só fica `completed` quando todas as keywords atingem um desfecho intencional; uma exceção técnica (não uma falha de fonte esperada) deixa o run `completed_with_errors`. Nesse caso o digest parcial nunca vai para o Telegram — o conteúdo mudaria após o retry e o operador receberia dois digests diferentes: é impresso no stdout e persistido com `delivery.status == "deferred"`, e o digest final é entregue exatamente uma vez depois de as keywords falhadas conseguirem. Falhas de fonte esperadas (Apify offline → pack `DADOS INSUFICIENTES`; quarta/mensal preservado) continuam terminais e digestáveis. Exactly-once ao nível da fonte não é garantido entre crashes (janela entre a chamada paga e a escrita do manifesto).
 
@@ -143,7 +145,7 @@ O progresso de entrega é persistido em `data/digests/<state_id>.json` com `sche
 
 ## Saída
 
-- `packs/YYYY-MM-DD--<modo>--<kw_hash12>--<keyword>--<run_id[:12]>.md` / `data/YYYY-MM-DD--<modo>--<kw_hash12>--<keyword>--<run_id[:12]>.json`: todos os packs atuais são run-scoped — o nome inclui o modo (keyword/all/sunday/wednesday/monthly), um hash estável de 12 hex da keyword (evita colisões entre `a/b` e `a-b`) e o prefixo do `run_id` (o mesmo run repetido resolve para o mesmo caminho). Ex.: `2026-08-09--sunday--9f3a2b1c0d4e--mochila-personalizada--abc123def456`.
+- `packs/YYYY-MM-DD--<modo>--<id12>--<keyword>--<run_id[:12]>.md` / `data/YYYY-MM-DD--<modo>--<id12>--<keyword>--<run_id[:12]>.json`: todos os packs atuais são run-scoped — o nome inclui o modo (keyword/all/sunday/wednesday/monthly), um id estável de 12 hex (o `product_id` canónico quando presente, que sobrevive a renomeações da query; o hash da keyword fica apenas como fallback para chamadores legados) e o prefixo do `run_id` (o mesmo run repetido resolve para o mesmo caminho). Os packs novos carregam `product_id`/`product_name`/`research_keyword` de forma aditiva — `keyword` continua a ser a query real. Ex.: `2026-08-09--sunday--e942e8bf7f30--mochila-personalizada--abc123def456`.
 - Nomes legados `YYYY-MM-DD--<keyword>.md` / `.json` (e `--wednesday`/`--monthly`) continuam a ser lidos pelos selectors (compatibilidade read-only), mas já não são escritos.
 - `data/runs/<run_id>.json`: manifesto de cada ação lógica (idempotência, checkpoints por keyword e estado de entrega do digest).
 - `data/digests/<state_id>.json`: estado de entrega v2 por item (`schema_version=2`), com audit text e `message_id` por mensagem.
@@ -161,7 +163,7 @@ As recomendações são operacionais, não decisões automáticas: `AVANÇAR` pr
 git diff --check
 ```
 
-Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **708 testes verdes** (65 focados de entrega em `tests/test_delivery_v2.py`).
+Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **755 testes verdes** (65 focados de entrega em `tests/test_delivery_v2.py`).
 
 ## Estado live
 

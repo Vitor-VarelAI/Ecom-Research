@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "products": [
+    {
+      "product_id": "e942e8bf7f30",
+      "name": "mochila personalizada",
+      "research_keyword": "mochila personalizada",
+      "aliases": [],
+      "active": true
+    },
+    {
+      "product_id": "be385ea0e349",
+      "name": "camisola portugal",
+      "research_keyword": "camisola portugal",
+      "aliases": ["camisolas portugal", "camisola de portugal", "camisola portugal preta"],
+      "active": true
+    },
+    {
+      "product_id": "a16e2196eb4d",
+      "name": "caneca personalizada",
+      "research_keyword": "caneca personalizada",
+      "aliases": [],
+      "active": true
+    },
+    {
+      "product_id": "ef5cd634db44",
+      "name": "tapete yoga",
+      "research_keyword": "tapete yoga",
+      "aliases": [],
+      "active": true
+    },
+    {
+      "product_id": "258053734570",
+      "name": "velas aromáticas",
+      "research_keyword": "velas aromáticas",
+      "aliases": [],
+      "active": true
+    }
+  ]
+}

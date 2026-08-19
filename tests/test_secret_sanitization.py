@@ -110,6 +110,7 @@ def test_http_error_returns_sanitized_message_logs_status_only(monkeypatch, tmp_
 
 def test_technical_keyword_exception_is_sanitized(monkeypatch, caplog):
     import run as run_module
+    from tests.fixtures.products_helpers import product
 
     monkeypatch.setattr(
         run_module,
@@ -119,7 +120,7 @@ def test_technical_keyword_exception_is_sanitized(monkeypatch, caplog):
         ),
     )
 
-    result = run_module._safe_run_keyword("mochila")
+    result = run_module._safe_run_keyword(product("mochila"))
 
     assert result["error"] == "Erro técnico inesperado (RuntimeError)"
     assert "SECRET" not in json.dumps(result)
@@ -130,12 +131,12 @@ def test_technical_keyword_exception_is_sanitized(monkeypatch, caplog):
 
 def test_secret_exception_never_reaches_pack_manifest_or_digest(monkeypatch, tmp_path, capsys):
     import run as run_module
+    from tests.fixtures.products_helpers import write_registry
 
     monkeypatch.setattr(run_module, "REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("SERPAPI_KEY", "fake-key")  # other suites pop this at import
-    config_dir = tmp_path / "config"
-    config_dir.mkdir(exist_ok=True)
-    (config_dir / "keywords.txt").write_text("mochila\n", encoding="utf-8")
+    registry = write_registry(tmp_path, ["mochila"])
+    products = list(registry.products)
     ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 1, "ad_ids": ["a1"],
            "top_ads": [{"ad_archive_id": "a1", "advertiser": "Loja", "page_id": "p1", "days_active": 30}],
            "advertisers": [{"page_id": "p1", "page_name": "Loja", "active_ads": 1, "oldest_ad_days": 30}],
@@ -151,14 +152,14 @@ def test_secret_exception_never_reaches_pack_manifest_or_digest(monkeypatch, tmp
     generated = []
     monkeypatch.setattr(run_module.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
 
-    results = run_module._run_all(["mochila"], send=False)
+    results = run_module._run_all(products, send=False)
 
     # Run result, pack kwargs, stdout digest and persisted manifest: no secret.
     assert "SECRET" not in json.dumps(results)
     assert "SECRET" not in json.dumps(generated, default=str)
     assert "SECRET" not in capsys.readouterr().out
     store = run_module._run_store()
-    run_id = run_module._compute_run_id("all", ["mochila"], None)
+    run_id = run_module._compute_run_id("all", products, None)
     manifest = store.load(run_id)
     assert "SECRET" not in json.dumps(manifest)
     # The sanitized class-name message is what travels inside the result

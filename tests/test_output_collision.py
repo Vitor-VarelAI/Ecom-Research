@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 
 import run
 from pipeline.output import pack
+from tests.fixtures.products_helpers import stable_id, write_registry
 
 TRENDS = {"direction": "estável", "slope_pct": 0, "seasonal": False, "top_geos": [], "related_queries": []}
 ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 1, "ad_ids": ["a1"],
@@ -39,7 +41,7 @@ def _temp_paths(tmp_path):
     packs_dir.mkdir(exist_ok=True)
     data_dir.mkdir(exist_ok=True)
 
-    def paths(keyword, run_date=None, mode=None, run_id=None):
+    def paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
         run_date = run_date or date.today()
         slug = pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"
@@ -74,10 +76,50 @@ def test_previous_pack_reader_selects_deterministically_by_timestamp(monkeypatch
         json.dumps({**base, "generated_at": "2026-08-01T09:00:00+00:00"}), encoding="utf-8")
 
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
-    previous = run._load_previous_pack("mochila")
+    registry = write_registry(tmp_path, ["mochila"])
+    previous = run._load_previous_pack(registry.products[0], registry=registry)
     assert previous["generated_at"] == "2026-08-01T09:00:00+00:00"
-    # Both names are visible to the watchlist search.
-    assert run._find_packs_by_label(["OBSERVAR"]) == ["mochila"]
+    # Both names are visible to the watchlist search (as one product).
+    assert [p.product_id for p in run._find_packs_by_label(["OBSERVAR"], registry=registry)] == [stable_id("mochila")]
+
+
+# ── Vertical slice 2: stable product_id in run-scoped pack names/JSON ─────
+
+
+def test_run_scoped_pack_filename_and_json_carry_stable_product_id(monkeypatch, tmp_path):
+    """(c) vertical slice: the run-scoped 12-id filename segment and the JSON
+    product fields use the stable product_id; the slug and ``keyword`` stay
+    the current research query, so a query rename changes the filename while
+    the product id (and product identity) stays stable."""
+    monkeypatch.setattr(pack, "_REPO_ROOT", str(tmp_path))
+    run_date = date(2026, 8, 20)
+
+    md, js = pack._pack_paths("mochila escolar", run_date, "sunday", "run123", product_id="e942e8bf7f30")
+    assert os.path.basename(js) == "2026-08-20--sunday--e942e8bf7f30--mochila-escolar--run123.json"
+    assert os.path.basename(md) == "2026-08-20--sunday--e942e8bf7f30--mochila-escolar--run123.md"
+
+    # Same product, renamed query: new filename, same stable product id.
+    md2, js2 = pack._pack_paths("mochila personalizada", run_date, "sunday", "run456", product_id="e942e8bf7f30")
+    assert "e942e8bf7f30" in os.path.basename(js2)
+    assert js2 != js
+    # Legacy callers without product identity keep the keyword-hash segment
+    # (hash of the current query, not the seeded product id).
+    _, legacy_js = pack._pack_paths("mochila escolar", run_date, "sunday", "run123")
+    assert "8d51661271f6" in os.path.basename(legacy_js)  # sha256("mochila escolar")[:12]
+
+    pack.generate(
+        "mochila escolar", TRENDS, CSV, ADS, SCORE, run_date=run_date,
+        mode="sunday", run_id="run123",
+        product_id="e942e8bf7f30", product_name="mochila personalizada",
+        research_keyword="mochila escolar",
+    )
+    raw = json.load(open(js, encoding="utf-8"))
+    assert raw["product_id"] == "e942e8bf7f30"
+    assert raw["product_name"] == "mochila personalizada"
+    assert raw["research_keyword"] == "mochila escolar"
+    assert raw["keyword"] == "mochila escolar"  # keyword is the actual query
+    assert raw["run_id"] == "run123" and raw["mode"] == "sunday"
+    assert raw["artifact_complete"] is True
 
 
 def test_legacy_failed_pack_does_not_evict_observar_evidence(monkeypatch, tmp_path):
@@ -92,8 +134,9 @@ def test_legacy_failed_pack_does_not_evict_observar_evidence(monkeypatch, tmp_pa
                     "generated_at": "2026-07-01T08:00:00+00:00"}), encoding="utf-8")
 
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
-    assert run._find_packs_by_label(["OBSERVAR"]) == ["mochila"]
-    previous = run._load_previous_pack("mochila")
+    registry = write_registry(tmp_path, ["mochila"])
+    assert [p.product_id for p in run._find_packs_by_label(["OBSERVAR"], registry=registry)] == [stable_id("mochila")]
+    previous = run._load_previous_pack(registry.products[0], registry=registry)
     assert previous["score"]["label"] == "OBSERVAR"
 
 
@@ -138,9 +181,10 @@ def test_malformed_legacy_packs_are_ignored_by_selectors(monkeypatch, tmp_path):
          "run_id": "r1", "generated_at": stamp}), encoding="utf-8")
 
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    registry = write_registry(tmp_path, ["mochila"])
     # The malformed packs are ignored: only the valid one is selected.
-    assert run._find_packs_by_label(["OBSERVAR"]) == ["mochila"]
-    previous = run._load_previous_pack("mochila")
+    assert [p.product_id for p in run._find_packs_by_label(["OBSERVAR"], registry=registry)] == [stable_id("mochila")]
+    previous = run._load_previous_pack(registry.products[0], registry=registry)
     assert previous["score"]["label"] == "OBSERVAR"
 
 
@@ -156,5 +200,6 @@ def test_newest_real_label_follows_decision(monkeypatch, tmp_path):
                     "generated_at": "2026-09-01T08:00:00+00:00"}), encoding="utf-8")
 
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
-    assert run._find_packs_by_label(["OBSERVAR"]) == []
-    assert run._find_packs_by_label(["AVANÇAR"]) == ["mochila"]
+    registry = write_registry(tmp_path, ["mochila"])
+    assert run._find_packs_by_label(["OBSERVAR"], registry=registry) == []
+    assert [p.product_id for p in run._find_packs_by_label(["AVANÇAR"], registry=registry)] == [stable_id("mochila")]

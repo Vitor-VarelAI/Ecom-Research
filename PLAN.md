@@ -31,7 +31,7 @@ Cache de Trends, SEO e Related Queries dura 30 dias; a timeseries do Trends usa 
 
 ## Sugestões
 
-Related Queries passa primeiro por relevância fail-closed do produto e depois por `extract_keyword_suggestions`: valores numéricos e `Breakout` são normalizados, Breakout vem primeiro, números ordenam descendentemente, e removem-se vazios, origem, duplicados, URLs e interrogativas. Cada entrada persistida tem `status: proposed`. Nunca se escreve em `config/keywords.txt` nem se executa uma sugestão automaticamente; o digest agrega no máximo três por fonte.
+Related Queries passa primeiro por relevância fail-closed do produto e depois por `extract_keyword_suggestions`: valores numéricos e `Breakout` são normalizados, Breakout vem primeiro, números ordenam descendentemente, e removem-se vazios, origem, duplicados, URLs e interrogativas. Cada entrada persistida tem `status: proposed`. Nunca se escreve em `config/keywords.txt` nem se executa uma sugestão automaticamente; o digest agrega no máximo três por fonte. O ficheiro permanece intacto e já não é lido em runtime — a fonte de produtos é o registo canónico em `config/products.json`.
 
 ## Decisão e mercados
 
@@ -52,7 +52,7 @@ O outbound é determinístico e HTML multi-mensagem por omissão (`TELEGRAM_REND
 
 ## Estado atual
 
-O código é CLI puro, sem chamadas LLM e sem alteração automática de decisões do utilizador. O output é a interface para consumo humano e eventual aprovação posterior pelo ad-machine. O outbound Telegram é HTML multi-mensagem determinístico por omissão, com estado de entrega v2 por item (ver "Landing e Telegram"). O baseline validado tem **708 testes verdes**; as integrações de rede são mockadas na suite. O parser do Keyword Planner aceita UTF-16 LE com BOM, export tab-delimitado com preâmbulo de título/data e CSV UTF-8 legado, ligando a keyword à linha de produto exacta após normalização.
+O código é CLI puro, sem chamadas LLM e sem alteração automática de decisões do utilizador. O output é a interface para consumo humano e eventual aprovação posterior pelo ad-machine. O outbound Telegram é HTML multi-mensagem determinístico por omissão, com estado de entrega v2 por item (ver "Landing e Telegram"). O baseline validado tem **755 testes verdes**; as integrações de rede são mockadas na suite. O parser do Keyword Planner aceita UTF-16 LE com BOM, export tab-delimitado com preâmbulo de título/data e CSV UTF-8 legado, ligando a keyword à linha de produto exacta após normalização.
 
 O smoke live de uma keyword e uma entrega de um digest Telegram foram concluídos com sucesso; o smoke autorizado do outbound multi-mensagem no chat de teste aprovou HTML (retry com zero chamadas de rede) e bloqueou Rich por duplicação visual — diagnosticada como específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram), sem reenvio pela aplicação. O host atual usa `Europe/Berlin`; o serviço cron está ativo e habilitado (`active`/`enabled`) e existe exactamente um job. Com `TZ=Europe/Lisbon`, o job das 09:00 do host corresponde às 08:00 de Lisboa e executa `--auto --digest`:
 
@@ -62,3 +62,5 @@ TZ=Europe/Lisbon
 ```
 
 O cron verifica a data diariamente, mas só atua ao domingo, à quarta-feira e no dia 1 do mês. O token Telegram exposto deve ainda ser rotacionado pelo utilizador.
+
+O identity store canónico de produtos está completo: `config/products.json` (`schema_version=1`) é o registo operado manualmente, com cinco produtos e `product_id` imutável (preservado do antigo hash de 12 hex da keyword); `config/keywords.txt` permanece intacto e já não é lido em runtime. Um `research_keyword` ativo por produto; aliases guardam keywords históricas (camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta). A identidade de run usa pares ordenados `(product_id, research_keyword)`: mudar a query ativa cria um run novo, enquanto o `product_id` estável preserva o histórico. Packs/manifestos novos carregam `product_id`/`product_name`/`research_keyword`; packs, manifestos e digests históricos são read-only e nunca reescritos; a migração apenas lê artefactos legados. Quarta/mensal selecionam por `product_id` com fallback read-only keyword-legada→alias, mantendo a watchlist e o baseline do pack anterior num produto renomeado. Token posicional desconhecido sai com exit 2 antes de qualquer chamada de fonte/rede; registo ausente ou inválido falha fechado. A idempotência de entrega e a segurança contra duplicação não mudaram.

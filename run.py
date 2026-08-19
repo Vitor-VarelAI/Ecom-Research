@@ -29,6 +29,13 @@ from pipeline.adapters.url_sanitize import sanitize_ads_data
 from pipeline.delivery import telegram
 from pipeline.notifications import NotificationBatch, build_batch, notification_snapshot
 from pipeline.output import pack
+from pipeline.products import (
+    Product,
+    ProductNotFoundError,
+    ProductRegistry,
+    ProductRegistryError,
+    load_registry,
+)
 from pipeline.scoring import score
 from pipeline.suggestions import extract_keyword_suggestions, filter_relevant_related_queries
 
@@ -45,6 +52,19 @@ logger = logging.getLogger("run")
 
 def _data_dir() -> str:
     return os.path.join(REPO_ROOT, "data")
+
+
+def _products_path() -> str:
+    return os.path.join(REPO_ROOT, "config", "products.json")
+
+
+def _load_products() -> ProductRegistry:
+    """Load the canonical product registry (``config/products.json``), fail-closed.
+
+    The registry is the only active product source; ``config/keywords.txt``
+    is a historical bootstrap input and is never read by the runtime.
+    """
+    return load_registry(_products_path())
 
 
 def _run_store() -> run_state.RunStore:
@@ -69,10 +89,13 @@ def _csv_hash(csv_path: str | None = None) -> str | None:
 CSV_CONSUMING_MODES = frozenset({"keyword", "all", "sunday"})
 
 
-def _compute_run_id(mode: str, keywords: list[str], csv_path: str | None = None) -> str:
-    """Deterministic identity: date + mode + ordered keywords + CSV hash + scoring version.
+def _compute_run_id(mode: str, products: list[Product], csv_path: str | None = None) -> str:
+    """Deterministic identity: date + mode + ordered product descriptors + CSV hash + scoring version.
 
-    The CSV hash is included only when the action actually consumes the CSV
+    Each descriptor is the canonical ``(product_id, research_keyword)`` pair:
+    renaming a product's research query changes the identity (creating a new
+    run), while a product name-only or alias-only change does not.  The CSV
+    hash is included only when the action actually consumes the CSV
     (``keyword``, ``all`` and ``sunday`` — including Sunday dispatched via
     ``--auto``, which executes the same ``sunday`` action).  Wednesday/monthly
     identity stays stable when unrelated CSV files change.  A direct
@@ -82,19 +105,30 @@ def _compute_run_id(mode: str, keywords: list[str], csv_path: str | None = None)
     return run_state.compute_run_id(
         logical_date=date.today().isoformat(),
         mode=mode,
-        keywords=keywords,
+        products=[
+            {"product_id": product.product_id, "research_keyword": product.research_keyword}
+            for product in products
+        ],
         csv_sha256=csv_sha,
         scoring_version=score.SCORING_VERSION,
     )
 
 
-def _begin_manifest(run_id: str, mode: str, keywords: list[str], csv_path: str | None) -> dict[str, Any]:
+def _begin_manifest(run_id: str, mode: str, products: list[Product], csv_path: str | None) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "state": "running",
         "mode": mode,
         "logical_date": date.today().isoformat(),
-        "keywords": list(keywords),
+        "products": [
+            {
+                "product_id": product.product_id,
+                "name": product.name,
+                "research_keyword": product.research_keyword,
+            }
+            for product in products
+        ],
+        "keywords": [product.research_keyword for product in products],
         "csv_sha256": _csv_hash(csv_path) if mode in CSV_CONSUMING_MODES else None,
         "scoring_version": score.SCORING_VERSION,
         "created_at": run_state.utc_now_iso(),
@@ -110,7 +144,8 @@ def _begin_manifest(run_id: str, mode: str, keywords: list[str], csv_path: str |
 
 
 def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
-    keep = ("keyword", "md_path", "score_result", "preserved", "error", "status", "changes",
+    keep = ("keyword", "product_id", "product_name", "research_keyword", "md_path",
+            "score_result", "preserved", "error", "status", "changes",
             "advertiser_deltas", "ad_cohort", "suggested_keywords")
     compact = {key: result.get(key) for key in keep}
     # Minimal credential-free, URL-free notification snapshot so a completed
@@ -228,23 +263,27 @@ def _is_technical_fatal(result: dict[str, Any] | None) -> bool:
     return bool(result and result.get("status") == "technical_fatal")
 
 
-def _safe_run_keyword(keyword: str, csv_path: str | None = None, mode: str | None = None, run_id: str | None = None) -> dict[str, Any]:
-    """Per-keyword exception containment shared by --all, --sunday and --auto.
+def _safe_run_keyword(product: Product, csv_path: str | None = None, mode: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    """Per-product exception containment shared by --all, --sunday and --auto.
 
-    Technical exceptions are marked ``status="technical_fatal"`` so the batch
+    Adapters still receive only ``product.research_keyword``.  Technical
+    exceptions are marked ``status="technical_fatal"`` so the batch
     checkpoint can tell them apart from expected source failures (an Apify
     failure still produces a DADOS INSUFICIENTES pack) and retry only the
-    fatal keywords on the next invocation.
+    fatal products on the next invocation.
     """
     try:
-        result = run_keyword(keyword, csv_path=csv_path, mode=mode, run_id=run_id)
+        result = run_keyword(product, csv_path=csv_path, mode=mode, run_id=run_id)
         result["status"] = "ok"
         return result
     except Exception as exc:
         error_type = type(exc).__name__
-        logger.error("Erro fatal sanitizado em keyword=%r (tipo=%s)", keyword, error_type)
+        logger.error("Erro fatal sanitizado em product_id=%s (tipo=%s)", product.product_id, error_type)
         return {
-            "keyword": keyword,
+            "product_id": product.product_id,
+            "product_name": product.name,
+            "research_keyword": product.research_keyword,
+            "keyword": product.research_keyword,
             "error": f"Erro técnico inesperado ({error_type})",
             "status": "technical_fatal",
             "score_result": {"score": 0, "label": "DADOS INSUFICIENTES"},
@@ -382,25 +421,6 @@ def _run_metadata(mode: str, run_id: str, source_states: dict[str, Any]) -> dict
     }
 
 
-def _load_keywords() -> list[str]:
-    path = os.path.join(REPO_ROOT, "config", "keywords.txt")
-    if not os.path.exists(path):
-        logger.error("Ficheiro config/keywords.txt não encontrado")
-        return []
-    with open(path, "r", encoding="utf-8") as source:
-        return [line.strip() for line in source if line.strip() and not line.strip().startswith("#")]
-
-
-def _consume_keywords() -> list[str]:
-    """Read active keywords without adding suggestions or changing config."""
-    keywords = _load_keywords()
-    if keywords:
-        logger.info("Lidas %d keywords; config/keywords.txt permanece intacto", len(keywords))
-    else:
-        logger.warning("Zero keywords ativas em config/keywords.txt")
-    return keywords
-
-
 def _find_latest_csv() -> str | None:
     data_dir = os.path.join(REPO_ROOT, "data")
     if not os.path.isdir(data_dir):
@@ -450,7 +470,40 @@ def _pack_sort_key(data: dict[str, Any], filename: str) -> tuple[str, str, str]:
     return (date_str, stamp, filename)
 
 
-def _find_packs_by_label(labels: list[str], max_age_days: int | None = None) -> list[str]:
+def _pack_product_id(data: dict[str, Any], registry: ProductRegistry) -> str | None:
+    """Canonical product identity of a pack: the explicit ``product_id`` when
+    present, else the read-only legacy resolution of its ``keyword``.  A pack
+    whose identity cannot be established (orphaned legacy keyword, unknown
+    product_id) is ``None`` and is ignored by every selector — never crashes,
+    never evicts evidence."""
+    product_id = data.get("product_id")
+    if isinstance(product_id, str) and product_id:
+        return product_id
+    keyword = data.get("keyword", "")
+    if not keyword:
+        return None
+    try:
+        return registry.resolve(keyword).product_id
+    except ProductNotFoundError:
+        return None
+
+
+def _find_packs_by_label(
+    labels: list[str],
+    max_age_days: int | None = None,
+    registry: ProductRegistry | None = None,
+) -> list[Product]:
+    """Watchlist selection grouped by canonical product identity.
+
+    Every complete pack maps to the product_id of its canonical product
+    (``product_id`` when present, else the legacy ``keyword`` resolved through
+    the registry), so a renamed product — old keyword now an alias — keeps its
+    slot and its previous-pack continuity.  Orphan packs (legacy keyword that
+    resolves to nothing) are skipped.  All existing eviction semantics hold per
+    product: newest complete pack wins, DADOS INSUFICIENTES never evicts older
+    labeled evidence, cutoff by date, malformed packs ignored.
+    """
+    registry = registry or _load_products()
     data_dir = os.path.join(REPO_ROOT, "data")
     if not os.path.isdir(data_dir):
         return []
@@ -467,32 +520,47 @@ def _find_packs_by_label(labels: list[str], max_age_days: int | None = None) -> 
             pack_date = date.fromisoformat(data.get("date", ""))
         except (TypeError, ValueError):
             continue
-        keyword = data.get("keyword", "")
-        if not keyword or (cutoff is not None and pack_date < cutoff):
+        if not data.get("keyword", "") or (cutoff is not None and pack_date < cutoff):
             continue
+        product_id = _pack_product_id(data, registry)
+        if product_id is None:
+            continue  # orphaned: no product identity to group under
         key = _pack_sort_key(data, filename)
-        overall[keyword] = max(overall.get(keyword, (("", "", ""), "")), (key, filename))
+        overall[product_id] = max(overall.get(product_id, (("", "", ""), "")), (key, filename))
         label = data.get("score", {}).get("label", "")
         if label in labels:
-            labeled[keyword] = max(labeled.get(keyword, (("", "", ""), "")), (key, filename))
+            labeled[product_id] = max(labeled.get(product_id, (("", "", ""), "")), (key, filename))
 
-    keywords: list[str] = []
-    for keyword in sorted(labeled):
-        overall_key, overall_file = overall[keyword]
+    selected: set[str] = set()
+    for product_id in labeled:
+        overall_key, overall_file = overall[product_id]
         overall_data = _read_pack_json(os.path.join(data_dir, overall_file)) or {}
         if not _pack_is_complete(overall_data):
             continue
         overall_label = overall_data.get("score", {}).get("label", "")
         if overall_label in labels:
-            keywords.append(keyword)  # the newest pack carries a requested label
+            selected.add(product_id)  # the newest pack carries a requested label
         elif overall_label == "DADOS INSUFICIENTES":
             # A failed run must not evict real evidence: keep the older labeled pack.
-            keywords.append(keyword)
+            selected.add(product_id)
         # else: newest pack carries another real label (e.g. AVANÇAR) — follows it.
-    return keywords
+    # Registry order, never keyword sort order; unknown product_ids drop out.
+    return [product for product in registry.products if product.product_id in selected]
 
 
-def _load_previous_pack(keyword: str) -> dict[str, Any] | None:
+def _load_previous_pack(
+    product: Product,
+    registry: ProductRegistry | None = None,
+) -> dict[str, Any] | None:
+    """Newest complete non-failed pack of the product's canonical identity.
+
+    Matches by product_id: either the pack carries ``product_id`` equal to
+    ``product.product_id``, or its legacy ``keyword`` resolves through the
+    registry to that same product.  DADOS INSUFICIENTES packs are not evidence
+    for the next incremental mode.  Returns the pack JSON unchanged — legacy
+    packs are read, never rewritten.
+    """
+    registry = registry or _load_products()
     data_dir = os.path.join(REPO_ROOT, "data")
     if not os.path.isdir(data_dir):
         return None
@@ -501,7 +569,9 @@ def _load_previous_pack(keyword: str) -> dict[str, Any] | None:
         if not filename.endswith(".json") or filename.startswith("quota"):
             continue
         data = _read_pack_json(os.path.join(data_dir, filename))
-        if data is None or not _pack_is_complete(data) or data.get("keyword") != keyword:
+        if data is None or not _pack_is_complete(data):
+            continue
+        if _pack_product_id(data, registry) != product.product_id:
             continue
         if (data.get("score", {}).get("label", "")) == "DADOS INSUFICIENTES":
             continue  # failed-run packs are not evidence for the next incremental mode
@@ -547,17 +617,21 @@ def _forced_zero_score() -> dict[str, Any]:
 
 
 def run_keyword(
-    keyword: str,
+    product: Product,
     csv_path: str | None = None,
     skip_serpapi: bool = False,
     mode: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Run one full keyword pipeline with exactly one Apify invocation.
+    """Run one full product pipeline with exactly one Apify invocation.
 
+    Adapters receive only ``product.research_keyword``; the result carries
+    the canonical identity (``product_id``/``product_name``/
+    ``research_keyword``) plus ``keyword`` = the current research query.
     ``mode``/``run_id`` are additive provenance passed through to the pack.
     """
-    logger.info("=== INÍCIO: keyword=%r ===", keyword)
+    keyword = product.research_keyword
+    logger.info("=== INÍCIO: product_id=%s keyword=%r ===", product.product_id, keyword)
     ads_data = apify_ads.fetch(keyword)
     apify_failed = "error" in ads_data
     if apify_failed:
@@ -614,6 +688,9 @@ def run_keyword(
     # never mutated and never serialized.
     ads_data = sanitize_ads_data(ads_data)
     result = {
+        "product_id": product.product_id,
+        "product_name": product.name,
+        "research_keyword": keyword,
         "keyword": keyword,
         "score_result": score_result,
         "trends_data": trends_data,
@@ -634,6 +711,9 @@ def run_keyword(
         landing_price_data=landing_data,
         suggested_keywords=suggested,
         run_date=date.today(),
+        product_id=product.product_id,
+        product_name=product.name,
+        research_keyword=keyword,
         **_run_metadata(run_mode, run_id or None, _source_states(run_mode, result, None)),
     )
     return result
@@ -641,61 +721,65 @@ def run_keyword(
 
 def _run_batch(
     mode: str,
-    keywords: list[str],
+    products: list[Product],
     csv_path: str | None,
     send: bool,
 ) -> list[dict[str, Any]]:
-    """Shared Sunday/--all batch loop with per-keyword checkpoints.
+    """Shared Sunday/--all batch loop with per-product checkpoints.
 
-    The manifest is saved atomically after every keyword result, so a crash
+    The manifest is saved atomically after every product result, so a crash
     never loses the work already done.  A rerun of a ``running``/``failed``/
     ``completed_with_errors`` manifest reuses the terminal results (zero paid
-    calls for them) and retries only the technical-fatal or missing keywords.
+    calls for them) and retries only the technical-fatal or missing products;
+    resume/done maps are keyed by ``product_id``, not by keyword.
 
     A batch containing technical fatals is saved as ``completed_with_errors``
     and its digest is *not* Telegram-delivered: the content would change after
     the retry, and the operator would receive two different digests.  Instead
     the digest is printed to stdout with ``delivery.status == "deferred"`` and
     persisted in the manifest, and the final digest is delivered exactly once
-    on the first run where every keyword reaches an intentional terminal
+    on the first run where every product reaches an intentional terminal
     outcome.  Normal source errors that already produced a pack remain
-    terminal and digestable.
+    terminal and digestable.  Digest order follows the given product order
+    (registry order for --all/--sunday).
     """
-    run_id = _compute_run_id(mode, keywords, csv_path)
+    run_id = _compute_run_id(mode, products, csv_path)
     store = _run_store()
     with store.lock(run_id):
         manifest = store.load(run_id)
         if _manifest_completed(manifest):
             return _reuse_run(manifest, send=send)
 
+        product_ids = {product.product_id for product in products}
         if manifest is None:
             results: list[dict[str, Any]] = []
-            pending: list[str] = list(keywords)
+            pending: list[Product] = list(products)
         else:
             results = [
                 r for r in (manifest.get("results") or [])
-                if isinstance(r, dict) and r.get("keyword") in keywords and not _is_technical_fatal(r)
+                if isinstance(r, dict) and r.get("product_id") in product_ids
+                and not _is_technical_fatal(r)
             ]
-            done = {r.get("keyword") for r in results}
-            pending = [kw for kw in keywords if kw not in done]
+            done = {r.get("product_id") for r in results}
+            pending = [product for product in products if product.product_id not in done]
             if pending:
-                logger.info("run_state: retoma %s — %d keyword(s) reutilizadas, %d a repetir",
+                logger.info("run_state: retoma %s — %d produto(s) reutilizado(s), %d a repetir",
                             mode, len(results), len(pending))
 
-        manifest = _begin_manifest(run_id, mode, keywords, csv_path)
+        manifest = _begin_manifest(run_id, mode, products, csv_path)
         manifest["results"] = results
         store.save(run_id, manifest)
-        logger.info("=== %s: deep run de %d keywords ===", mode.upper(), len(keywords))
+        logger.info("=== %s: deep run de %d produtos ===", mode.upper(), len(products))
         try:
-            for keyword in pending:
-                result = _safe_run_keyword(keyword, csv_path=csv_path, mode=mode, run_id=run_id)
+            for product in pending:
+                result = _safe_run_keyword(product, csv_path=csv_path, mode=mode, run_id=run_id)
                 results.append(result)
                 manifest["results"] = [dict(r) for r in results]  # checkpoint
                 store.save(run_id, manifest)
 
             # Deterministic digest order even after a resume appended retries.
-            by_keyword = {r["keyword"]: r for r in results}
-            results = [by_keyword[kw] for kw in keywords if kw in by_keyword]
+            by_id = {r["product_id"]: r for r in results}
+            results = [by_id[product.product_id] for product in products if product.product_id in by_id]
 
             batch = build_batch(mode=mode, run_id=run_id, results=results, run_date=date.today())
             digest = batch.audit_text
@@ -714,31 +798,35 @@ def _run_batch(
     return results
 
 
-def _run_sunday(csv_path: str | None = None, send: bool = True) -> list[dict[str, Any]]:
-    keywords = _consume_keywords()
-    if not keywords:
+def _run_sunday(csv_path: str | None = None, send: bool = True, registry: ProductRegistry | None = None) -> list[dict[str, Any]]:
+    registry = registry or _load_products()
+    products = registry.active_products()
+    if not products:
+        logger.info("Zero produtos ativos em config/products.json")
         return []
-    return _run_batch("sunday", keywords, csv_path, send)
+    return _run_batch("sunday", list(products), csv_path, send)
 
 
-def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
-    keywords = _find_packs_by_label(["AVANÇAR", "OBSERVAR"], max_age_days=14)
-    if not keywords:
+def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -> list[dict[str, Any]]:
+    registry = registry or _load_products()
+    products = _find_packs_by_label(["AVANÇAR", "OBSERVAR"], max_age_days=14, registry=registry)
+    if not products:
         logger.info("Zero packs AVANÇAR/OBSERVAR com <14 dias. Nada a pulsar.")
         return []
-    run_id = _compute_run_id("wednesday", keywords, None)
+    run_id = _compute_run_id("wednesday", products, None)
     store = _run_store()
     with store.lock(run_id):
         manifest = store.load(run_id)
         if _manifest_completed(manifest):
             return _reuse_run(manifest, send=send)
-        manifest = _begin_manifest(run_id, "wednesday", keywords, None)
+        manifest = _begin_manifest(run_id, "wednesday", products, None)
         store.save(run_id, manifest)
-        logger.info("=== QUARTA: pulse Apify em %d keywords ===", len(keywords))
+        logger.info("=== QUARTA: pulse Apify em %d produtos ===", len(products))
         results: list[dict[str, Any]] = []
         try:
-            for keyword in keywords:
-                previous = _load_previous_pack(keyword)
+            for product in products:
+                keyword = product.research_keyword
+                previous = _load_previous_pack(product, registry=registry)
                 if not previous:
                     continue
                 previous_ads = previous.get("facebook_ads", {})
@@ -746,6 +834,9 @@ def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
                 if "error" in current_ads:
                     logger.warning("Pulse %s: %s; pack anterior preservado", keyword, current_ads["error"])
                     results.append({
+                        "product_id": product.product_id,
+                        "product_name": product.name,
+                        "research_keyword": keyword,
                         "keyword": keyword,
                         "error": current_ads["error"],
                         "ads_data": current_ads,
@@ -766,6 +857,9 @@ def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
                 score_result = previous.get("score", {})
                 suggested = previous.get("suggested_keywords", [])
                 result = {
+                    "product_id": product.product_id,
+                    "product_name": product.name,
+                    "research_keyword": keyword,
                     "keyword": keyword,
                     "score_result": score_result,
                     "ads_data": current_ads,
@@ -788,6 +882,9 @@ def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
                     landing_price_data=landing_data,
                     suggested_keywords=suggested,
                     run_date=date.today(),
+                    product_id=product.product_id,
+                    product_name=product.name,
+                    research_keyword=keyword,
                     ad_cohort=cohort,
                     **_run_metadata("wednesday", run_id, _source_states("wednesday", result, previous)),
                 )
@@ -802,24 +899,26 @@ def _run_wednesday(send: bool = True) -> list[dict[str, Any]]:
     return results
 
 
-def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
-    keywords = _find_packs_by_label(["OBSERVAR"], max_age_days=None)
-    if not keywords:
+def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> list[dict[str, Any]]:
+    registry = registry or _load_products()
+    products = _find_packs_by_label(["OBSERVAR"], max_age_days=None, registry=registry)
+    if not products:
         logger.info("Zero packs OBSERVAR na watchlist. Nada a re-score.")
         return []
-    run_id = _compute_run_id("monthly", keywords, None)
+    run_id = _compute_run_id("monthly", products, None)
     store = _run_store()
     with store.lock(run_id):
         manifest = store.load(run_id)
         if _manifest_completed(manifest):
             return _reuse_run(manifest, send=send)
-        manifest = _begin_manifest(run_id, "monthly", keywords, None)
+        manifest = _begin_manifest(run_id, "monthly", products, None)
         store.save(run_id, manifest)
-        logger.info("=== DIA 1: re-score watchlist de %d keywords ===", len(keywords))
+        logger.info("=== DIA 1: re-score watchlist de %d produtos ===", len(products))
         results: list[dict[str, Any]] = []
         try:
-            for keyword in keywords:
-                previous = _load_previous_pack(keyword)
+            for product in products:
+                keyword = product.research_keyword
+                previous = _load_previous_pack(product, registry=registry)
                 if not previous:
                     continue
                 trends_data = trends.fetch(keyword, timeseries_only=True, force_refresh=True)
@@ -836,6 +935,9 @@ def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
                     # the OBSERVAR watchlist entry alive, report in digest/run state.
                     logger.warning("Re-score %s: %s; pack anterior preservado", keyword, trends_data["error"])
                     results.append({
+                        "product_id": product.product_id,
+                        "product_name": product.name,
+                        "research_keyword": keyword,
                         "keyword": keyword,
                         "error": trends_data["error"],
                         "preserved": True,
@@ -846,6 +948,9 @@ def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
                     continue
                 score_result = score.compute(trends_data, csv_data, ads_data)
                 result = {
+                    "product_id": product.product_id,
+                    "product_name": product.name,
+                    "research_keyword": keyword,
                     "keyword": keyword,
                     "score_result": score_result,
                     "trends_data": trends_data,
@@ -865,6 +970,9 @@ def _run_monthly(send: bool = True) -> list[dict[str, Any]]:
                     landing_price_data=landing_data,
                     suggested_keywords=suggested,
                     run_date=date.today(),
+                    product_id=product.product_id,
+                    product_name=product.name,
+                    research_keyword=keyword,
                     **_run_metadata("monthly", run_id, _source_states("monthly", result, previous)),
                 )
                 results.append(result)
@@ -971,11 +1079,11 @@ def _compare_ads(previous: dict[str, Any], current: dict[str, Any]) -> tuple[lis
             deltas.append(f"{key}: {old_adv.get(key, 0)}→{new_adv.get(key, 0)} variantes")
     return changes, deltas
 
-def _run_all(keywords: list[str], csv_path: str | None = None, send: bool = True) -> list[dict[str, Any]]:
-    """Full run over all active keywords, with per-keyword exception isolation."""
-    if not keywords:
+def _run_all(products: list[Product], csv_path: str | None = None, send: bool = True) -> list[dict[str, Any]]:
+    """Full run over all active products, with per-product exception isolation."""
+    if not products:
         return []
-    return _run_batch("all", keywords, csv_path, send)
+    return _run_batch("all", products, csv_path, send)
 
 
 def _auto_dispatch(send: bool = True, csv_path: str | None = None) -> list[dict[str, Any]]:
@@ -997,9 +1105,9 @@ def _auto_dispatch(send: bool = True, csv_path: str | None = None) -> list[dict[
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ECOM-RESEARCH — pipeline determinístico de pesquisa")
-    parser.add_argument("keyword", nargs="?", help="Keyword a pesquisar")
-    parser.add_argument("--all", action="store_true", help="Pesquisar keywords de config/keywords.txt")
-    parser.add_argument("--sunday", action="store_true", help="Deep run de domingo")
+    parser.add_argument("keyword", nargs="?", help="Produto a pesquisar (product_id, nome, research_keyword ou alias)")
+    parser.add_argument("--all", action="store_true", help="Pesquisar produtos ativos de config/products.json")
+    parser.add_argument("--sunday", action="store_true", help="Deep run de domingo (produtos ativos do registry)")
     parser.add_argument("--wednesday", action="store_true", help="Pulse de quarta: um refresh Apify por keyword")
     parser.add_argument("--monthly", action="store_true", help="Re-score mensal: uma call Trends por keyword")
     parser.add_argument("--auto", action="store_true", help="Despachar dia 1, domingo ou quarta")
@@ -1077,9 +1185,10 @@ def resolve_mode(args: argparse.Namespace, today: date | None = None) -> dict[st
     return {"mode": mode, "keyword": args.keyword, "warnings": warnings, "csv_fatal": csv_fatal}
 
 
-def _run_keyword_action(keyword: str, csv_path: str | None = None, send: bool = False) -> None:
-    """Single-keyword action with the same idempotency contract as the other modes."""
-    run_id = _compute_run_id("keyword", [keyword], csv_path)
+def _run_keyword_action(product: Product, csv_path: str | None = None, send: bool = False) -> None:
+    """Single-product action with the same idempotency contract as the other modes."""
+    keyword = product.research_keyword
+    run_id = _compute_run_id("keyword", [product], csv_path)
     store = _run_store()
     with store.lock(run_id):
         manifest = store.load(run_id)
@@ -1091,10 +1200,10 @@ def _run_keyword_action(keyword: str, csv_path: str | None = None, send: bool = 
             print(f"Score: {score_result.get('score', 0)}/100 ({score_result.get('label', 'DADOS INSUFICIENTES')})")
             print(f"Pack: {result.get('md_path', 'reutilizado do run anterior')}")
             return
-        manifest = _begin_manifest(run_id, "keyword", [keyword], csv_path)
+        manifest = _begin_manifest(run_id, "keyword", [product], csv_path)
         store.save(run_id, manifest)
         try:
-            result = run_keyword(keyword, csv_path=csv_path, mode="keyword", run_id=run_id)
+            result = run_keyword(product, csv_path=csv_path, mode="keyword", run_id=run_id)
             score_result = result["score_result"]
             batch = build_batch(mode="keyword", run_id=run_id, results=[result], run_date=date.today())
             digest = batch.audit_text
@@ -1118,28 +1227,42 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(resolved["csv_fatal"])
     mode = resolved["mode"]
 
+    # Fail-closed registry validation: every mode that touches products loads
+    # config/products.json before any source/network call, so a missing or
+    # invalid registry is a hard exit-2 error, never a silent empty run.
+    registry = None
+    if mode in ("all", "sunday", "wednesday", "monthly", "keyword", "auto"):
+        try:
+            registry = _load_products()
+        except ProductRegistryError as exc:
+            parser.error(str(exc))
+
     if mode == "auto":
         _auto_dispatch(send=args.digest, csv_path=args.csv)
         return
     if mode == "sunday":
-        _run_sunday(csv_path=args.csv, send=args.digest)
+        _run_sunday(csv_path=args.csv, send=args.digest, registry=registry)
         return
     if mode == "wednesday":
-        _run_wednesday(send=args.digest)
+        _run_wednesday(send=args.digest, registry=registry)
         return
     if mode == "monthly":
-        _run_monthly(send=args.digest)
+        _run_monthly(send=args.digest, registry=registry)
         return
     if mode == "all":
-        keywords = _load_keywords()
-        if not keywords:
-            parser.error("Zero keywords em config/keywords.txt")
-        _run_all(keywords, csv_path=args.csv, send=args.digest)
+        products = registry.active_products()
+        if not products:
+            parser.error("Zero produtos ativos em config/products.json")
+        _run_all(products, csv_path=args.csv, send=args.digest)
         return
     if mode == "none":
         parser.print_help()
         return
-    _run_keyword_action(args.keyword, csv_path=args.csv, send=args.digest)
+    try:
+        product = registry.resolve(args.keyword)
+    except ProductNotFoundError as exc:
+        parser.error(str(exc))
+    _run_keyword_action(product, csv_path=args.csv, send=args.digest)
 
 
 if __name__ == "__main__":

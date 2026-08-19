@@ -77,6 +77,14 @@ def notification_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     empty snapshot and rebuilds degrade to placeholders.
     """
     snapshot: dict[str, Any] = {}
+    # Canonical product identity (safe scalars): the builder needs it to
+    # rebuild the exact batch identity from a persisted compact result
+    # without any source call.  Absent in historical results, so legacy
+    # snapshots are byte-unchanged.
+    for key in ("product_id", "product_name", "research_keyword"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            snapshot[key] = value
     ads = result.get("ads_data")
     if isinstance(ads, dict) and "error" not in ads:
         safe_ads: dict[str, Any] = {}
@@ -227,6 +235,19 @@ def _preserved_section(result: dict[str, Any]) -> NotificationSection:
     return NotificationSection(heading="Fonte", fields=tuple(fields))
 
 
+def _product_identity(result: dict[str, Any]) -> str:
+    """The canonical product id for a result item.
+
+    New runs carry ``product_id`` on every result (including preserved and
+    technical-fatal ones); that id is authoritative.  Only a historical
+    compact result without a ``product_id`` falls back to the legacy
+    keyword-hash identity (``stable_product_id(keyword)``) — a read-only
+    fallback that never rewrites anything.
+    """
+    keyword = result.get("keyword") or "?"
+    return result.get("product_id") or stable_product_id(keyword)
+
+
 def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestions: bool) -> NotificationItem:
     keyword = result.get("keyword") or "?"
     sections: list[NotificationSection] = []
@@ -267,7 +288,7 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
     return NotificationItem(
         kind=KIND_PRODUCT,
         title=keyword,
-        product=stable_product_id(keyword),
+        product=_product_identity(result),
         header_fields=_score_header(result),
         sections=tuple(sections),
         footer_fields=_footer_date(run_date),
@@ -309,7 +330,7 @@ def _wednesday_product_item(result: dict[str, Any], run_date: date) -> Notificat
     return NotificationItem(
         kind=KIND_PRODUCT,
         title=keyword,
-        product=stable_product_id(keyword),
+        product=_product_identity(result),
         header_fields=_score_header(result),
         sections=tuple(sections),
         footer_fields=_footer_date(run_date),

@@ -253,3 +253,39 @@ git diff --check: exit 0
 ```
 
 Sem alterações a schema de estado (`schema_version=2`), defaults do renderer (`TELEGRAM_RENDERER=html`), `_send_item_once`, formato de estado, transição de fallback nem `.env`/dados. O risco "assinatura real de erro Rich continua por confirmar" do registo histórico acima está resolvido por este slice; a limitação dos 4096 do HTML fica como risco aberto conhecido. A próxima prioridade é o identity store canónico de produtos (o hash de keyword não sobrevive a renomeações); depois inbound polling/decisões; depois fornecedores/margens e Legal Gate executável em releases separados.
+
+## Follow-up — identity store canónico de produtos (`config/products.json`)
+
+Data: 2026-08-19 (release de reconciliação de documentação sobre a implementação já no working tree). Sem chamadas de rede, Telegram live ou fornecedores neste slice: a verificação é local. O registo histórico acima permanece válido para o seu slice; este follow-up documenta o estado completo do identity store.
+
+### O que mudou no working tree
+
+- `config/products.json` (novo, `schema_version=1`): registo canónico operado manualmente, com cinco produtos. `product_id` imutável, preservado do antigo hash de 12 hex da keyword: `e942e8bf7f30` mochila personalizada, `be385ea0e349` camisola portugal, `a16e2196eb4d` caneca personalizada, `ef5cd634db44` tapete yoga, `258053734570` velas aromáticas. Um `research_keyword` ativo por produto; aliases guardam keywords históricas — camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta. `config/keywords.txt` permanece intacto e deixou de ser lido em runtime.
+- `pipeline/products.py` (novo): loader fail-closed — valida schema, chaves exatas, formato de `product_id`, duplicados e colisões de tokens normalizados; nunca escreve ficheiros e nunca vaza conteúdo nos erros.
+- `run.py`: o token posicional resolve por `product_id`/nome/`research_keyword`/alias no registo; token desconhecido sai com exit 2 (`unknown product token`) antes de qualquer chamada de fonte/rede; registo ausente ou inválido é erro fatal (fail-closed), nunca um run vazio silencioso. `--all`/`--sunday` usam `registry.active_products()`.
+- `pipeline/run_state.py`: `compute_run_id` passou a usar pares ordenados `(product_id, research_keyword)` em vez de keywords cruas — mudar a query ativa cria um run novo, enquanto nome/aliases sozinhos não participam na identidade; o manifesto guarda `products` e mantém `keywords` como legado.
+- `pipeline/output/pack.py`: packs novos carregam `product_id`/`product_name`/`research_keyword` (aditivo; `keyword` continua a ser a query real); o segmento de 12 hex do nome do ficheiro passou a ser o `product_id` (fallback para o hash da keyword apenas em chamadores legados).
+- `pipeline/notifications/builder.py`: identidade de item usa `product_id` quando presente, com fallback read-only para `stable_product_id(keyword)` apenas em resultados históricos.
+- Quarta/mensal: seleção da watchlist por `product_id` (pack com `product_id` explícito ou keyword legada resolvida por alias no registo) — um produto renomeado mantém a watchlist e o baseline do pack anterior; packs órfãos (keyword legada que não resolve) são ignorados sem crash; packs, manifestos e digests históricos são read-only e nunca reescritos; a migração apenas lê artefactos legados.
+- Testes: `tests/test_products.py`, `tests/test_product_watchlist_selection.py` e `tests/fixtures/products_helpers.py` (novos); adaptações nos testes de run id/CSV, idempotência, resume de batches, pack metadata, config immutability e cli resolution.
+
+### Identidade de run e histórico
+
+Mudar o `research_keyword` ativo de um produto cria um run novo (nova pesquisa); o `product_id` estável garante que o histórico (packs anteriores, baseline de quarta/mensal) sobrevive à renomeação. A entrega Telegram v2 (idempotência por item, duplicação-safe) não mudou; nenhum artefacto histórico é reescrito.
+
+### Verificação deste slice
+
+```text
+755 passed (tests/ completo)
+compileall_rc=0
+run.py --help: exit 0
+git diff --check: exit 0
+```
+
+Sem chamadas live Telegram/providers. Token posicional desconhecido confirmado com exit 2 antes de qualquer rede. Sem alterações a `.env`, dados, schema de estado nem `config/keywords.txt`.
+
+### Riscos e trabalho aberto (atualizado)
+
+- Resolvido: a identidade de produto deixou de depender do hash da keyword — o item "A identidade de produto continua baseada no hash da keyword e não sobrevive a renomeações" do registo histórico está fechado por esta release.
+- Próxima prioridade: long polling e decisões (callbacks), num spike entre `python-telegram-bot` e uma implementação mínima; depois fornecedores/margens e Legal Gate executável em releases separados.
+- Mantidos: token Telegram exposto a rotacionar pelo operador; Rich desativado para a coorte de clientes atual; limitação 4096 do HTML no fallback; itens com entrega ambígua exigem reconciliação manual.

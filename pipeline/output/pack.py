@@ -118,19 +118,24 @@ def _pack_paths(
     run_date: date | None = None,
     mode: str | None = None,
     run_id: str | None = None,
+    product_id: str | None = None,
 ) -> tuple[str, str]:
     """Resolve the deterministic paths for a pack.
 
     Legacy (no ``run_id``): ``YYYY-MM-DD--<slug>[--<mode>]`` — unchanged and
     still read by every reader.
 
-    Run-scoped (``run_id`` present): ``YYYY-MM-DD--<mode>--<kw_hash12>--
-    <slug>--<run_id[:12]>``.  The stable keyword hash keeps slug-equivalent
-    keywords (``a/b`` vs ``a-b``) collision-free, the mode separates
-    keyword/all/sunday/wednesday/monthly artifacts, and the run-id prefix
-    makes repeated same runs resolve to the same path.  Because every run
-    writes unique paths, a crash can leave at most an orphan Markdown: it
-    can never replace an older complete JSON.
+    Run-scoped (``run_id`` present): ``YYYY-MM-DD--<mode>--<id12>--
+    <slug>--<run_id[:12]>``.  The 12-id segment is the stable
+    ``product_id`` when one is supplied (the canonical identity survives
+    query renames), falling back to the keyword hash for legacy callers
+    that predate product identity.  The slug remains the current research
+    query, so renaming a query changes the filename while the product id
+    stays stable.  The mode separates keyword/all/sunday/wednesday/monthly
+    artifacts and the run-id prefix makes repeated same runs resolve to
+    the same path.  Because every run writes unique paths, a crash can
+    leave at most an orphan Markdown: it can never replace an older
+    complete JSON.
     """
     if run_date is None:
         run_date = date.today()
@@ -142,9 +147,9 @@ def _pack_paths(
     slug = _slugify(keyword)
     if run_id:
         mode_part = mode or "manual"
-        kw_hash = _keyword_hash(keyword)
+        id_part = product_id or _keyword_hash(keyword)
         rid = run_id[:12]
-        base = f"{date_str}--{mode_part}--{kw_hash}--{slug}--{rid}"
+        base = f"{date_str}--{mode_part}--{id_part}--{slug}--{rid}"
     else:
         base = f"{date_str}--{slug}"
         if mode in SCHEDULED_MODES:
@@ -516,6 +521,9 @@ def generate(
     ad_cohort: dict[str, Any] | None = None,
     mode: str | None = None,
     run_id: str | None = None,
+    product_id: str | None = None,
+    product_name: str | None = None,
+    research_keyword: str | None = None,
     source_states: dict[str, Any] | None = None,
     source_policies: dict[str, Any] | None = None,
     scoring_version: str | None = None,
@@ -530,7 +538,7 @@ def generate(
     if mode is None:
         md_path, json_path = _pack_paths(keyword, run_date)
     else:
-        md_path, json_path = _pack_paths(keyword, run_date, mode, run_id)
+        md_path, json_path = _pack_paths(keyword, run_date, mode, run_id, product_id=product_id)
     rows = _build_market_rows(trends_data, ads_data)
     breakdown = score_result.get("breakdown", {})
     now = generated_at or utc_now_iso()
@@ -596,6 +604,15 @@ Fórmula determinística. Sem LLM no score.
         "landing_price": landing_price_data,
         "suggested_keywords": suggested_keywords,
     }
+    # Canonical product identity (additive): ``keyword`` stays the actual
+    # research query; product identity survives query renames.  Only written
+    # when supplied, so legacy/no-identity packs are unchanged bytes.
+    if product_id is not None:
+        raw_pack["product_id"] = product_id
+    if product_name is not None:
+        raw_pack["product_name"] = product_name
+    if research_keyword is not None:
+        raw_pack["research_keyword"] = research_keyword
     if ad_cohort is not None:
         raw_pack["ad_cohort"] = ad_cohort
     # Additive run/provenance metadata; legacy top-level keys stay as aliases.

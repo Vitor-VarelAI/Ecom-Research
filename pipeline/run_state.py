@@ -5,10 +5,11 @@ This module is deliberately tiny and dependency-free.  It provides:
 
 * ``compute_run_id`` — a deterministic identity for one logical action.
   Inputs are the logical date, the resolved action mode, the ordered
-  keywords, the CSV content hash (when the mode consumes CSV) and the
-  scoring version.  Credentials, wall-clock timestamps and ``--digest``
-  are intentionally excluded so that a rerun of the same action reuses
-  the persisted artifacts instead of spending paid sources again.
+  product descriptors (each ``product_id`` + ``research_keyword``), the
+  CSV content hash (when the mode consumes CSV) and the scoring version.
+  Credentials, wall-clock timestamps and ``--digest`` are intentionally
+  excluded so that a rerun of the same action reuses the persisted
+  artifacts instead of spending paid sources again.
 * ``atomic_write_json`` / ``atomic_write_text`` — temp-file + fsync +
   ``os.replace`` so readers never observe a half-written file.
 * ``RunStore`` — persistence of run manifests under ``data/runs/`` with a
@@ -106,22 +107,33 @@ def compute_run_id(
     *,
     logical_date: str,
     mode: str,
-    keywords: list[str],
+    products: list[dict[str, str]],
     csv_sha256: str | None,
     scoring_version: str,
 ) -> str:
     """
     Deterministic identity for one logical action.
 
+    ``products`` is an ordered list of canonical descriptors, each
+    ``{"product_id": ..., "research_keyword": ...}`` — the structure is
+    explicit JSON, never delimiter-packed strings.  A research-query
+    rename (different ``research_keyword`` on the same ``product_id``)
+    changes the identity and creates a new run; a product name-only or
+    alias-only change does not participate and keeps the identity.
+
     The same inputs always produce the same run id; ``--digest``, clock
     timestamps and credentials never influence it.  A repeated completed
     run therefore resolves to the same manifest and is short-circuited.
     """
+    canonical_products = [
+        {"product_id": item["product_id"], "research_keyword": item["research_keyword"]}
+        for item in products
+    ]
     canonical = json.dumps(
         {
             "date": logical_date,
             "mode": mode,
-            "keywords": list(keywords),
+            "products": canonical_products,
             "csv_sha256": csv_sha256,
             "scoring_version": scoring_version,
         },
@@ -208,6 +220,19 @@ class RunStore:
             return False
         if not isinstance(data.get("keywords"), list) or not all(
             isinstance(keyword, str) and keyword for keyword in data["keywords"]
+        ):
+            return False
+        products = data.get("products")
+        if products is not None and not (
+            isinstance(products, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("product_id"), str)
+                and item["product_id"]
+                and isinstance(item.get("research_keyword"), str)
+                and item["research_keyword"]
+                for item in products
+            )
         ):
             return False
         if not isinstance(data.get("results"), list):

@@ -6,6 +6,7 @@ import json
 from datetime import date, timedelta
 
 import run
+from tests.fixtures.products_helpers import product, stable_id as run_module_stable_id, write_registry
 
 
 ADS = {
@@ -43,10 +44,12 @@ def test_apify_failure_continues_paid_sources_without_false_descartar(monkeypatc
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
-    result = run.run_keyword("mochila")
+    result = run.run_keyword(product("mochila"))
 
     assert calls == {"apify": 1, "trends": 1, "seo": 1, "landing": 0}
     assert result["score_result"]["label"] == "DADOS INSUFICIENTES"
+    assert result["keyword"] == "mochila"
+    assert result["product_id"] == product("mochila").product_id
 
 
 def test_zero_ads_skips_seo_and_landing_but_fetches_related_once(monkeypatch):
@@ -59,7 +62,7 @@ def test_zero_ads_skips_seo_and_landing_but_fetches_related_once(monkeypatch):
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
-    result = run.run_keyword("mochila")
+    result = run.run_keyword(product("mochila"))
 
     assert calls == {"apify": 1, "related": 1, "seo": 0, "landing": 0}
     assert result["score_result"]["label"] == "DESCARTAR"
@@ -77,7 +80,7 @@ def test_run_keyword_filters_irrelevant_related_queries_end_to_end(monkeypatch, 
     packs_dir.mkdir()
     data_dir.mkdir()
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
         run_date = run_date or date.today()
         slug = run.pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"
@@ -100,7 +103,7 @@ def test_run_keyword_filters_irrelevant_related_queries_end_to_end(monkeypatch, 
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 10, "max": 20}})
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
 
-    result = run.run_keyword("camisolas portugal")
+    result = run.run_keyword(product("camisolas portugal"))
 
     # Suggestions: ranking preserved within retained candidates, proposed.
     assert [s["keyword"] for s in result["suggested_keywords"]] == [
@@ -149,6 +152,7 @@ def _write_previous(tmp_path, keyword="mochila", label="OBSERVAR"):
         "suggested_keywords": [{"keyword": "mochila escolar", "score": 10, "status": "proposed"}],
     }
     (data_dir / f"{date.today().isoformat()}--mochila.json").write_text(json.dumps(previous), encoding="utf-8")
+    write_registry(tmp_path, ["mochila"])
 
 
 def test_wednesday_uses_one_apify_and_reuses_everything(monkeypatch, tmp_path):
@@ -191,6 +195,10 @@ def test_wednesday_emits_ad_cohort_to_pack_and_results(monkeypatch, tmp_path, ca
     assert cohort["advertiser_retention_pct"] == 100.0
     assert cohort["top_advertiser_share_pct"] == 100.0
     assert cohort["signals"] == ["high_churn", "concentrated_market"]
+    # (7) pulse products resolve through the registry and carry identity.
+    assert results[0]["product_id"] == run_module_stable_id("mochila")
+    assert results[0]["research_keyword"] == "mochila"
+    assert generated[0]["product_id"] == run_module_stable_id("mochila")
     digest = capsys.readouterr().out
     assert "retenção ads 0.0%" in digest
     assert "Sinais: high_churn, concentrated_market" in digest
@@ -336,7 +344,7 @@ def test_run_keyword_persists_only_sanitized_landing_urls(monkeypatch, tmp_path)
     data_dir.mkdir()
     raw_url = "https://user:pass@shop.example/produto?api_key=TOPSECRET&utm_source=fb#frag"
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
         run_date = run_date or date.today()
         slug = run.pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"
@@ -359,7 +367,7 @@ def test_run_keyword_persists_only_sanitized_landing_urls(monkeypatch, tmp_path)
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", fetch_prices)
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
 
-    result = run.run_keyword("mochila")
+    result = run.run_keyword(product("mochila"))
 
     # O fetch consumiu a URL crua exactamente como veio do Apify.
     assert consumed == [raw_url]
@@ -391,7 +399,7 @@ def test_run_keyword_failure_branch_also_sanitizes(monkeypatch, tmp_path):
     data_dir.mkdir()
     raw_url = "https://loja.example/x?token=secret#h"
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
         run_date = run_date or date.today()
         slug = run.pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"
@@ -406,7 +414,7 @@ def test_run_keyword_failure_branch_also_sanitizes(monkeypatch, tmp_path):
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"error": "x"})
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
 
-    result = run.run_keyword("mochila")
+    result = run.run_keyword(product("mochila"))
 
     blob = json.dumps(result["ads_data"])
     assert "secret" not in blob and "token=" not in blob
@@ -420,7 +428,7 @@ def test_run_keyword_keeps_public_ad_library_link_with_ad_id(monkeypatch, tmp_pa
     data_dir.mkdir()
     library_link = "https://www.facebook.com/ads/library/?id=123456789"
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None):
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
         run_date = run_date or date.today()
         slug = run.pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"
@@ -438,7 +446,7 @@ def test_run_keyword_keeps_public_ad_library_link_with_ad_id(monkeypatch, tmp_pa
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 10.0, "max": 20.0, "currency": "EUR", "sources": 1}})
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
 
-    result = run.run_keyword("mochila")
+    result = run.run_keyword(product("mochila"))
 
     ad = result["ads_data"]["top_ads"][0]
     assert ad["landing_url"] == "https://shop.example/p"      # sanitizada

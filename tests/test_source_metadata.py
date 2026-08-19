@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pipeline import provenance
 from pipeline.adapters import trends
+from tests.fixtures.products_helpers import product
 import run as run_module
 
 ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 3, "ad_ids": ["a1"],
@@ -141,7 +142,7 @@ def test_zero_ad_run_end_to_end_records_related_queries_only(monkeypatch):
     generated = []
     monkeypatch.setattr(run_module.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
 
-    result = run_module.run_keyword("mochila")
+    result = run_module.run_keyword(product("mochila"))
     states = generated[0]["source_states"]
 
     assert calls == {"apify": 1, "related": 1, "seo": 0, "landing": 0}

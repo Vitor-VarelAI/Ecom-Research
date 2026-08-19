@@ -8,6 +8,7 @@ from datetime import date as real_date
 import pytest
 
 import run
+from tests.fixtures.products_helpers import write_registry
 
 
 def _resolve(argv, today=None):
@@ -114,3 +115,82 @@ def test_main_prints_warnings_to_stderr_and_errors_on_missing_csv(monkeypatch, t
     err = capsys.readouterr().err
     assert "--monthly" in err and "ignorados" in err
     assert "CSV não encontrado" in err
+
+
+# ── Vertical slice 2: positional resolution through the product registry ──
+
+
+def _install_registry(tmp_path):
+    write_registry(tmp_path, [
+        {"keyword": "mochila personalizada"},
+        {"keyword": "velas aromáticas", "aliases": ["velas", "candles"]},
+    ])
+
+
+def test_main_resolves_positional_by_id_name_query_and_alias(monkeypatch, tmp_path):
+    """(b) vertical slice: the positional token resolves via the registry —
+    exact product_id, name, research_keyword (case/accent folded) or alias —
+    and the resolved Product reaches the action."""
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    _install_registry(tmp_path)
+    captured = []
+    monkeypatch.setattr(
+        run, "_run_keyword_action",
+        lambda product, **kwargs: captured.append((product.product_id, product.name, product.research_keyword)),
+    )
+
+    run.main(["mochila personalizada"])  # research_keyword/name
+    assert captured == [("e942e8bf7f30", "mochila personalizada", "mochila personalizada")]
+
+    captured.clear()
+    run.main(["e942e8bf7f30"])  # exact product_id
+    assert captured == [("e942e8bf7f30", "mochila personalizada", "mochila personalizada")]
+
+    captured.clear()
+    run.main(["VELAS AROMÁTICAS"])  # name/query, case+accents folded
+    assert captured == [("258053734570", "velas aromáticas", "velas aromáticas")]
+
+    for alias in ("velas", "candles"):
+        captured.clear()
+        run.main([alias])
+        assert captured == [("258053734570", "velas aromáticas", "velas aromáticas")]
+
+
+def test_main_unknown_positional_exits_2_before_any_source(monkeypatch, tmp_path, capsys):
+    """(b) vertical slice: an unknown positional token is a hard exit-2 error
+    raised before any source/network call."""
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    _install_registry(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("adapter/source called before resolution error")
+
+    monkeypatch.setattr(run.apify_ads, "fetch", boom)
+    monkeypatch.setattr(run.trends, "fetch", boom)
+    monkeypatch.setattr(run, "_run_keyword_action", boom)
+
+    with pytest.raises(SystemExit) as exc:
+        run.main(["nao existe"])
+    assert exc.value.code == 2
+    assert "unknown product token" in capsys.readouterr().err
+
+
+def test_main_missing_registry_fails_closed_exit_2(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        run.main(["--all"])
+    assert exc.value.code == 2
+    assert "cannot read product registry" in capsys.readouterr().err
+
+
+def test_main_invalid_registry_fails_closed_exit_2(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "products.json").write_text("{ not json SECRET_LEAK_XYZ }", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        run.main(["mochila"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "not valid JSON" in err
+    assert "SECRET_LEAK_XYZ" not in err  # registry errors never leak file contents

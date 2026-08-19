@@ -36,6 +36,7 @@ from pipeline.notifications import (
     visible_text,
 )
 from pipeline.output import pack
+from tests.fixtures.products_helpers import write_registry
 
 RUN_DATE = date(2026, 8, 16)
 
@@ -81,11 +82,11 @@ def _wednesday_result(keyword: str) -> dict:
 
 
 def _install_full_stack(monkeypatch, tmp_path):
-    """Point run at tmp_path, stub every adapter and count paid calls."""
+    """Point run at tmp_path, stub every adapter, count paid calls and
+    return the resolved registry products for direct run.py calls."""
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
-    config_dir = tmp_path / "config"
-    config_dir.mkdir(exist_ok=True)
-    (config_dir / "keywords.txt").write_text("mochila\nbolsa\n", encoding="utf-8")
+    registry = write_registry(tmp_path, ["mochila", "bolsa"])
+    products = list(registry.products)
     calls = {"apify": 0, "trends": 0, "seo": 0, "landing": 0, "related": 0}
     monkeypatch.setattr(run.apify_ads, "fetch", lambda kw: calls.__setitem__("apify", calls["apify"] + 1) or dict(ADS))
     monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: calls.__setitem__("trends", calls["trends"] + 1) or dict(TRENDS))
@@ -94,7 +95,7 @@ def _install_full_stack(monkeypatch, tmp_path):
     monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: calls.__setitem__("landing", calls["landing"] + 1) or {"price_range": {"min": 10, "max": 20}})
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: dict(CSV))
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
-    return calls
+    return calls, products
 
 
 def _install_deliver_batch(monkeypatch, *, fail: bool = False):
@@ -115,8 +116,41 @@ def _install_deliver_batch(monkeypatch, *, fail: bool = False):
     return delivered
 
 
-def _completed_manifest(tmp_path, keywords):
-    return run._run_store().load(run._compute_run_id("all", keywords, None))
+def _completed_manifest(tmp_path, products):
+    return run._run_store().load(run._compute_run_id("all", products, None))
+
+
+# ── Vertical slice 2: completed compact manifest rebuild keeps identity ──
+
+
+def test_completed_manifest_rebuild_preserves_product_identity(monkeypatch, tmp_path):
+    """(d) vertical slice: a completed compact manifest rebuilds the exact
+    deterministic batch with zero source calls — product/item identity keyed
+    by product_id (not keyword), byte-stable audit text, registry order."""
+    _, products = _install_full_stack(monkeypatch, tmp_path)
+    captured = []
+    monkeypatch.setattr(
+        run, "deliver_notification_batch",
+        lambda batch, send: captured.append(batch) or run._noop_delivery("skipped", len(batch.items)),
+    )
+
+    run._run_all(products, send=False)
+    manifest = _completed_manifest(tmp_path, products)
+
+    # Manifest shape: ordered product descriptors + audit keyword list.
+    assert [p["product_id"] for p in manifest["products"]] == [p.product_id for p in products]
+    assert manifest["keywords"] == [p.research_keyword for p in products]
+    # Compact results persist product identity/name/query.
+    for compact in manifest["results"]:
+        assert compact["product_id"] and compact["product_name"] and compact["research_keyword"]
+        assert compact["keyword"] == compact["research_keyword"]
+    # Digest order follows registry order.
+    assert [r["product_id"] for r in manifest["results"]] == [p.product_id for p in products]
+
+    rebuilt = run._rebuild_batch(manifest)
+    assert [item.product for item in rebuilt.items[1:]] == [p.product_id for p in products]
+    assert rebuilt.items == captured[0].items  # byte-stable rebuild
+    assert rebuilt.audit_text == manifest["digest"]["text"]  # same digest, no sources
 
 
 # ── 1) Mode shapes, stable order, stable item ids ─────────────────────────
@@ -239,16 +273,16 @@ def test_monthly_preserved_result_audit_matches_legacy_line():
 
 
 def test_run_calls_deliver_batch_with_run_id_and_digests_dir(monkeypatch, tmp_path):
-    _install_full_stack(monkeypatch, tmp_path)
+    _, products = _install_full_stack(monkeypatch, tmp_path)
     delivered = _install_deliver_batch(monkeypatch)
     legacy = []
     monkeypatch.setattr(run.telegram, "deliver", lambda *a, **k: legacy.append(a) or {"delivered": True})
 
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
 
     assert len(delivered) == 1
     call = delivered[0]
-    assert call["state_id"] == run._compute_run_id("all", ["mochila", "bolsa"], None)
+    assert call["state_id"] == run._compute_run_id("all", products, None)
     assert call["state_dir"] == run._digests_dir()
     assert call["renderer"] is None  # TELEGRAM_RENDERER selection stays inside deliver_batch
     assert legacy == []  # the production single-text deliver path is gone
@@ -257,56 +291,56 @@ def test_run_calls_deliver_batch_with_run_id_and_digests_dir(monkeypatch, tmp_pa
 def test_every_result_producing_mode_uses_deliver_batch(monkeypatch, tmp_path):
     """keyword / sunday / wednesday / monthly all route through deliver_batch
     with state_id=run_id and state_dir=_digests_dir."""
-    _install_full_stack(monkeypatch, tmp_path)
+    _, products = _install_full_stack(monkeypatch, tmp_path)
     delivered = _install_deliver_batch(monkeypatch)
 
-    run._run_keyword_action("mochila", send=True)
+    run._run_keyword_action(products[0], send=True)
     assert len(delivered) == 1
     assert delivered[0]["state_dir"] == run._digests_dir()
-    assert delivered[0]["state_id"] == run._compute_run_id("keyword", ["mochila"], None)
+    assert delivered[0]["state_id"] == run._compute_run_id("keyword", [products[0]], None)
 
     # A different run (sunday) is a fresh invocation: it delivers too, with the
     # same explicit v1->v2 state location.
     run._run_sunday(send=True)
     assert len(delivered) == 2
     assert all(call["state_dir"] == run._digests_dir() for call in delivered)
-    assert delivered[1]["state_id"] == run._compute_run_id("sunday", ["mochila", "bolsa"], None)
+    assert delivered[1]["state_id"] == run._compute_run_id("sunday", products, None)
 
 
 # ── 3) Digest printed exactly once; network only when send=True ───────────
 
 
 def test_send_false_makes_no_call_and_prints_digest_once(monkeypatch, tmp_path, capsys):
-    _install_full_stack(monkeypatch, tmp_path)
+    _, products = _install_full_stack(monkeypatch, tmp_path)
     delivered = _install_deliver_batch(monkeypatch)
 
-    run._run_all(["mochila", "bolsa"], send=False)
+    run._run_all(products, send=False)
     out = capsys.readouterr().out
     assert delivered == []
-    manifest = _completed_manifest(tmp_path, ["mochila", "bolsa"])
+    manifest = _completed_manifest(tmp_path, products)
     assert out.count(manifest["digest"]["text"]) == 1
     assert "RESUMO DO DIA" in out
 
 
 def test_send_true_prints_digest_once_and_calls_once(monkeypatch, tmp_path, capsys):
-    _install_full_stack(monkeypatch, tmp_path)
+    _, products = _install_full_stack(monkeypatch, tmp_path)
     delivered = _install_deliver_batch(monkeypatch)
 
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
     out = capsys.readouterr().out
     assert len(delivered) == 1
-    manifest = _completed_manifest(tmp_path, ["mochila", "bolsa"])
+    manifest = _completed_manifest(tmp_path, products)
     assert out.count(manifest["digest"]["text"]) == 1
 
 
 def test_delivery_failure_prints_digest_once_not_twice(monkeypatch, tmp_path, capsys):
-    _install_full_stack(monkeypatch, tmp_path)
+    _, products = _install_full_stack(monkeypatch, tmp_path)
     delivered = _install_deliver_batch(monkeypatch, fail=True)
 
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
     out = capsys.readouterr().out
     assert len(delivered) == 1
-    manifest = _completed_manifest(tmp_path, ["mochila", "bolsa"])
+    manifest = _completed_manifest(tmp_path, products)
     assert manifest["digest"]["delivery"]["status"] == "error"
     assert out.count(manifest["digest"]["text"]) == 1  # no fallback second copy
 
@@ -315,25 +349,25 @@ def test_delivery_failure_prints_digest_once_not_twice(monkeypatch, tmp_path, ca
 
 
 def test_completed_success_rerun_makes_zero_source_and_zero_message_calls(monkeypatch, tmp_path):
-    calls = _install_full_stack(monkeypatch, tmp_path)
+    calls, products = _install_full_stack(monkeypatch, tmp_path)
     delivered = _install_deliver_batch(monkeypatch)
 
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
     assert calls["apify"] == 2 and calls["trends"] == 2
     assert len(delivered) == 1
 
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
     assert calls["apify"] == 2 and calls["trends"] == 2  # zero source calls
     assert len(delivered) == 1  # zero message calls
 
 
 def test_send_false_then_send_true_reconstructs_same_batch_without_sources(monkeypatch, tmp_path):
-    calls = _install_full_stack(monkeypatch, tmp_path)
-    run._run_all(["mochila", "bolsa"], send=False)
+    calls, products = _install_full_stack(monkeypatch, tmp_path)
+    run._run_all(products, send=False)
     assert calls["apify"] == 2
 
     delivered = _install_deliver_batch(monkeypatch)
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
 
     assert calls["apify"] == 2 and calls["trends"] == 2  # zero source calls
     assert len(delivered) == 1
@@ -342,11 +376,11 @@ def test_send_false_then_send_true_reconstructs_same_batch_without_sources(monke
     assert [item.product for item in batch.items[1:]] == [
         stable_product_id("mochila"), stable_product_id("bolsa"),
     ]
-    manifest = _completed_manifest(tmp_path, ["mochila", "bolsa"])
+    manifest = _completed_manifest(tmp_path, products)
     assert batch.audit_text == manifest["digest"]["text"]  # same deterministic batch
 
     # A later send=True on the completed run never resends.
-    run._run_all(["mochila", "bolsa"], send=True)
+    run._run_all(products, send=True)
     assert len(delivered) == 1
 
 
@@ -355,23 +389,27 @@ def test_send_false_then_send_true_reconstructs_same_batch_without_sources(monke
 
 def test_technical_fatal_batch_never_calls_deliver_batch(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    registry = write_registry(tmp_path, ["ok", "boom"])
+    products = list(registry.products)
     delivered = _install_deliver_batch(monkeypatch)
 
-    def safe(keyword, csv_path=None, mode=None, run_id=None):
-        if keyword == "boom":
-            return {"keyword": keyword, "error": "explosão", "status": "technical_fatal",
+    def safe(product, csv_path=None, mode=None, run_id=None):
+        if product.research_keyword == "boom":
+            return {"product_id": product.product_id, "keyword": product.research_keyword,
+                    "error": "explosão", "status": "technical_fatal",
                     "score_result": {"score": 0, "label": "DADOS INSUFICIENTES"}}
-        return {"keyword": keyword, "status": "ok", "md_path": "pack.md",
+        return {"product_id": product.product_id, "keyword": product.research_keyword,
+                "status": "ok", "md_path": "pack.md",
                 "score_result": {"score": 50, "label": "OBSERVAR"},
                 "ads_data": dict(ADS), "trends_data": dict(TRENDS),
                 "suggested_keywords": []}
 
     monkeypatch.setattr(run, "_safe_run_keyword", safe)
-    results = run._run_all(["ok", "boom"], send=True)
+    results = run._run_all(products, send=True)
 
     assert delivered == []  # MUST NOT call deliver_batch
     assert results[1]["status"] == "technical_fatal"
-    manifest = run._run_store().load(run._compute_run_id("all", ["ok", "boom"], None))
+    manifest = run._run_store().load(run._compute_run_id("all", products, None))
     assert manifest["state"] == "completed_with_errors"
     delivery = manifest["digest"]["delivery"]
     assert delivery["status"] == "deferred"
@@ -379,6 +417,33 @@ def test_technical_fatal_batch_never_calls_deliver_batch(monkeypatch, tmp_path, 
     assert delivery["items_total"] == 3 and delivery["items_sent"] == 0
     out = capsys.readouterr().out
     assert out.count(manifest["digest"]["text"]) == 1  # printed and persisted
+
+
+# ── Vertical slice 2: builder product identity ──────────────────────────
+
+
+def test_builder_uses_result_product_id_not_keyword_hash():
+    """Product items use the canonical ``product_id`` carried by the result;
+    the keyword-hash fallback is reserved for historical results."""
+    result = _result("mochila")
+    result["product_id"] = "e942e8bf7f30"
+    batch = run.build_batch(mode="keyword", run_id="pid1", results=[result], run_date=RUN_DATE)
+    assert batch.items[0].product == "e942e8bf7f30"
+    assert batch.items[0].product != stable_product_id("mochila")
+
+
+def test_notification_snapshot_persists_product_identity():
+    snapshot = notification_snapshot({
+        "product_id": "e942e8bf7f30",
+        "product_name": "mochila personalizada",
+        "research_keyword": "mochila escolar",
+        "keyword": "mochila escolar",
+        "ads_data": {"total_ads": 3, "saturation": "alta",
+                      "advertisers": [{"page_name": "Loja", "active_ads": 2}]},
+    })
+    assert snapshot["product_id"] == "e942e8bf7f30"
+    assert snapshot["product_name"] == "mochila personalizada"
+    assert snapshot["research_keyword"] == "mochila escolar"
 
 
 # ── 6) Snapshot and manifest safety ───────────────────────────────────────
@@ -420,10 +485,10 @@ def test_notification_snapshot_drops_urls_credentials_and_raw_payloads():
 
 
 def test_completed_manifest_snapshot_and_delivery_state_are_safe(monkeypatch, tmp_path):
-    _install_full_stack(monkeypatch, tmp_path)
-    run._run_all(["mochila", "bolsa"], send=False)
+    _, products = _install_full_stack(monkeypatch, tmp_path)
+    run._run_all(products, send=False)
 
-    manifest = _completed_manifest(tmp_path, ["mochila", "bolsa"])
+    manifest = _completed_manifest(tmp_path, products)
     delivery = manifest["digest"]["delivery"]
     assert "chunks_total" not in delivery and "chunks_sent" not in delivery
     assert delivery["status"] == "skipped"

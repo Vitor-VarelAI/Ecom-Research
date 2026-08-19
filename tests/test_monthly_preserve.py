@@ -6,6 +6,7 @@ import json
 from datetime import date as real_date
 
 import run
+from tests.fixtures.products_helpers import stable_id, write_registry
 
 TRENDS = {"direction": "estável", "slope_pct": 0, "seasonal": False, "top_geos": [], "related_queries": []}
 ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 1, "ad_ids": ["a1"],
@@ -31,6 +32,13 @@ def _write_previous(tmp_path, label="OBSERVAR"):
         "suggested_keywords": [{"keyword": "mochila escolar", "score": 10, "status": "proposed"}],
     }
     (data_dir / f"{real_date.today().isoformat()}--mochila.json").write_text(json.dumps(previous), encoding="utf-8")
+    return write_registry(tmp_path, ["mochila"])
+
+
+def _product(tmp_path, keyword="mochila"):
+    """The registry Product for a keyword under the tmp root."""
+    registry = write_registry(tmp_path, [keyword])
+    return registry.products[0]
 
 
 def test_monthly_trends_failure_preserves_previous_pack(monkeypatch, tmp_path, capsys):
@@ -53,8 +61,9 @@ def test_monthly_trends_failure_preserves_previous_pack(monkeypatch, tmp_path, c
     out = capsys.readouterr().out
     assert "fonte falhou; pack anterior preservado" in out
 
-    # The OBSERVAR keyword survives in the watchlist for the next monthly run.
-    assert run._find_packs_by_label(["OBSERVAR"]) == ["mochila"]
+    # The OBSERVAR product survives in the watchlist for the next monthly run.
+    watchlist = run._find_packs_by_label(["OBSERVAR"])
+    assert [p.product_id for p in watchlist] == [stable_id("mochila")]
 
     # The failure is recorded in the run state (digest + preserved result).
     runs_dir = tmp_path / "data" / "runs"
@@ -78,3 +87,24 @@ def test_monthly_success_writes_mode_suffixed_pack(monkeypatch, tmp_path):
     assert generated and generated[0]["mode"] == "monthly"
     assert results[0]["score_result"]["label"] in {"AVANÇAR", "OBSERVAR", "DESCARTAR"}
     assert "error" not in results[0]
+    # (7) watchlist products resolve through the registry and carry identity.
+    assert results[0]["product_id"] == stable_id("mochila")
+    assert results[0]["research_keyword"] == "mochila"
+    assert generated[0]["product_id"] == stable_id("mochila")
+    assert generated[0]["research_keyword"] == "mochila"
+
+
+def test_monthly_preserved_result_carries_product_identity(monkeypatch, tmp_path):
+    """Preserved outcomes also carry canonical product identity/name/query."""
+    _write_previous(tmp_path)
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: {"error": "Trends offline"})
+    monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
+
+    results = run._run_monthly(send=False)
+
+    assert results[0]["preserved"] is True
+    assert results[0]["product_id"] == stable_id("mochila")
+    assert results[0]["product_name"] == "mochila"
+    assert results[0]["research_keyword"] == "mochila"
+    assert results[0]["keyword"] == "mochila"

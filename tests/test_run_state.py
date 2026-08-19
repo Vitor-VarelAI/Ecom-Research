@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -9,7 +10,10 @@ from pipeline import run_state
 
 
 def test_run_id_is_deterministic_and_excludes_digest_and_clock():
-    base = dict(logical_date="2026-08-02", mode="sunday", keywords=["a", "b"], csv_sha256=None, scoring_version="1.0.0")
+    base = dict(logical_date="2026-08-02", mode="sunday",
+                products=[{"product_id": "p1", "research_keyword": "a"},
+                          {"product_id": "p2", "research_keyword": "b"}],
+                csv_sha256=None, scoring_version="1.0.0")
     first = run_state.compute_run_id(**base)
     second = run_state.compute_run_id(**base)
     assert first == second
@@ -19,17 +23,50 @@ def test_run_id_is_deterministic_and_excludes_digest_and_clock():
 
 
 def test_run_id_changes_with_each_identity_input():
-    base = dict(logical_date="2026-08-02", mode="sunday", keywords=["a"], csv_sha256=None, scoring_version="1.0.0")
+    base = dict(logical_date="2026-08-02", mode="sunday",
+                products=[{"product_id": "p1", "research_keyword": "a"}],
+                csv_sha256=None, scoring_version="1.0.0")
     ids = [
         run_state.compute_run_id(**base),
         run_state.compute_run_id(**{**base, "mode": "all"}),
-        run_state.compute_run_id(**{**base, "keywords": ["b"]}),
-        run_state.compute_run_id(**{**base, "keywords": ["a", "b"]}),
+        run_state.compute_run_id(**{**base, "products": [{"product_id": "p1", "research_keyword": "b"}]}),
+        run_state.compute_run_id(**{**base, "products": [
+            {"product_id": "p1", "research_keyword": "a"},
+            {"product_id": "p2", "research_keyword": "b"},
+        ]}),
         run_state.compute_run_id(**{**base, "logical_date": "2026-08-09"}),
         run_state.compute_run_id(**{**base, "csv_sha256": "abc"}),
         run_state.compute_run_id(**{**base, "scoring_version": "2.0.0"}),
     ]
     assert len(set(ids)) == len(ids)
+
+
+def test_run_id_uses_explicit_product_descriptors_not_delimited_strings():
+    base = dict(logical_date="2026-08-02", mode="sunday", csv_sha256=None, scoring_version="1.0.0")
+    # Query rename on the same product id changes the identity.
+    renamed = run_state.compute_run_id(**{
+        **base, "products": [{"product_id": "p1", "research_keyword": "mochila escolar"}],
+    })
+    original = run_state.compute_run_id(**{
+        **base, "products": [{"product_id": "p1", "research_keyword": "mochila personalizada"}],
+    })
+    assert renamed != original
+    # The canonical payload is explicit JSON: two descriptors, not one packed string.
+    canonical = json.dumps(
+        {
+            "date": "2026-08-02",
+            "mode": "sunday",
+            "products": [{"product_id": "p1", "research_keyword": "a"},
+                          {"product_id": "p2", "research_keyword": "b"}],
+            "csv_sha256": None,
+            "scoring_version": "1.0.0",
+        },
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    assert run_state.compute_run_id(**{
+        **base, "products": [{"product_id": "p1", "research_keyword": "a"},
+                              {"product_id": "p2", "research_keyword": "b"}],
+    }) == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def test_atomic_write_json_leaves_no_partial_files(tmp_path):
