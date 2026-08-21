@@ -53,7 +53,13 @@ from typing import Any
 
 # Version of the scoring formula.  Bump only when the formula changes; it is
 # part of the deterministic run identity and of every pack's provenance.
-SCORING_VERSION = "1.0.0"
+#
+# 2.0.0 — the input cohort changed, not the formula: the ads data feeding
+# the ad_longevity/saturation components now carries matched-only
+# projections (see pipeline.matching.product_ads), so the same formula
+# operates over deliberately different evidence.  The calculation below
+# stays byte-for-byte unchanged.
+SCORING_VERSION = "2.0.0"
 
 # Immutable metadata snapshots of the formula.  Exported for provenance and
 # run metadata; the calculation below remains byte-for-byte unchanged.

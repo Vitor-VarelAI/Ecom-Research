@@ -38,3 +38,7 @@ O contrato é partilhado por execução completa, pulse semanal, re-score mensal
 ## Ação recomendada
 
 Implementar numa worktree isolada, por TDD e commits pequenos. Normalizar todos os anúncios ativos antes do matching; classificar todos os candidatos canónicos; manter `top_ads` como projeção exclusiva dos `matched`; sanitizar `candidates` e `top_ads` na mesma mudança; impedir re-score de packs legados; verificar a suite completa em cada checkpoint relevante.
+
+## Estado
+
+Este documento é a análise de impacto original (pré-entrega). A implementação está completa na worktree `feature/ad-matching-evidence` (ainda não merged); o contrato atual e as decisões resolvidas estão registados em `docs/ad-matching/IMPLEMENTATION_PLAN.md` (secção "Decisões resolvidas"). SQLite, Datasette e revisão manual ficam para a entrega seguinte.

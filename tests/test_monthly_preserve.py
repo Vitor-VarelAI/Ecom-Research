@@ -6,13 +6,10 @@ import json
 from datetime import date as real_date
 
 import run
+from tests.fixtures.ads_helpers import classified_ads_data
 from tests.fixtures.products_helpers import stable_id, write_registry
 
 TRENDS = {"direction": "estável", "slope_pct": 0, "seasonal": False, "top_geos": [], "related_queries": []}
-ADS = {"source": "Facebook Ad Library via Apify", "total_ads": 1, "ad_ids": ["a1"],
-       "top_ads": [{"ad_archive_id": "a1", "advertiser": "Loja", "page_id": "p1", "days_active": 30}],
-       "advertisers": [{"page_id": "p1", "page_name": "Loja", "active_ads": 1, "oldest_ad_days": 30}],
-       "saturation": "baixa"}
 CSV = {"volume": 1000, "cpc": 1, "related_keywords": []}
 SEO = {"organic_results": [], "ads_count": 0, "paa_questions": [], "seo_opportunity": "alta"}
 
@@ -26,7 +23,7 @@ def _write_previous(tmp_path, label="OBSERVAR"):
         "score": {"score": 50, "label": label, "breakdown": {}},
         "trends": TRENDS,
         "keyword_planner": CSV,
-        "facebook_ads": ADS,
+        "facebook_ads": classified_ads_data(),
         "seo": SEO,
         "landing_price": {"price_range": {"min": 10, "max": 20}},
         "suggested_keywords": [{"keyword": "mochila escolar", "score": 10, "status": "proposed"}],

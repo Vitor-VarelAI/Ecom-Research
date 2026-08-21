@@ -169,6 +169,9 @@ def _full_item_audit(result: dict[str, Any], run_date: date, *, with_suggestions
 def _wednesday_item_audit(result: dict[str, Any]) -> str:
     """Exact per-result digest contribution of the legacy pulse digest."""
     if result.get("preserved"):
+        error = result.get("error", "")
+        if error:
+            return f"{result.get('keyword', '?')} — pack anterior preservado ({error})"
         return f"{result.get('keyword', '?')} — Apify falhou; pack anterior preservado"
     keyword = result.get("keyword", "?")
     line = f"{keyword}: {', '.join(result.get('changes', []))}"

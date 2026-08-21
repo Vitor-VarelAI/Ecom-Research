@@ -6,6 +6,7 @@ import json
 from datetime import date, timedelta
 
 import run
+from tests.fixtures.ads_helpers import classified_ads_data
 from tests.fixtures.products_helpers import product, stable_id as run_module_stable_id, write_registry
 
 
@@ -146,7 +147,7 @@ def _write_previous(tmp_path, keyword="mochila", label="OBSERVAR"):
         "score": {"score": 50, "label": label, "breakdown": {}},
         "trends": TRENDS,
         "keyword_planner": CSV,
-        "facebook_ads": ADS,
+        "facebook_ads": classified_ads_data(),
         "seo": SEO,
         "landing_price": {"price_range": {"min": 10, "max": 20}},
         "suggested_keywords": [{"keyword": "mochila escolar", "score": 10, "status": "proposed"}],
@@ -332,127 +333,209 @@ def test_monthly_has_one_forced_trends_call_and_no_apify_or_landing(monkeypatch,
     assert results[0]["score_result"]["label"] in {"OBSERVAR", "AVANÇAR", "DESCARTAR"}
 
 
-# ── Landing URL privacy end-to-end ─────────────────────────────────────────
+# ── Política zero-match (total_ads = matched) e classificação no run ───────
 
 
-def test_run_keyword_persists_only_sanitized_landing_urls(monkeypatch, tmp_path):
-    """A URL crua de landing (com userinfo/query/fragment) só pode ser usada
-    no fetch real.  O result, o pack JSON e o checkpoint/manifesto guardam
-    sempre a forma sanitizada (scheme + host + porta segura + path)."""
-    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
-    packs_dir.mkdir()
-    data_dir.mkdir()
-    raw_url = "https://user:pass@shop.example/produto?api_key=TOPSECRET&utm_source=fb#frag"
+def _adapter_result(keyword, *, matched=0, needs_review=0, rejected=0):
+    """A new-format adapter result (unclassified canonical candidates +
+    counts).  run_keyword classifies it with the real matcher."""
+    candidates = []
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
-        run_date = run_date or date.today()
-        slug = run.pack._slugify(keyword)
-        base = f"{run_date.isoformat()}--{slug}"
-        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+    def mk(ad_id, commercial, geo, weak, copy="Mochila premium", days_active=30):
+        return {
+            "ad_archive_id": ad_id,
+            "advertiser": "Loja",
+            "page_id": "p1",
+            "days_active": days_active,
+            "reported_active_time": f"{days_active} days",
+            "link": f"https://www.facebook.com/ads/library/?id={ad_id}",
+            "landing_url": f"https://shop.example/{ad_id}",
+            "copy": copy,
+            "publisher_platforms": ["facebook"],
+            "countries": ["PT"],
+            "match_evidence": {"commercial": commercial, "geo": geo, "weak": weak},
+        }
 
-    consumed = []
+    for i in range(matched):
+        candidates.append(mk(
+            f"m{i}",
+            "mochilas personalizadas premium",
+            "mochilas personalizadas",
+            "mochila personalizada premium envio rapido",
+            copy="Mochila personalizada premium",
+        ))
+    for i in range(needs_review):
+        candidates.append(mk(
+            f"r{i}",
+            "mochilas escolares com divisoes",
+            "mochilas escolares",
+            "mochila personalizada escolar com bolso",
+            copy="Mochila escolar com divisões",
+        ))
+    for i in range(rejected):
+        candidates.append(mk(
+            f"x{i}",
+            "concentrador de oxigenio portatil",
+            "concentrador de oxigenio",
+            "concentrador portatil com mochila incluida",
+            copy="Concentrador com mochila incluída",
+        ))
+    total = len(candidates)
+    return {
+        "source": "Facebook Ad Library via Apify",
+        "query": keyword,
+        "evidence_scope": "global",
+        "query_country": "ALL",
+        "sample_limit": 100,
+        "sample_capped": False,
+        "raw_ads_count": total,
+        "filtered_out_count": 0,
+        "filtered_inactive_count": 0,
+        "filtered_irrelevant_count": 0,
+        "candidate_count": total,
+        "duplicates_removed": 0,
+        "relevance_policy": "gate1",
+        "matching_schema_version": 1,
+        "candidates": candidates,
+    }
 
-    def fetch_prices(ads_data):
-        # A função de preços consome a URL crua (é o fetch real).
-        consumed.append(ads_data["top_ads"][0]["landing_url"])
-        return {"price_range": {"min": 10.0, "max": 20.0, "currency": "EUR", "sources": 1}}
 
-    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
-    monkeypatch.setattr(
-        run.apify_ads, "fetch",
-        lambda keyword: {**ADS, "top_ads": [{**ADS["top_ads"][0], "landing_url": raw_url}]},
-    )
-    monkeypatch.setattr(run.trends, "fetch", lambda keyword: TRENDS)
-    monkeypatch.setattr(run.serp_seo, "fetch", lambda keyword: SEO)
-    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", fetch_prices)
+def _install_zero_match_stack(monkeypatch, ads_result):
+    calls = {"apify": 0, "trends": 0, "related": 0, "seo": 0, "landing": 0}
+    monkeypatch.setattr(run.apify_ads, "fetch",
+                        lambda kw: calls.__setitem__("apify", calls["apify"] + 1) or ads_result)
+    monkeypatch.setattr(run.trends, "fetch",
+                        lambda kw: calls.__setitem__("trends", calls["trends"] + 1) or TRENDS)
+    monkeypatch.setattr(run.trends, "fetch_related",
+                        lambda kw: calls.__setitem__("related", calls["related"] + 1) or {"related_queries": []})
+    monkeypatch.setattr(run.serp_seo, "fetch", lambda kw: calls.__setitem__("seo", calls["seo"] + 1) or SEO)
+    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads",
+                        lambda data: calls.__setitem__("landing", calls["landing"] + 1))
     monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
-
-    result = run.run_keyword(product("mochila"))
-
-    # O fetch consumiu a URL crua exactamente como veio do Apify.
-    assert consumed == [raw_url]
-    # O result já carrega a URL sanitizada.
-    persisted = result["ads_data"]["top_ads"][0]["landing_url"]
-    assert persisted == "https://shop.example/produto"
-    assert "TOPSECRET" not in persisted and "user:pass" not in persisted
-
-    # Pack JSON serializado: nunca a URL crua, sempre a sanitizada.
-    json_path = result["md_path"].replace("/packs/", "/data/").replace(".md", ".json")
-    raw_pack = open(json_path, encoding="utf-8").read()
-    assert "https://shop.example/produto" in raw_pack
-    assert "TOPSECRET" not in raw_pack
-    assert "user:pass" not in raw_pack
-    assert "api_key=TOPSECRET" not in raw_pack
-    assert "utm_source=fb" not in raw_pack
-    assert "#frag" not in raw_pack
-
-    # Pack Markdown também.
-    md_content = open(result["md_path"], encoding="utf-8").read()
-    assert "TOPSECRET" not in md_content
-    assert "user:pass" not in md_content
+    monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
+    return calls
 
 
-def test_run_keyword_failure_branch_also_sanitizes(monkeypatch, tmp_path):
-    """Mesmo com landing a falhar, o ads_data serializado no result nunca\n    carrega a URL crua (branch zero-ads/apify-error incluídos)."""
-    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
-    packs_dir.mkdir()
-    data_dir.mkdir()
-    raw_url = "https://loja.example/x?token=secret#h"
+def test_run_keyword_classifies_candidates_and_total_ads_is_matched(monkeypatch):
+    """A result com candidatos é classificado pelo matcher no run: total_ads é
+    a contagem matched, as projeções vêm só dos matched."""
+    ads_result = _adapter_result("mochila personalizada", matched=2, needs_review=1, rejected=1)
+    calls = _install_zero_match_stack(monkeypatch, ads_result)
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
-        run_date = run_date or date.today()
-        slug = run.pack._slugify(keyword)
-        base = f"{run_date.isoformat()}--{slug}"
-        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+    result = run.run_keyword(product("mochila personalizada"))
 
-    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
-    monkeypatch.setattr(
-        run.apify_ads, "fetch",
-        lambda keyword: {**ADS, "total_ads": 0, "ad_ids": [], "top_ads": [], "advertisers": []},
-    )
-    monkeypatch.setattr(run.trends, "fetch_related", lambda keyword: {"related_queries": []})
-    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"error": "x"})
-    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
-
-    result = run.run_keyword(product("mochila"))
-
-    blob = json.dumps(result["ads_data"])
-    assert "secret" not in blob and "token=" not in blob
+    assert calls == {"apify": 1, "trends": 1, "seo": 1, "landing": 1, "related": 0}
+    ads = result["ads_data"]
+    assert ads["candidate_count"] == 4
+    assert ads["matched_count"] == 2
+    assert ads["needs_review_count"] == 1
+    assert ads["rejected_count"] == 1
+    assert ads["total_ads"] == 2
+    assert ads["ad_ids"] == ["m0", "m1"]
+    assert [ad["ad_archive_id"] for ad in ads["top_ads"]] == ["m0", "m1"]
+    assert ads["matcher_version"]
+    assert ads["matching_schema_version"] == 1
+    labels = {c["ad_archive_id"]: c["match"]["label"] for c in ads["candidates"]}
+    assert labels == {"m0": "matched", "m1": "matched", "r0": "needs_review", "x0": "rejected"}
+    assert result["score_result"]["label"] in {"AVANÇAR", "OBSERVAR", "DESCARTAR"}
 
 
-def test_run_keyword_keeps_public_ad_library_link_with_ad_id(monkeypatch, tmp_path):
-    """A referência pública da Ad Library (``link`` com ad-ID) é permitida e
-    sobrevive intacta à serialização — só a landing_url é sanitizada."""
-    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
-    packs_dir.mkdir()
-    data_dir.mkdir()
-    library_link = "https://www.facebook.com/ads/library/?id=123456789"
+def test_zero_candidates_is_descartar_with_related_queries(monkeypatch):
+    """Zero candidatos canónicos ativos => DESCARTAR determinístico (sem
+    decisão negativa sobre evidência ambígua porque não há evidência)."""
+    calls = _install_zero_match_stack(monkeypatch, _adapter_result("mochila personalizada"))
+    result = run.run_keyword(product("mochila personalizada"))
 
-    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
-        run_date = run_date or date.today()
-        slug = run.pack._slugify(keyword)
-        base = f"{run_date.isoformat()}--{slug}"
-        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+    assert calls == {"apify": 1, "trends": 0, "related": 1, "seo": 0, "landing": 0}
+    assert result["score_result"]["label"] == "DESCARTAR"
+    assert result["score_result"]["score"] == 0
 
-    monkeypatch.setattr(run.pack, "_pack_paths", fake_paths)
-    monkeypatch.setattr(
-        run.apify_ads, "fetch",
-        lambda keyword: {**ADS, "top_ads": [
-            {**ADS["top_ads"][0], "landing_url": "https://shop.example/p?token=hush", "link": library_link}
-        ]},
-    )
-    monkeypatch.setattr(run.trends, "fetch", lambda keyword: TRENDS)
-    monkeypatch.setattr(run.serp_seo, "fetch", lambda keyword: SEO)
-    monkeypatch.setattr(run.landing_price, "fetch_prices_from_ads", lambda data: {"price_range": {"min": 10.0, "max": 20.0, "currency": "EUR", "sources": 1}})
-    monkeypatch.setattr(run, "_csv_data", lambda path, keyword: CSV)
 
-    result = run.run_keyword(product("mochila"))
+def test_zero_matched_with_needs_review_is_dados_insuficientes(monkeypatch):
+    """Zero matched com candidatos needs_review => DADOS INSUFICIENTES: a
+    evidência é ambígua e nenhuma decisão negativa pode ser tomada."""
+    calls = _install_zero_match_stack(monkeypatch, _adapter_result("mochila personalizada", needs_review=2))
+    result = run.run_keyword(product("mochila personalizada"))
 
-    ad = result["ads_data"]["top_ads"][0]
-    assert ad["landing_url"] == "https://shop.example/p"      # sanitizada
-    assert ad["link"] == library_link                          # pública, mantida
+    assert result["score_result"]["label"] == "DADOS INSUFICIENTES"
+    assert result["score_result"]["incomplete"] is True
+    assert "needs_review" in result["score_result"]["reason"]
+    assert calls == {"apify": 1, "trends": 1, "seo": 1, "landing": 0, "related": 0}
+    assert result["ads_data"]["needs_review_count"] == 2
+    assert result["ads_data"]["total_ads"] == 0
 
-    json_path = result["md_path"].replace("/packs/", "/data/").replace(".md", ".json")
-    raw_pack = open(json_path, encoding="utf-8").read()
-    assert library_link in raw_pack
-    assert "token=hush" not in raw_pack
+
+def test_zero_matched_all_rejected_is_descartar(monkeypatch):
+    """Zero matched com todos os candidatos rejeitados => DESCARTAR: sinal
+    negativo real (a coorte da Ad Library não prova o produto)."""
+    calls = _install_zero_match_stack(monkeypatch, _adapter_result("mochila personalizada", rejected=2))
+    result = run.run_keyword(product("mochila personalizada"))
+
+    assert result["score_result"]["label"] == "DESCARTAR"
+    assert result["score_result"]["score"] == 0
+    assert "rejeitados" in result["score_result"]["reason"]
+    assert calls == {"apify": 1, "trends": 0, "related": 1, "seo": 0, "landing": 0}
+    assert result["ads_data"]["rejected_count"] == 2
+
+
+# ── Guardas legadas mensal/quarta (fail-closed, nunca reescrever história) ─
+
+
+def _write_legacy_previous(tmp_path):
+    """A previous pack whose facebook_ads predates matching_schema_version."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    previous = {
+        "keyword": "mochila",
+        "date": date.today().isoformat(),
+        "score": {"score": 50, "label": "OBSERVAR", "breakdown": {}},
+        "trends": TRENDS,
+        "keyword_planner": CSV,
+        "facebook_ads": ADS,
+        "seo": SEO,
+        "landing_price": {"price_range": {"min": 10, "max": 20}},
+        "suggested_keywords": [],
+    }
+    (data_dir / f"{date.today().isoformat()}--mochila.json").write_text(json.dumps(previous), encoding="utf-8")
+    write_registry(tmp_path, ["mochila"])
+
+
+def test_wednesday_skips_legacy_baseline_pack_fail_closed(monkeypatch, tmp_path, capsys):
+    """Um pack anterior sem matching_schema_version não pode servir de
+    baseline de coorte: o pulse é saltado (zero calls Apify), o pack é
+    preservado e o motivo é explícito — nunca se reescreve história."""
+    _write_legacy_previous(tmp_path)
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    apify_calls = []
+    monkeypatch.setattr(run.apify_ads, "fetch", lambda kw: apify_calls.append(kw) or classified_ads_data())
+    monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
+
+    results = run._run_wednesday(send=False)
+
+    assert apify_calls == []
+    assert len(results) == 1
+    assert results[0]["preserved"] is True
+    assert "matching_schema_version" in results[0]["error"]
+    out = capsys.readouterr().out
+    assert "matching_schema_version" in out
+
+
+def test_monthly_skips_legacy_baseline_pack_fail_closed(monkeypatch, tmp_path, capsys):
+    """Um pack anterior sem matching_schema_version nunca é re-scored sob a
+    semântica nova: salta antes da call Trends (zero gastos), preserva o
+    pack e reporta o motivo."""
+    _write_legacy_previous(tmp_path)
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    trends_calls = []
+    monkeypatch.setattr(run.trends, "fetch",
+                        lambda *a, **k: trends_calls.append((a, k)) or TRENDS)
+    monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
+
+    results = run._run_monthly(send=False)
+
+    assert trends_calls == []
+    assert len(results) == 1
+    assert results[0]["preserved"] is True
+    assert "matching_schema_version" in results[0]["error"]
+    out = capsys.readouterr().out
+    assert "matching_schema_version" in out

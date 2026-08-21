@@ -217,31 +217,37 @@ def _format_ads_section(ads_data: dict[str, Any]) -> str:
         return f"- sem dados: {ads_data['error']}"
     lines = [
         f"- Fonte: {ads_data.get('source', 'Facebook Ad Library via Apify')}",
-        f"- Evidência global de ads ativos para o nicho: {ads_data.get('total_ads', 0)}",
+        f"- Evidência global de ads ativos para o nicho: {ads_data.get('total_ads', 0)} (matched)",
     ]
     top_ads = ads_data.get("top_ads", [])
     if top_ads:
-        lines.append("- Top 3 ads por longevidade:")
+        lines.append("- Top 3 ads por longevidade (matched):")
         for ad in top_ads[:3]:
             link = f" | {ad.get('link')}" if ad.get("link") else ""
             lines.append(
                 f"  - {ad.get('advertiser', '?')} | ativo há {ad.get('days_active', 0)} dias{link}"
             )
     else:
-        lines.append("- Top 3 ads por longevidade: sem dados")
+        lines.append("- Top 3 ads por longevidade (matched): sem dados")
     copies = ads_data.get("copy_examples", ads_data.get("copy_angles", []))
     if copies:
-        lines.append("- Exemplos de copy:")
+        lines.append("- Exemplos de copy (matched):")
         lines.extend(f"  - {copy}" for copy in copies[:5])
     else:
-        lines.append("- Exemplos de copy: sem dados")
-    lines.append(f"- Saturação: {ads_data.get('saturation', '?')}")
+        lines.append("- Exemplos de copy (matched): sem dados")
+    lines.append(f"- Saturação (matched): {ads_data.get('saturation', '?')}")
     lines.append(f"- Amostra: {ads_data.get('raw_ads_count', 0)}/{ads_data.get('sample_limit', 100)}; capped={ads_data.get('sample_capped', False)}")
     lines.append(
         f"- Filtrados: inativos={ads_data.get('filtered_inactive_count', 0)} | "
         f"irrelevantes={ads_data.get('filtered_irrelevant_count', 0)} | "
         f"total excluídos={ads_data.get('filtered_out_count', 0)} | "
-        f"retidos={ads_data.get('total_ads', 0)}"
+        f"duplicados={ads_data.get('duplicates_removed', 0)}"
+    )
+    lines.append(
+        f"- Classificação: candidatos={ads_data.get('candidate_count', 0)} | "
+        f"matched={ads_data.get('matched_count', 0)} | "
+        f"needs_review={ads_data.get('needs_review_count', 0)} | "
+        f"rejected={ads_data.get('rejected_count', 0)}"
     )
     return "\n".join(lines)
 
@@ -435,9 +441,9 @@ def _format_decision(
         lines.append("Prova global: sem escala detetada")
 
     if label == "DADOS INSUFICIENTES" or "error" in ads_data:
-        risk = "repetir quando o Apify estiver disponível"
+        risk = score_result.get("reason") or "repetir quando o Apify estiver disponível"
     elif ads_data.get("total_ads", 0) == 0:
-        risk = "zero ads ativos — sem sinal de mercado"
+        risk = "zero matched — sem sinal de mercado"
     elif ads_data.get("saturation") == "alta":
         risk = "mercado com competição publicitária intensa"
     else:
@@ -473,6 +479,7 @@ def _format_provenance_section(
     mode: str | None,
     run_id: str | None,
     scoring_version: str | None,
+    matcher_version: str | None,
     generated_at: str | None,
     completed_at: str | None,
     source_states: dict[str, Any] | None,
@@ -488,6 +495,8 @@ def _format_provenance_section(
         bits.append(f"run {run_id[:12]}")
     if scoring_version:
         bits.append(f"scoring v{scoring_version}")
+    if matcher_version:
+        bits.append(f"matcher v{matcher_version}")
     if bits:
         lines.append("- " + ", ".join(bits))
     if generated_at:
@@ -528,6 +537,8 @@ def generate(
     source_policies: dict[str, Any] | None = None,
     scoring_version: str | None = None,
     scoring_config: dict[str, Any] | None = None,
+    matcher_version: str | None = None,
+    matching_schema_version: int | None = None,
     generated_at: str | None = None,
     completed_at: str | None = None,
 ) -> str:
@@ -548,6 +559,7 @@ def generate(
         mode=mode,
         run_id=run_id,
         scoring_version=scoring_version,
+        matcher_version=matcher_version,
         generated_at=now,
         completed_at=done_at,
         source_states=source_states,
@@ -626,6 +638,10 @@ Fórmula determinística. Sem LLM no score.
         raw_pack["scoring_version"] = scoring_version
     if scoring_config is not None:
         raw_pack["scoring_config"] = scoring_config
+    if matcher_version is not None:
+        raw_pack["matcher_version"] = matcher_version
+    if matching_schema_version is not None:
+        raw_pack["matching_schema_version"] = matching_schema_version
     if source_states is not None:
         raw_pack["source_states"] = source_states
     if source_policies is not None:

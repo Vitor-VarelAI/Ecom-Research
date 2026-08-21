@@ -172,14 +172,21 @@ def test_renamed_product_keeps_weekly_and_monthly_runs(monkeypatch, tmp_path):
     _write_pack(tmp_path, f"{date.today().isoformat()}--mochila.json",
                 {**_legacy_pack("mochila", date.today().isoformat(), SCORE_OBSERVAR),
                   "trends": {}, "keyword_planner": {}, "seo": {},
-                  "facebook_ads": {"total_ads": 1, "ad_ids": ["a1"], "advertisers": []}})
+                  "facebook_ads": {
+                      "matching_schema_version": 1,
+                      "total_ads": 1, "ad_ids": ["a1"], "advertisers": [],
+                      "candidates": [],
+                  }})
     registry = write_registry(tmp_path, [
         {"keyword": "mochila escolar", "name": "mochila personalizada", "aliases": ["mochila"]},
     ])
     monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
     apify_calls = []
     monkeypatch.setattr(run.apify_ads, "fetch", lambda kw: apify_calls.append(kw) or {
-        "total_ads": 1, "ad_ids": ["a2"], "advertisers": []})
+        "matching_schema_version": 1,
+        "total_ads": 1, "ad_ids": ["a2"], "advertisers": [],
+        "candidates": [],
+    })
     monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
 
     results = run._run_wednesday(send=False, registry=registry)

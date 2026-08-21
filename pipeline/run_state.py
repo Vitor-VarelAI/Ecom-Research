@@ -6,10 +6,10 @@ This module is deliberately tiny and dependency-free.  It provides:
 * ``compute_run_id`` — a deterministic identity for one logical action.
   Inputs are the logical date, the resolved action mode, the ordered
   product descriptors (each ``product_id`` + ``research_keyword``), the
-  CSV content hash (when the mode consumes CSV) and the scoring version.
-  Credentials, wall-clock timestamps and ``--digest`` are intentionally
-  excluded so that a rerun of the same action reuses the persisted
-  artifacts instead of spending paid sources again.
+  CSV content hash (when the mode consumes CSV), the scoring version and
+  the matcher version.  Credentials, wall-clock timestamps and ``--digest``
+  are intentionally excluded so that a rerun of the same action reuses the
+  persisted artifacts instead of spending paid sources again.
 * ``atomic_write_json`` / ``atomic_write_text`` — temp-file + fsync +
   ``os.replace`` so readers never observe a half-written file.
 * ``RunStore`` — persistence of run manifests under ``data/runs/`` with a
@@ -110,6 +110,7 @@ def compute_run_id(
     products: list[dict[str, str]],
     csv_sha256: str | None,
     scoring_version: str,
+    matcher_version: str,
 ) -> str:
     """
     Deterministic identity for one logical action.
@@ -120,6 +121,10 @@ def compute_run_id(
     rename (different ``research_keyword`` on the same ``product_id``)
     changes the identity and creates a new run; a product name-only or
     alias-only change does not participate and keeps the identity.
+
+    ``scoring_version`` and ``matcher_version`` participate in the identity:
+    a new scoring cohort or a new matcher classification never reuses the
+    artifacts of a run produced under older semantics.
 
     The same inputs always produce the same run id; ``--digest``, clock
     timestamps and credentials never influence it.  A repeated completed
@@ -136,6 +141,7 @@ def compute_run_id(
             "products": canonical_products,
             "csv_sha256": csv_sha256,
             "scoring_version": scoring_version,
+            "matcher_version": matcher_version,
         },
         sort_keys=True,
         ensure_ascii=False,

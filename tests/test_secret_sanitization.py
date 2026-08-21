@@ -166,3 +166,89 @@ def test_secret_exception_never_reaches_pack_manifest_or_digest(monkeypatch, tmp
     # instead of the raw exception text.
     assert results[0]["trends_data"]["error"] == "Erro de rede na SerpAPI (ConnectionError)"
     assert results[0]["seo_data"]["error"] == "Erro de rede na SerpAPI (SERP) (ConnectionError)"
+
+
+# ── sanitize_ads_data: deep-copy + candidatos + top_ads, sem mutação ────────
+
+
+def _ads_with_raw_urls():
+    from tests.fixtures.ads_helpers import classified_ads_data
+    raw = "https://user:pass@shop.example/produto?api_key=TOPSECRET&utm_source=fb#frag"
+    ads = classified_ads_data()
+    ads["top_ads"] = [{**ads["top_ads"][0], "landing_url": raw}]
+    ads["candidates"] = [{**ads["candidates"][0], "landing_url": raw}]
+    return ads
+
+
+def test_sanitize_ads_data_deep_copies_and_sanitizes_candidates_and_top_ads():
+    from pipeline.adapters.url_sanitize import sanitize_ads_data
+    ads = _ads_with_raw_urls()
+    snapshot = json.dumps(ads, ensure_ascii=False)
+
+    clean = sanitize_ads_data(ads)
+
+    # O input nunca é mutado (nem os anúncios nem os dicionários aninhados).
+    assert json.dumps(ads, ensure_ascii=False) == snapshot
+    assert clean is not ads
+    assert clean["candidates"] is not ads["candidates"]
+    assert clean["candidates"][0] is not ads["candidates"][0]
+    assert clean["top_ads"][0] is not ads["top_ads"][0]
+    # Ambos os sítios ficam sanitizados.
+    assert clean["candidates"][0]["landing_url"] == "https://shop.example/produto"
+    assert clean["top_ads"][0]["landing_url"] == "https://shop.example/produto"
+    blob = json.dumps(clean, ensure_ascii=False)
+    assert "TOPSECRET" not in blob and "user:pass" not in blob and "utm_source=fb" not in blob
+    # A referência pública da Ad Library (link com ad-ID) sobrevive intacta —
+    # só a landing_url é sanitizada.
+    assert clean["candidates"][0]["link"] == "https://www.facebook.com/ads/library/?id=a1"
+    assert "facebook.com/ads/library" in blob
+
+
+def test_run_keyword_persists_only_sanitized_candidate_landing_urls(monkeypatch, tmp_path):
+    """O result e o pack JSON nunca carregam a URL crua de um candidato
+    (userinfo/query/fragment) — candidates e top_ads são sanitizados na
+    mesma mudança antes de qualquer serialização."""
+    import run as run_module
+    from tests.fixtures.ads_helpers import classified_ads_data
+    from tests.fixtures.products_helpers import product
+
+    packs_dir, data_dir = tmp_path / "packs", tmp_path / "data"
+    packs_dir.mkdir()
+    data_dir.mkdir()
+    raw_url = "https://shop.example/produto?api_key=TOPSECRET&utm_source=fb#frag"
+
+    def fake_paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
+        from datetime import date as _date
+        run_date = run_date or _date.today()
+        slug = run_module.pack._slugify(keyword)
+        base = f"{run_date.isoformat()}--{slug}"
+        return str(packs_dir / f"{base}.md"), str(data_dir / f"{base}.json")
+
+    ads = classified_ads_data()
+    ads["top_ads"] = [{**ads["top_ads"][0], "landing_url": raw_url}]
+    ads["candidates"] = [{**ads["candidates"][0], "landing_url": raw_url}]
+    consumed = []
+
+    def fetch_prices(data):
+        consumed.append(data["top_ads"][0]["landing_url"])
+        return {"price_range": {"min": 10.0, "max": 20.0, "currency": "EUR", "sources": 1}}
+
+    monkeypatch.setattr(run_module.pack, "_pack_paths", fake_paths)
+    monkeypatch.setattr(run_module.apify_ads, "fetch", lambda kw: ads)
+    monkeypatch.setattr(run_module.trends, "fetch", lambda kw: {"direction": "estável", "slope_pct": 0, "seasonal": False, "top_geos": [], "related_queries": []})
+    monkeypatch.setattr(run_module.serp_seo, "fetch", lambda kw: {"organic_results": [], "ads_count": 0, "paa_questions": [], "seo_opportunity": "alta"})
+    monkeypatch.setattr(run_module.landing_price, "fetch_prices_from_ads", fetch_prices)
+    monkeypatch.setattr(run_module, "_csv_data", lambda path, keyword: {"volume": 1000, "cpc": 1, "related_keywords": []})
+
+    result = run_module.run_keyword(product("mochila"))
+
+    # O fetch consumiu a URL crua; o que é persistido está sanitizado.
+    assert consumed == [raw_url]
+    persisted = result["ads_data"]["candidates"][0]["landing_url"]
+    assert persisted == "https://shop.example/produto"
+    json_path = result["md_path"].replace("/packs/", "/data/").replace(".md", ".json")
+    raw_pack = open(json_path, encoding="utf-8").read()
+    assert "https://shop.example/produto" in raw_pack
+    assert "TOPSECRET" not in raw_pack
+    assert "api_key=TOPSECRET" not in raw_pack
+    assert "utm_source=fb" not in raw_pack

@@ -8,6 +8,7 @@ from datetime import date as real_date
 import pytest
 
 import run
+from tests.fixtures.ads_helpers import classified_ads_data
 from tests.fixtures.products_helpers import write_registry
 
 ADS = {
@@ -32,7 +33,7 @@ def _write_previous(tmp_path, keyword="mochila", label="OBSERVAR"):
         "score": {"score": 50, "label": label, "breakdown": {}},
         "trends": TRENDS,
         "keyword_planner": CSV,
-        "facebook_ads": ADS,
+        "facebook_ads": classified_ads_data(),
         "seo": SEO,
         "landing_price": {"price_range": {"min": 10, "max": 20}},
         "suggested_keywords": [{"keyword": "mochila escolar", "score": 10, "status": "proposed"}],

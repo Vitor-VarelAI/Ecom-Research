@@ -9,12 +9,14 @@ packs, manifests, logs) goes through ``sanitize_url``.
 This module is the single sanitizer home: ``landing_price`` uses it for
 ``source_url``/provenance, and ``run.py`` uses ``sanitize_ads_data`` before
 building results, packs and checkpoints, so the raw landing URL can never
-reach serialized artifacts.  No circular imports: it depends only on the
-stdlib.
+reach serialized artifacts.  ``sanitize_ads_data`` deep-copies and
+sanitizes ``landing_url`` in both ``top_ads`` and ``candidates`` without
+mutating its input.  No circular imports: it depends only on the stdlib.
 """
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 from urllib.parse import urlparse
 
@@ -81,8 +83,9 @@ def domain_of(url: str) -> str:
 
 
 def sanitize_ads_data(ads_data: dict[str, Any]) -> dict[str, Any]:
-    """Devolve uma *cópia* de ``ads_data`` com ``top_ads[].landing_url``
-    sanitizado (scheme + host + porta segura + path).
+    """Devolve uma *cópia profunda* de ``ads_data`` com ``landing_url``
+    sanitizado (scheme + host + porta segura + path) em ``top_ads`` E em
+    ``candidates``.
 
     O objeto original nunca é mutado: ``landing_price.fetch_prices_from_ads``
     consome as URLs cruas antes de esta função correr.  Ad library links,
@@ -92,19 +95,15 @@ def sanitize_ads_data(ads_data: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(ads_data, dict):
         return ads_data
-    top_ads = ads_data.get("top_ads", [])
-    if not isinstance(top_ads, list):
-        return dict(ads_data)
-    sanitized_top: list[dict[str, Any]] = []
-    for ad in top_ads:
-        if not isinstance(ad, dict):
-            sanitized_top.append(ad)
+    clean = copy.deepcopy(ads_data)
+    for key in ("top_ads", "candidates"):
+        items = clean.get(key)
+        if not isinstance(items, list):
             continue
-        clean_ad = dict(ad)
-        raw = clean_ad.get("landing_url", "")
-        safe = sanitize_url(raw) if raw else ""
-        clean_ad["landing_url"] = safe or ""
-        sanitized_top.append(clean_ad)
-    clean_ads = dict(ads_data)
-    clean_ads["top_ads"] = sanitized_top
-    return clean_ads
+        for ad in items:
+            if not isinstance(ad, dict):
+                continue
+            raw = ad.get("landing_url", "")
+            safe = sanitize_url(raw) if raw else ""
+            ad["landing_url"] = safe or ""
+    return clean

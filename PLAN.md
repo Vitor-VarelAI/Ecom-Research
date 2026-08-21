@@ -7,24 +7,24 @@ Manter um pipeline CLI reproduzível em que anúncios ativos globais fornecem ev
 ## Fluxo Full
 
 1. Fazer uma chamada ao actor Apify `curious_coder~facebook-ads-library-scraper`, com uma URL global da Facebook Ad Library por keyword e `count=100`.
-2. Normalizar localmente, retirar anúncios inativos/irrelevantes com accent-folding e relevância fail-closed do produto, e deduplicar por ID, URL ou página+copy+data.
-3. Se houver anúncios, executar Trends, SEO, CSV e preços de landing. Se não houver, forçar `DESCARTAR`, saltar SEO/landing e fazer apenas a call Related Queries cacheada para sugestões.
+2. Normalizar localmente, retirar anúncios inativos e gate-1-irrelevantes (accent-folding, token product-head da keyword — primeiro token não stopword/não geográfico, equivalência exacta ou plural de um só `s` — em qualquer parte do copy/texto do anunciante) e deduplicar por ID, URL ou página+copy+data. Cada anúncio ativo, gate-1-relevante e deduplicado torna-se um candidato canónico (máx. 100).
+3. Classificar cada candidato com `pipeline/matching/product_ads.py` (`matched`/`needs_review`/`rejected`). Se houver `matched`, executar Trends, SEO, CSV e preços de landing sobre os top ads matched. Se não houver candidatos (ou zero matched com todos rejeitados), forçar `DESCARTAR`, saltar SEO/landing e fazer apenas a call Related Queries cacheada para sugestões; zero matched com qualquer `needs_review` produz `DADOS INSUFICIENTES`.
 4. Se a fonte Apify falhar, continuar Trends/SEO/CSV, marcar `DADOS INSUFICIENTES` e não produzir uma decisão negativa.
-5. Persistir Markdown e JSON, incluindo `facebook_ads` e `suggested_keywords`.
+5. Persistir Markdown e JSON, incluindo `facebook_ads` (candidatos classificados + contagens + `matcher_version` + `matching_schema_version`) e `suggested_keywords`.
 
 ## Contrato Apify
 
 A evidência da Ad Library é global (`country=ALL`) e não escolhe mercado. A requisição usa POST para o endpoint `run-sync-get-dataset-items`, `Authorization: Bearer APIFY_API_TOKEN`, `Content-Type: application/json`, query `clean=true&format=json`, timeout `(10,135)` e nenhum retry. O payload contém uma URL global com `active_status=active`, `ad_type=all`, `country=ALL`, `is_targeted_country=false`, `media_type=all`, `q` URL-encoded, `search_type=keyword_unordered`, e `count=100`.
 
-O resultado tem `source`, `query`, `sample_limit`, `sample_capped`, `raw_ads_count`, `filtered_out_count`, `duplicates_removed`, `total_ads`, `ad_ids`, `top_ads`, `advertisers`, `global_market_proven`, `copy_examples` e `saturation`. Como a query usa `country=ALL`, `global_market_proven` descreve apenas prova global; nunca é prova de mercado local. Cada top ad tem `ad_archive_id`, advertiser, page ID, longevidade, link da Ad Library, `landing_url`, copy, plataformas e países.
+O resultado do adapter tem `source`, `query`, `sample_limit`, `sample_capped`, `raw_ads_count`, `filtered_out_count`, `filtered_inactive_count`, `filtered_irrelevant_count`, `candidate_count`, `duplicates_removed`, `relevance_policy`, `matching_schema_version` e `candidates` (até 100 candidatos canónicos ativos, gate-1-relevantes e deduplicados, cada um com `match_evidence` folded commercial/geo/weak). O adapter não decide fit de produto: `pipeline/matching/product_ads.py` classifica cada candidato (`matched` / `needs_review` / `rejected`) com confiança categórica, reason codes ordenados e `matcher_version`, e deriva `total_ads` (contagem matched), `matched_count`/`needs_review_count`/`rejected_count`, `ad_ids`, `top_ads`, `advertisers`, `global_market_proven`, `copy_examples` e `saturation` **apenas dos candidatos matched**. Como a query usa `country=ALL`, `global_market_proven` descreve apenas prova global; nunca é prova de mercado local. Cada candidato/top ad tem `ad_archive_id`, advertiser, page ID, longevidade, link da Ad Library, `landing_url` (sanitizada na persistência), copy, plataformas, países e `match_evidence`. A classificação exige o product-head e todos os tokens significativos (incluindo modificadores como `personalizada`/`aromáticas`) em campos comerciais fortes e os qualificadores geográficos em campos geo-proof estritos; prova parcial é `needs_review`, ausência do head é `rejected`.
 
 ## Cadência e limites
 
 | Ação | Comportamento |
 |---|---|
-| Full/domingo | Um Apify por keyword; Trends/SEO/landing só conforme o resultado; Related Queries cacheada quando zero ads |
-| Quarta | Uma chamada paga e bounded de Apify por keyword elegível; zero SerpAPI, Firecrawl ou landing; reutiliza todos os outros campos; compara IDs e advertisers |
-| Mensal | Uma timeseries Trends forçada por keyword OBSERVAR; zero Apify, SEO, landing ou Firecrawl; rescore com os dados reutilizados |
+| Full/domingo | Um Apify por keyword; Trends/SEO/landing só conforme o resultado; Related Queries cacheada quando zero candidatos ou zero matched (todos rejeitados) |
+| Quarta | Uma chamada paga e bounded de Apify por keyword elegível; zero SerpAPI, Firecrawl ou landing; reutiliza todos os outros campos; compara IDs e advertisers (matched-only); saltada fail-closed se o pack anterior não tiver `matching_schema_version` |
+| Mensal | Uma timeseries Trends forçada por keyword OBSERVAR; zero Apify, SEO, landing ou Firecrawl; rescore com os dados reutilizados; saltado fail-closed se o pack anterior não tiver `matching_schema_version` |
 | Auto no dia 1 | Mensal primeiro; depois domingo ou quarta; cada ação conserva o próprio digest |
 
 Cache de Trends, SEO e Related Queries dura 30 dias; a timeseries do Trends usa timeout de 60s e a política de proveniência expõe o mesmo valor. A quota SerpAPI mantém hard stop local em 230 chamadas. O limite Apify por execução é uma invocação por keyword e o sample cap é 100.
@@ -52,7 +52,7 @@ O outbound é determinístico e HTML multi-mensagem por omissão (`TELEGRAM_REND
 
 ## Estado atual
 
-O código é CLI puro, sem chamadas LLM e sem alteração automática de decisões do utilizador. O output é a interface para consumo humano e eventual aprovação posterior pelo ad-machine. O outbound Telegram é HTML multi-mensagem determinístico por omissão, com estado de entrega v2 por item (ver "Landing e Telegram"). O baseline validado tem **755 testes verdes**; as integrações de rede são mockadas na suite. O parser do Keyword Planner aceita UTF-16 LE com BOM, export tab-delimitado com preâmbulo de título/data e CSV UTF-8 legado, ligando a keyword à linha de produto exacta após normalização.
+O código é CLI puro, sem chamadas LLM e sem alteração automática de decisões do utilizador. O output é a interface para consumo humano e eventual aprovação posterior pelo ad-machine. O outbound Telegram é HTML multi-mensagem determinístico por omissão, com estado de entrega v2 por item (ver "Landing e Telegram"). A suite completa fica verde em cada checkpoint (as integrações de rede são mockadas na suite; os números exatos de testes mudam com o contrato e não são referenciados aqui). O parser do Keyword Planner aceita UTF-16 LE com BOM, export tab-delimitado com preâmbulo de título/data e CSV UTF-8 legado, ligando a keyword à linha de produto exacta após normalização.
 
 O smoke live de uma keyword e uma entrega de um digest Telegram foram concluídos com sucesso; o smoke autorizado do outbound multi-mensagem no chat de teste aprovou HTML (retry com zero chamadas de rede) e bloqueou Rich por duplicação visual — diagnosticada como específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram), sem reenvio pela aplicação. O host atual usa `Europe/Berlin`; o serviço cron está ativo e habilitado (`active`/`enabled`) e existe exactamente um job. Com `TZ=Europe/Lisbon`, o job das 09:00 do host corresponde às 08:00 de Lisboa e executa `--auto --digest`:
 

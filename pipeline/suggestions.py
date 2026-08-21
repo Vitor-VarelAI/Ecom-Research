@@ -201,6 +201,13 @@ _RELEVANCE_POLICY = (
 )
 
 
+def is_stopword(token: str) -> bool:
+    """True when a folded token is a PT/EN function word (never meaningful
+    product evidence).  The head-token selection and the matcher's
+    meaningful-token contract share this single rule."""
+    return token in _PRODUCT_STOPWORDS
+
+
 def product_head_token(source_keyword: str) -> str | None:
     """Deterministic product-head token for a source keyword.
 

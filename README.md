@@ -115,9 +115,11 @@ No dia 1, se o Trends falhar para uma keyword, o pack anterior é preservado: n�
 
 Cada keyword faz uma única chamada POST, com custo do actor limitado a uma invocação e sample de 100, com timeout de conexão/leitura `(10, 135)`, `count=100` e uma URL global da Ad Library com `active_status=active`, `ad_type=all`, `country=ALL`, `is_targeted_country=false`, `media_type=all`, `search_type=keyword_unordered` e `q` URL-encoded. Não há retries.
 
-A resposta é normalizada localmente com filtros determinísticos e relevância fail-closed: status inativo é removido, texto é accent-folded, uma keyword exige o token e queries com vários tokens exigem pelo menos 60% de cobertura, com a frase exata sempre aceite; anúncios sem prova global do product head nos campos de intenção comercial são rejeitados. Duplicados são removidos por `ad_archive_id`, depois URL, depois `page_id + copy + date`. O pack guarda amostra, descartes, duplicados, IDs, top ads, advertisers, `global_market_proven` e saturação; o limite de 100 permite que `alta` (>50) seja atingível.
+A resposta é normalizada localmente com o adapter como limitador de fonte: status inativo é removido, texto é accent-folded e o gate 1 exige apenas o token product-head da keyword (primeiro token que não é stopword nem qualificador geográfico, com equivalência exacta ou plural de um só `s` final) em qualquer parte do copy/texto do anunciante — menções genéricas (uma mochila escolar para `mochila personalizada`) continuam candidatas e é o matcher que decide forte vs ambíguo vs rejeitado; ruído só-geográfico sem o head cai aqui. Duplicados são removidos por `ad_archive_id`, depois URL, depois `page_id + copy + date`. Todo anúncio ativo, gate-1-relevante e deduplicado torna-se um **candidato canónico persistido** (máx. 100) com uma shape pequena de `match_evidence` (texto forte commercial/geo e fraco weak, folded, sem URLs cruas). O adapter nunca decide se um anúncio pertence ao produto: a classificação (`matched` / `needs_review` / `rejected`) vive em `pipeline/matching/product_ads.py`, que exige o product-head e todos os tokens significativos (incluindo modificadores como `personalizada`/`aromáticas`) em campos comerciais fortes e os qualificadores geográficos em campos geo-proof estritos; prova parcial produz `needs_review` e ausência do head produz `rejected`.
 
-Um resultado vazio é sucesso e força `DESCARTAR`, sem SEO nem landing. Ainda faz uma call Related Queries da SerpAPI, cacheada por 30 dias e contada na quota, aplicando relevância fail-closed do produto antes de propor alternativas. Uma falha do Apify continua Trends, SEO e CSV, mas produz `DADOS INSUFICIENTES` e nunca um `DESCARTAR` falso.
+O resultado classificado deriva `top_ads`, `ad_ids`, `advertisers`, `copy_examples`, `saturation` e `global_market_proven` **apenas dos candidatos `matched`**; `total_ads` é a contagem matched. O pack guarda as contagens completas (raw, inativos, irrelevantes gate-1, candidatos, duplicados, matched, needs_review, rejected), `matcher_version` e `matching_schema_version`.
+
+Um resultado vazio (zero candidatos) é sucesso e força `DESCARTAR`, sem SEO nem landing; ainda faz uma call Related Queries da SerpAPI, cacheada por 30 dias e contada na quota, aplicando relevância fail-closed do produto antes de propor alternativas. Zero matched com qualquer candidato `needs_review` produz `DADOS INSUFICIENTES` (evidência ambígua, sem decisão negativa); zero matched com todos rejeitados produz `DESCARTAR`. Uma falha do Apify continua Trends, SEO e CSV, mas produz `DADOS INSUFICIENTES` e nunca um `DESCARTAR` falso.
 
 ## Custos e modos
 
@@ -127,7 +129,7 @@ Um resultado vazio é sucesso e força `DESCARTAR`, sem SEO nem landing. Ainda f
 | Quarta | 1 chamada paga/bounded por keyword elegível | 0 | 0 | Trends, CSV, SEO, landing, sugestões e score anteriores |
 | Dia 1 | 0 | 1 timeseries forçada por keyword | 0 | Ads, CSV, SEO, landing e sugestões anteriores |
 
-A quarta compara `ad_ids` e advertisers, mas se o Apify falhar relata o erro e preserva o último pack bom. O mensal é um caminho de rescore separado: não faz refresh de anúncios nem chama Firecrawl.
+A quarta compara `ad_ids` e advertisers (projeções matched-only), mas se o Apify falhar relata o erro e preserva o último pack bom. O mensal é um caminho de rescore separado: não faz refresh de anúncios nem chama Firecrawl. Tanto a quarta como o mensal **nunca re-score nem comparam coortes sobre um pack anterior sem `matching_schema_version`**: saltam fail-closed com razão explícita (zero calls pagas) e preservam o pack legado sem reescrever história. O `run_id` inclui `scoring_version` e `matcher_version`; o pack e o manifest persistem ambos.
 
 ## Sugestões e mercados
 
@@ -163,7 +165,7 @@ As recomendações são operacionais, não decisões automáticas: `AVANÇAR` pr
 git diff --check
 ```
 
-Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. O último baseline é de **755 testes verdes** (65 focados de entrega em `tests/test_delivery_v2.py`).
+Todos os testes mockam rede; não são feitas chamadas reais durante a verificação. A suite completa fica verde em cada checkpoint (os números exatos de testes mudam com o contrato e não são referenciados aqui).
 
 ## Estado live
 

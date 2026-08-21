@@ -1,4 +1,12 @@
-"""Mocked contract and normalization tests for the Apify ads adapter."""
+"""Mocked contract and normalization tests for the Apify ads adapter.
+
+The adapter is the source limiter: it drops inactive ads, applies gate-1
+broad relevance and deduplicates, then persists every remaining ad as a
+canonical candidate with a small ``match_evidence`` shape.  Product-fit
+classification (matched / needs_review / rejected) moved to
+``pipeline.matching.product_ads`` — the old gate-2 tests now live in
+``tests/test_product_ads.py`` under classified-candidate semantics.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +14,8 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from pipeline.adapters import apify_ads
+from pipeline.matching import product_ads
+from pipeline.matching.product_ads import MATCHING_SCHEMA_VERSION
 
 
 class Response:
@@ -22,9 +32,10 @@ class Response:
 def ad(ad_id, copy="Mochila personalizada com entrega rápida", title=None, **overrides):
     """A minimal active ad row.
 
-    ``title`` defaults to the copy so the ad carries a commercial-intent
+    ``title`` defaults to the copy so the ad carries a strong commercial
     field matching the first query token; pass ``title`` explicitly to test
-    gate-2 rejection (body/copy alone must not satisfy relevance).
+    that a body-only mention still becomes a candidate (the matcher then
+    classifies it, it is never filtered here).
     """
     value = {
         "ad_archive_id": ad_id,
@@ -94,14 +105,20 @@ def captured_ad(
     return value
 
 
+def _fetch(monkeypatch, keyword, rows):
+    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
+    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
+    return apify_ads.fetch(keyword)
+
+
 def test_captured_shape_2_7_19_snapshot_merge(monkeypatch):
     """Actor build 2.7.19 nests creative fields under ``snapshot``.
 
     The internal merged view must let nested copy/title/caption/link fields
-    feed relevance, normalized copy and ``landing_url`` while top-level
-    identity, lifecycle, platform and country fields keep precedence;
-    epoch ``start_date`` yields the correct ``days_active`` and inactive
-    rows stay filtered.
+    feed relevance, normalized copy, ``landing_url`` and the canonical
+    ``match_evidence`` while top-level identity, lifecycle, platform and
+    country fields keep precedence; epoch ``start_date`` yields the correct
+    ``days_active`` and inactive rows stay filtered.
 
     Inactivity precedence: an explicit ``is_active=True`` survives a past
     integer ``end_date`` (the actor reports it as an observation boundary,
@@ -109,7 +126,6 @@ def test_captured_shape_2_7_19_snapshot_merge(monkeypatch):
     a past ``end_date`` still filters when no affirmative active flag
     exists.
     """
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
     now = datetime.now(timezone.utc)
     start_epoch = int(now.timestamp()) - 30 * 86400
     rows = [
@@ -140,19 +156,19 @@ def test_captured_shape_2_7_19_snapshot_merge(monkeypatch):
     )
     no_active_flag.pop("is_active")
     rows.append(no_active_flag)
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
 
-    result = apify_ads.fetch("mochila personalizada")
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
 
-    assert result["total_ads"] == 1
+    assert result["candidate_count"] == 1
     assert result["filtered_out_count"] == 3
     assert result["filtered_inactive_count"] == 2
     assert result["filtered_irrelevant_count"] == 1
     assert result["relevance_policy"] == apify_ads.RELEVANCE_POLICY
     assert result["duplicates_removed"] == 0
-    assert result["ad_ids"] == ["1001"]
+    assert result["matching_schema_version"] == MATCHING_SCHEMA_VERSION
+    assert [ad["ad_archive_id"] for ad in result["candidates"]] == ["1001"]
 
-    top = result["top_ads"][0]
+    top = result["candidates"][0]
     # Nested creative text participates in relevance and normalized copy.
     assert "Mochila personalizada com nome" in top["copy"]
     # Nested link_url becomes landing_url.
@@ -165,6 +181,12 @@ def test_captured_shape_2_7_19_snapshot_merge(monkeypatch):
     # Singular publisher_platform and targeted_or_reached_countries preserved.
     assert top["publisher_platforms"] == ["facebook"]
     assert top["countries"] == ["PT", "ES"]
+    # Canonical match_evidence carries folded strong/geo/weak text.
+    assert set(top["match_evidence"]) == {"commercial", "geo", "weak"}
+    assert "mochilas personalizadas" in top["match_evidence"]["commercial"]
+    assert "envio para todo o pais" in top["match_evidence"]["weak"]
+    assert "feita a medida" in top["match_evidence"]["commercial"]  # link_description é forte
+    assert "feita a medida" not in top["match_evidence"]["geo"]  # mas não prova geografia
 
 
 def test_parse_datetime_epoch_seconds_millis_and_iso():
@@ -224,12 +246,13 @@ def test_request_contract_and_normalized_fields(monkeypatch):
     assert result["source"] == "Facebook Ad Library via Apify"
     assert result["query"] == "Mochila personalizada"
     assert result["sample_limit"] == 100
-    assert result["total_ads"] == 1
-    assert result["ad_ids"] == ["1"]
-    top = result["top_ads"][0]
-    assert set(("ad_archive_id", "advertiser", "page_id", "days_active", "reported_active_time", "link", "landing_url", "copy", "publisher_platforms", "countries")) <= set(top)
-    assert top["link"].startswith("https://www.facebook.com/ads/library/")
-    assert top["landing_url"] == "https://loja.example/1"
+    assert result["candidate_count"] == 1
+    candidate = result["candidates"][0]
+    assert set(("ad_archive_id", "advertiser", "page_id", "days_active", "reported_active_time",
+                "link", "landing_url", "copy", "publisher_platforms", "countries",
+                "match_evidence")) <= set(candidate)
+    assert candidate["link"].startswith("https://www.facebook.com/ads/library/")
+    assert candidate["landing_url"] == "https://loja.example/1"
 
 
 def test_request_json_uses_object_url_shape(monkeypatch):
@@ -259,7 +282,6 @@ def test_request_json_uses_object_url_shape(monkeypatch):
 
 
 def test_filters_relevance_inactive_and_deduplicates(monkeypatch):
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
     rows = [
         ad("1", copy="Mochila personalizada com nome"),
         ad("1", copy="Mochila personalizada duplicada"),
@@ -269,49 +291,81 @@ def test_filters_relevance_inactive_and_deduplicates(monkeypatch):
         ad("inactive", copy="Mochila personalizada", active_status="INACTIVE"),
         ad("irrelevant", copy="Caneca azul", title="Caneca azul", page_name="Outra loja"),
     ]
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
 
-    result = apify_ads.fetch("mochila personalizada")
-
-    assert result["total_ads"] == 3
+    assert result["candidate_count"] == 3
     assert result["filtered_out_count"] == 2
     assert result["filtered_inactive_count"] == 1
     assert result["filtered_irrelevant_count"] == 1
     assert result["duplicates_removed"] == 2
-    assert result["ad_ids"] == ["1", "2"]
-    assert result["advertisers"][0]["active_ads"] == 3
+    assert [ad["ad_archive_id"] for ad in result["candidates"]] == ["1", "2", ""]
 
 
-def test_long_query_requires_sixty_percent_and_single_token_requires_token(monkeypatch):
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
+def test_gate1_head_only_reaches_matcher_geo_only_noise_drops(monkeypatch):
+    """Gate 1 is broad head-token source relevance only: a generic school
+    backpack and an oxygen ad that mention ``mochila`` only in weak body
+    copy both become canonical candidates; the matcher then decides
+    (needs_review / rejected).  Geo-only noise with no head token is
+    filtered by gate 1 and never becomes a candidate.  This replaces the
+    old 60%-coverage gate: two-token queries never require every token
+    (``personalizada`` absent is fine at the source — the matcher owns
+    strong vs ambiguous vs rejected).
+    """
     rows = [
-        ad("exact", copy="Saco vermelho premium"),
-        ad("two-of-three", copy="Saco vermelho em promoção", page_name="Loja"),
-        ad("one-of-three", copy="Saco azul", page_name="Loja"),
-        ad("single-no", copy="Produto azul", page_name="Loja"),
+        ad("generic", copy="Mochila escolar com divisões e bolso para portátil",
+           title="Mochila escolar", link_url="https://loja.example/escolar"),
+        ad("oxygen", copy="Concentrador de oxigénio portátil com mochila incluída",
+           title="Concentrador de oxigénio portátil", link_url="https://loja.example/oxigenio"),
+        ad("geo-only", copy="Descobre Portugal em sete dias", title="Férias em Portugal",
+           page_name="Agência de Viagens"),
     ]
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
 
-    result = apify_ads.fetch("saco vermelho premium")
+    assert result["candidate_count"] == 2
+    assert result["filtered_irrelevant_count"] == 1
+    assert [ad["ad_archive_id"] for ad in result["candidates"]] == ["generic", "oxygen"]
 
-    assert result["ad_ids"] == ["exact", "two-of-three"]
-    assert result["filtered_out_count"] == 2
+    classified = product_ads.classify_ads_data("mochila personalizada", result)
+    labels = {c["ad_archive_id"]: c["match"]["label"] for c in classified["candidates"]}
+    assert labels == {"generic": "needs_review", "oxygen": "rejected"}
 
 
-def test_empty_list_is_valid_success_and_sample_cap_reaches_alta(monkeypatch):
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, {"data": []}))
-    empty = apify_ads.fetch("inexistente")
-    assert "error" not in empty
-    assert empty["total_ads"] == 0
-    assert empty["filtered_out_count"] == 0
+def test_gate2_is_no_longer_a_filter_body_only_mention_stays_a_candidate(monkeypatch):
+    """A body-only mention of the product head used to be dropped by gate 2.
+    Now it is a canonical candidate and the matcher classifies it (rejected);
+    the adapter never decides product fit."""
+    rows = [
+        ad("body-only", copy="Caneca personalizada no corpo do anúncio",
+           title="Oferta da semana", link_url="https://loja.example/oferta"),
+    ]
+    result = _fetch(monkeypatch, "caneca personalizada", rows)
+    assert result["candidate_count"] == 1
+    assert result["filtered_irrelevant_count"] == 0
+    candidate = result["candidates"][0]
+    assert candidate["ad_archive_id"] == "body-only"
+    # O head está só no corpo/copy → campos fortes não o provam.
+    assert "caneca" not in candidate["match_evidence"]["commercial"]
+    assert "caneca personalizada" in candidate["match_evidence"]["weak"]
 
-    rows = [ad(str(index), copy=f"Mochila premium {index}") for index in range(51)]
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
-    saturated = apify_ads.fetch("mochila")
-    assert saturated["total_ads"] == 51
-    assert saturated["saturation"] == "alta"
-    assert saturated["sample_capped"] is False
+
+def test_empty_list_is_valid_success(monkeypatch):
+    result = _fetch(monkeypatch, "inexistente", {"data": []})
+    assert "error" not in result
+    assert result["candidate_count"] == 0
+    assert result["candidates"] == []
+    assert result["filtered_out_count"] == 0
+    assert result["matching_schema_version"] == MATCHING_SCHEMA_VERSION
+
+
+def test_sample_cap_flag_and_candidate_cap(monkeypatch):
+    """O invariante do contrato: ``candidates`` está limitado a <=100 mesmo
+    com payloads arbitrários para além do sample do actor."""
+    rows = [ad(str(index), copy=f"Mochila premium {index}") for index in range(150)]
+    result = _fetch(monkeypatch, "mochila", rows)
+    assert result["candidate_count"] == 100
+    assert len(result["candidates"]) == 100
+    assert result["sample_capped"] is True
+    assert result["raw_ads_count"] == 150
 
 
 def test_source_failures_are_errors_and_only_one_post(monkeypatch):
@@ -334,367 +388,35 @@ def test_source_failures_are_errors_and_only_one_post(monkeypatch):
 def test_successful_result_marks_global_evidence_scope(monkeypatch):
     """Resultados normalizados com sucesso declaram explicitamente que a query
     é global (country=ALL) — descoberta, não prova de fit PT/ES/FR."""
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, [ad("1")]))
-    result = apify_ads.fetch("mochila")
+    result = _fetch(monkeypatch, "mochila", [ad("1")])
     assert "error" not in result
     assert result["evidence_scope"] == "global"
     assert result["query_country"] == "ALL"
-    assert "global_market_proven" in result
+    assert result["raw_ads_count"] == 1
 
 
 def test_empty_success_result_marks_global_evidence_scope(monkeypatch):
     """Um resultado vazio bem-sucedido carrega o mesmo contrato de scope —
     células em branco significam desconhecido, não zero."""
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, {"data": []}))
-    empty = apify_ads.fetch("inexistente")
-    assert "error" not in empty
-    assert empty["total_ads"] == 0
-    assert empty["evidence_scope"] == "global"
-    assert empty["query_country"] == "ALL"
-    assert empty["global_market_proven"] is False
+    result = _fetch(monkeypatch, "inexistente", {"data": []})
+    assert "error" not in result
+    assert result["candidate_count"] == 0
+    assert result["evidence_scope"] == "global"
+    assert result["query_country"] == "ALL"
 
 
-def test_empty_success_helper_carries_scope_fields():
-    """O contrato do helper de sucesso vazio também expõe scope/país."""
+def test_empty_success_helper_carries_scope_fields_and_schema():
+    """O contrato do helper de sucesso vazio também expõe scope/país e o
+    schema de matching — sem projeções (são do matcher)."""
     empty = apify_ads._empty_success(0, 0, 0, False)
     assert empty["evidence_scope"] == "global"
     assert empty["query_country"] == "ALL"
     assert empty["filtered_inactive_count"] == 0
     assert empty["filtered_irrelevant_count"] == 0
-    assert empty["relevance_policy"] == apify_ads.RELEVANCE_POLICY
-
-
-def test_global_market_proof_is_counted_over_global_retained_ads(monkeypatch):
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
-    rows = [ad(str(index), copy="Mochila premium", title="Mochilas premium") for index in range(5)]
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
-
-    result = apify_ads.fetch("mochila")
-
-    assert result["total_ads"] == 5
-    assert result["global_market_proven"] is True
-    assert result["evidence_scope"] == "global"
-    assert result["query_country"] == "ALL"
-
-
-class TestHighIntentGate:
-    """Segunda gate fail-closed: product-head token da query num campo de
-    intenção comercial (title/headline/link block/URL de destino).
-
-    O corpo/copy sozinho nunca satisfaz a gate — o defeito provado para
-    ``tapete yoga`` era ficção, cursos, mentoring e um macacão cujo corpo
-    apenas mencionava um tapete de yoga a passar a gate de cobertura 60%%.
-    """
-
-    def _fetch(self, monkeypatch, keyword, rows):
-        monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
-        monkeypatch.setattr(apify_ads.requests, "post", lambda *args, **kwargs: Response(200, rows))
-        return apify_ads.fetch(keyword)
-
-    def test_tapete_fiction_course_and_jumpsuit_rejected_real_mat_retained(self, monkeypatch):
-        rows = [
-            # Ficção espanhola: o corpo menciona tapete, title/URL não.
-            ad("fiction", copy="Los papeles del divorcio estaban sobre la encimera. Me temblaban los dedos mientras recorría el borde del tapete de yoga del salón.",
-               title="Capítulo 3: El secreto", link_url="https://novela.example/capitulo-3"),
-            # Curso de professores: o corpo menciona tapete, o title só yoga.
-            ad("course", copy="Ser professora de yoga não é sobre ter uma vida perfeita. É sobre usar as ferramentas no seu tapete e saber guiar outras pessoas.",
-               title="Formação de professores de yoga", link_url="https://curso.example/formacao"),
-            # Mentoria 1:1: corpo menciona tapete.
-            ad("mentoring", copy="Guio-te no teu tapete de yoga com método e dedicação.",
-               title="Mentoria 1:1 de yoga", link_url="https://mentor.example/sessao"),
-            # Macacão (jumpsuit): o corpo fala de yoga e tapete, o produto é roupa.
-            ad("jumpsuit", copy="O Macacão Way acompanha os movimentos de yoga e te deixa livre para respirar no teu tapete.",
-               title="Macacão Way Lycra", link_url="https://moda.example/macacao-way"),
-            # Tapete real: o title tem o token (plural por prefixo).
-            ad("mat-title", copy="Tapete de yoga antiderrapante 6mm com alça",
-               title="Tapetes de yoga aveludado — oferta", link_url="https://loja.example/tapetes-de-yoga"),
-            # Tapete real: só a URL de destino tem o token (``/tapetes-de-yoga-aveludado/``).
-            ad("mat-url", copy="Tapete de yoga aveludado premium antiderrapante",
-               title="Oferta especial da semana", link_url="https://loja.example/tapetes-de-yoga-aveludado/"),
-            # App de aulas: title tem yoga mas nunca tapete.
-            ad("app", copy="Aulas de yoga online para todos os níveis",
-               title="App Yoga Life", link_url="https://app.example/yoga"),
-        ]
-        result = self._fetch(monkeypatch, "tapete yoga", rows)
-
-        assert result["ad_ids"] == ["mat-title", "mat-url"]
-        assert result["total_ads"] == 2
-        assert result["filtered_out_count"] == 5
-        assert result["filtered_inactive_count"] == 0
-        assert result["filtered_irrelevant_count"] == 5
-        assert result["relevance_policy"] == apify_ads.RELEVANCE_POLICY
-        landing_urls = {item["landing_url"] for item in result["top_ads"]}
-        assert "https://loja.example/tapetes-de-yoga-aveludado/" in landing_urls
-
-    def test_commercial_examples_retained(self, monkeypatch):
-        cases = [
-            ("caneca personalizada", "Caneca personalizada com nome", "Canecas personalizadas com nome", "https://loja.example/canecas-personalizadas"),
-            ("velas aromáticas", "Velas aromáticas naturais de soja", "Velas aromáticas premium", "https://loja.example/velas-aromaticas"),
-            ("mochila personalizada", "Mochila personalizada escolar", "Mochilas personalizadas escolares", "https://loja.example/mochilas-personalizadas"),
-        ]
-        for keyword, copy, title, url in cases:
-            result = self._fetch(
-                monkeypatch,
-                keyword,
-                [ad("1", copy=copy, title=title, snapshot_links=[{"url": url}])],
-            )
-            assert result["ad_ids"] == ["1"], keyword
-            assert result["total_ads"] == 1, keyword
-            assert result["filtered_irrelevant_count"] == 0, keyword
-
-    def test_accents_case_and_singular_plural(self, monkeypatch):
-        # Accent/case folding: a query com acentos casa com title sem acentos.
-        result = self._fetch(
-            monkeypatch,
-            "velas aromáticas",
-            [ad("1", copy="Velas aromáticas de soja", title="VELAS AROMATICAS DE SOJA")],
-        )
-        assert result["total_ads"] == 1
-        # Singular na query casa com plural no title (prefixo ``caneca``~``canecas``).
-        result = self._fetch(
-            monkeypatch,
-            "caneca personalizada",
-            [ad("1", copy="Caneca personalizada premium", title="Canecas personalizadas premium")],
-        )
-        assert result["total_ads"] == 1
-        # Plural na query casa com singular no title (prefixo ``velas``~``vela``).
-        result = self._fetch(
-            monkeypatch,
-            "velas aromáticas",
-            [ad("1", copy="Velas aromáticas artesanais", title="Vela aromática artesanal")],
-        )
-        assert result["total_ads"] == 1
-
-    def test_body_mention_alone_is_rejected(self, monkeypatch):
-        # Gate 1 passa (cobertura 100%% no corpo) mas nenhum campo de intenção
-        # comercial tem o product head → gate 2 rejeita.
-        result = self._fetch(
-            monkeypatch,
-            "caneca personalizada",
-            [ad("1", copy="Caneca personalizada no corpo do anúncio", title="Oferta da semana", link_url="https://loja.example/oferta")],
-        )
-        assert result["total_ads"] == 0
-        assert result["filtered_irrelevant_count"] == 1
-        assert result["filtered_inactive_count"] == 0
-
-    def test_pasta_vs_pastelaria_shared_prefix_rejected(self, monkeypatch):
-        """Regressão do defeito de relevância ``pasta``~``pastelaria``: o corpo
-        contém literalmente ``pasta`` (gate 1 passa), mas os campos de intenção
-        comercial (title/URL) só têm ``pastelaria`` — o prefixo partilhado não
-        satisfaz a gate 2; massas reais (``pastas`` no title) continuam a entrar
-        via variante de um só ``s``."""
-        rows = [
-            # Pastelaria: o corpo menciona literalmente ``pasta``, o title/URL só ``pastelaria``.
-            ad("pastelaria",
-               copy="Receita de pasta com legumes frescos e entrega rápida",
-               title="Pastelaria Artesanal — Bolos e Doces",
-               link_url="https://pastelaria.example/bolos"),
-            # Massa real: o corpo tem ``pasta`` e o title a variante plural ``pastas``.
-            ad("pastas",
-               copy="Pasta fresca artesanal cozida em 3 minutos",
-               title="Pastas frescas artesanais — oferta",
-               link_url="https://massa.example/pastas-frescas"),
-        ]
-        result = self._fetch(monkeypatch, "pasta", rows)
-        assert result["ad_ids"] == ["pastas"]
-        assert result["total_ads"] == 1
-        assert result["filtered_irrelevant_count"] == 1
-        assert result["filtered_inactive_count"] == 0
-
-    def test_geographic_qualifier_blocks_generic_and_keeps_real_portugal_shirt(self, monkeypatch):
-        """Defeito provado para ``camisola portugal``: camisas de compressão e
-        de clubes (Benfica/Porto) cujo title/URL não é Portugal passavam a
-        gate só porque o qualificador geográfico aparecia no corpo ou na
-        link_description ('entrega em Portugal').  O qualificador ``portugal``
-        agora só pode ser provado nos campos geo-proof: product
-        title/headline, ad creative link titles e path/domínio da URL de
-        destino — body, copy, advertiser/page name, caption e
-        link_description/ad creative link descriptions nunca o satisfazem.
-        """
-        rows = [
-            # Camisa de compressão genérica: title tem camisola, Portugal só no corpo.
-            ad("compression",
-               copy="Camisola de compressão com envio para Portugal e devoluções fáceis",
-               title="Camisola de compressão para treino",
-               link_url="https://moda.example/camisola-compressao"),
-            # Camisola do Benfica: Portugal só na link_description (entrega).
-            ad("benfica",
-               copy="Camisola oficial do Benfica com entrega em Portugal",
-               title="Camisola oficial do Benfica",
-               link_description="Entrega em Portugal em 48h",
-               link_url="https://slb.example/camisola-benfica"),
-            # Camisola do Porto: Portugal só no corpo (envio).
-            ad("porto",
-               copy="Camisola do FC Porto com envio para Portugal",
-               title="Camisola FC Porto 24/25",
-               link_url="https://porto.example/camisola-fc-porto"),
-            # Camisola real de Portugal: qualificador no title.
-            ad("title-pt",
-               copy="Camisola de Portugal premium em algodão",
-               title="Camisolas De Portugal",
-               link_url="https://loja.example/camisas"),
-            # Camisola real: qualificador só na link_description → rejeitada.
-            ad("desc-pt",
-               copy="Camisola de Portugal oficial",
-               title="Camisola oficial da seleção",
-               link_description="Camisola da seleção de Portugal",
-               link_url="https://loja.example/selecao"),
-            # Camisola real: qualificador e produto na URL de destino.
-            ad("url-pt",
-               copy="Camisola de Portugal oficial",
-               title="Oferta da semana",
-               link_url="https://sporta.example/collections/portugal/products/camisola-portugal"),
-        ]
-        result = self._fetch(monkeypatch, "camisola portugal", rows)
-
-        assert result["ad_ids"] == ["title-pt", "url-pt"]
-        assert result["total_ads"] == 2
-        assert result["filtered_out_count"] == 4
-        assert result["filtered_irrelevant_count"] == 4
-        assert result["filtered_inactive_count"] == 0
-        assert result["relevance_policy"] == apify_ads.RELEVANCE_POLICY
-        landing_urls = {item["landing_url"] for item in result["top_ads"]}
-        assert "https://sporta.example/collections/portugal/products/camisola-portugal" in landing_urls
-
-    def test_geographic_requirement_is_driven_by_the_query_not_the_ad(self, monkeypatch):
-        """Sem qualificador geográfico na query, o comportamento head-token
-        mantém-se: uma camisola de compressão genérica (mesmo a mencionar
-        Portugal no corpo) continua a passar como antes."""
-        result = self._fetch(
-            monkeypatch,
-            "camisola",
-            [ad("1",
-               copy="Camisola de compressão com envio para Portugal",
-               title="Camisolas de compressão",
-               link_url="https://moda.example/camisolas")],
-        )
-        assert result["ad_ids"] == ["1"]
-        assert result["total_ads"] == 1
-        assert result["filtered_irrelevant_count"] == 0
-
-    def test_geography_first_keyword_requires_product_head_in_commercial_fields(self, monkeypatch):
-        """A geography-first query must use ``camisolas`` as its head.
-
-        Both rows satisfy the broad relevance gate, but a Portugal travel ad
-        whose commercial title only proves Portugal must not pass; the actual
-        Portugal shirt proves both product head and geographic qualifier.
-        """
-        result = self._fetch(
-            monkeypatch,
-            "portugal camisolas",
-            [
-                ad(
-                    "unrelated-portugal",
-                    copy="Viaja por Portugal; camisolas não incluídas no passeio",
-                    title="Descobre Portugal em sete dias",
-                    link_url="https://travel.example/portugal",
-                ),
-                ad(
-                    "actual-shirt",
-                    copy="Camisolas de Portugal em algodão premium",
-                    title="Camisolas de Portugal",
-                    link_url="https://shop.example/portugal/camisolas",
-                ),
-            ],
-        )
-
-        assert result["ad_ids"] == ["actual-shirt"]
-        assert result["total_ads"] == 1
-        assert result["filtered_irrelevant_count"] == 1
-
-    def test_geographic_qualifier_accent_and_case_folding(self, monkeypatch):
-        # Case: PORTUGAL na query casa com portugal no title.
-        result = self._fetch(
-            monkeypatch,
-            "camisola PORTUGAL",
-            [ad("1", copy="Camisola de Portugal", title="Camisolas de portugal")],
-        )
-        assert result["total_ads"] == 1
-        # Acento: França na query casa com FRANCA (folded) no title.
-        result = self._fetch(
-            monkeypatch,
-            "camisola França",
-            [ad("1", copy="Camisola de França", title="Camisola oficial da seleção de França")],
-        )
-        assert result["total_ads"] == 1
-        # Qualificador no path da URL de destino → aceite.
-        result = self._fetch(
-            monkeypatch,
-            "camisola França",
-            [ad("1", copy="Camisola de França", title="Oferta da semana",
-               link_url="https://sporta.example/franca/camisola-selecao")],
-        )
-        assert result["total_ads"] == 1
-        # Qualificador só na link_description (contexto/entrega) → rejeitado.
-        result = self._fetch(
-            monkeypatch,
-            "camisola França",
-            [ad("1", copy="Camisola de compressão com entrega em França", title="Camisola de compressão",
-               link_description="Entrega em França")],
-        )
-        assert result["total_ads"] == 0
-        assert result["filtered_irrelevant_count"] == 1
-        # Acento no nome do país no ad sem qualificador no title/URL → rejeitado.
-        result = self._fetch(
-            monkeypatch,
-            "camisola brasil",
-            [ad("1", copy="Camisola com envio para o Brasil", title="Camisola de compressão")],
-        )
-        assert result["total_ads"] == 0
-        assert result["filtered_irrelevant_count"] == 1
-
-    def test_non_geographic_modifier_not_required_in_high_intent(self, monkeypatch):
-        """Modificadores não geográficos (personalizada, aromáticas) nunca são
-        exigidos nos campos de intenção comercial — mochila/caneca/velas
-        mantêm o comportamento fail-closed mas utilizável."""
-        result = self._fetch(
-            monkeypatch,
-            "caneca personalizada",
-            [ad("1", copy="Caneca personalizada com nome e entrega rápida",
-               title="Canecas da loja", link_url="https://loja.example/canecas")],
-        )
-        assert result["ad_ids"] == ["1"]
-        assert result["filtered_irrelevant_count"] == 0
-        result = self._fetch(
-            monkeypatch,
-            "velas aromáticas",
-            [ad("1", copy="Velas aromáticas naturais de soja", title="Velas artesanais",
-               link_url="https://loja.example/velas")],
-        )
-        assert result["ad_ids"] == ["1"]
-        assert result["filtered_irrelevant_count"] == 0
-        result = self._fetch(
-            monkeypatch,
-            "mochila personalizada",
-            [ad("1", copy="Mochila personalizada escolar", title="Mochilas escolares",
-               link_url="https://loja.example/mochilas")],
-        )
-        assert result["ad_ids"] == ["1"]
-        assert result["filtered_irrelevant_count"] == 0
-
-    def test_geographic_qualifiers_set_is_explicit(self):
-        assert apify_ads.GEOGRAPHIC_QUALIFIERS == frozenset({"portugal", "espanha", "franca", "brasil"})
-
-    def test_high_intent_field_list_is_explicit(self):
-        assert apify_ads.HIGH_INTENT_TEXT_FIELDS == (
-            "title",
-            "headline",
-            "link_description",
-            "ad_creative_link_titles",
-            "ad_creative_link_descriptions",
-        )
-        assert "landing_url" in apify_ads.HIGH_INTENT_URL_FIELDS
-        assert "body" not in apify_ads.HIGH_INTENT_TEXT_FIELDS
-        assert "copy" not in apify_ads.HIGH_INTENT_TEXT_FIELDS
-        # Geo-proof fields são mais estritos: link_description/ad creative link
-        # descriptions/caption nunca provam geografia.
-        assert apify_ads.GEO_PROOF_TEXT_FIELDS == ("title", "headline", "ad_creative_link_titles")
-        assert "link_description" not in apify_ads.GEO_PROOF_TEXT_FIELDS
-        assert "ad_creative_link_descriptions" not in apify_ads.GEO_PROOF_TEXT_FIELDS
-        assert "caption" not in apify_ads.GEO_PROOF_TEXT_FIELDS
-        assert "body" not in apify_ads.GEO_PROOF_TEXT_FIELDS
+    assert empty["candidate_count"] == 0
+    assert empty["candidates"] == []
+    assert empty["matching_schema_version"] == MATCHING_SCHEMA_VERSION
+    assert "total_ads" not in empty  # projeções matched-only são do matcher
 
 
 # ── Malformed numerics never raise (adapter contract: never-raise) ─────────
@@ -743,8 +465,7 @@ def test_days_active_never_raises_on_nan_inf_bool_or_garbage():
 def test_malformed_numerics_in_full_fetch_never_raise(monkeypatch):
     """O contrato do adapter é never-raise: um payload com dias/épocas
     malformados produz um resultado normalizado (0 dias ou data válida),
-    nunca uma exceção, e os ads continuam a entrar na coorte."""
-    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
+    nunca uma exceção, e os ads continuam a entrar na coorte de candidatos."""
     now = datetime.now(timezone.utc)
     rows = [
         ad("1", copy="Mochila personalizada premium", title="Mochilas personalizadas",
@@ -756,69 +477,31 @@ def test_malformed_numerics_in_full_fetch_never_raise(monkeypatch):
            start_date=float("nan"),
            end_date=float("inf")),
     ]
-    monkeypatch.setattr(apify_ads.requests, "post", lambda *a, **k: Response(200, rows))
-    result = apify_ads.fetch("mochila personalizada")
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
     assert "error" not in result
-    assert result["total_ads"] == 2
-    for item in result["top_ads"]:
+    assert result["candidate_count"] == 2
+    for item in result["candidates"]:
         assert isinstance(item["days_active"], int)
         assert item["days_active"] >= 0
         assert isinstance(item["reported_active_time"], str)
 
 
-# ── Relevance tokenizes only sanitized URL scheme/hostname/path ────────────
+# ── match_evidence tokeniza só URLs sanitizadas (scheme/hostname/path) ─────
 
-class TestSanitizedUrlRelevanceProof:
-    """A prova de relevância (product head + geografia) tokeniza só a URL
-    sanitizada (scheme/hostname/path) — nunca a query/fragment crus: uma
-    landing genérica com ``?country=portugal&query=camisola`` não satisfaz
-    prova de produto nem de geografia."""
-
-    def _fetch(self, monkeypatch, keyword, rows):
-        monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
-        monkeypatch.setattr(apify_ads.requests, "post", lambda *a, **k: Response(200, rows))
-        return apify_ads.fetch(keyword)
-
-    def test_query_parameters_never_satisfy_product_or_geo_proof(self, monkeypatch):
-        """O corpo prova ambos os tokens (gate 1) e o title prova o product
-        head; só o URL query contém ``portugal``/``camisola`` — a landing
-        genérica deve ser rejeitada pela gate 2 (geo não provado)."""
-        rows = [
-            ad("1", copy="Camisola de Portugal em algodão premium",
-               title="Camisola de algodão premium",
-               link_url="https://loja.example/produto?country=portugal&query=camisola"),
-        ]
-        result = self._fetch(monkeypatch, "camisola portugal", rows)
-        assert result["total_ads"] == 0
-        assert result["filtered_irrelevant_count"] == 1
-
-    def test_fragment_and_userinfo_never_satisfy_proof(self, monkeypatch):
-        rows = [
-            ad("1", copy="Camisola de Portugal premium",
-               title="Oferta da semana",
-               link_url="https://loja.example/item?q=camisola#portugal"),
-        ]
-        result = self._fetch(monkeypatch, "camisola portugal", rows)
-        assert result["total_ads"] == 0
-        assert result["filtered_irrelevant_count"] == 1
-
-    def test_sanitized_url_path_still_proves_product_and_geography(self, monkeypatch):
-        """O path sanitizado continua a contar: ``/portugal/camisola`` prova
-        os dois tokens mesmo com query a mais na URL crua."""
-        rows = [
-            ad("1", copy="Camisola de Portugal premium",
-               title="Oferta da semana",
-               link_url="https://loja.example/portugal/camisola?utm_source=fb&country=ES"),
-        ]
-        result = self._fetch(monkeypatch, "camisola portugal", rows)
-        assert result["ad_ids"] == ["1"]
-        assert result["total_ads"] == 1
-
-    def test_sanitized_hostname_proves_geography(self, monkeypatch):
-        rows = [
-            ad("1", copy="Camisola de Portugal premium",
-               title="Oferta da semana",
-               link_url="https://portugal.example/camisola?x=1"),
-        ]
-        result = self._fetch(monkeypatch, "camisola portugal", rows)
-        assert result["total_ads"] == 1
+def test_match_evidence_never_includes_raw_url_query_fragment_or_userinfo(monkeypatch):
+    """A prova construída pelo adapter (match_evidence) tokeniza apenas a URL
+    sanitizada — query/fragment/userinfo crus nunca entram nos campos fortes;
+    a classificação do matcher nunca vê ``?country=portugal`` nem segredos."""
+    rows = [
+        ad("1", copy="Camisola de Portugal em algodão premium",
+           title="Camisola de algodão premium",
+           link_url="https://user:pass@loja.example/produto?country=portugal&query=camisola&token=SECRET#frag"),
+    ]
+    result = _fetch(monkeypatch, "camisola portugal", rows)
+    candidate = result["candidates"][0]
+    blob = str(candidate["match_evidence"])
+    assert "country=portugal" not in blob
+    assert "SECRET" not in blob
+    assert "user:pass" not in blob
+    assert "#frag" not in blob
+    assert "https://loja.example/produto" in candidate["match_evidence"]["commercial"]

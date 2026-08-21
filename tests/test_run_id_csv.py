@@ -96,9 +96,10 @@ def test_run_id_canonical_payload_is_explicit_products_json():
         products=products,
         csv_sha256=None,
         scoring_version="1.0.0",
+        matcher_version="1.0.0",
     )
     expected = run_state.sha256_hex(
-        '{"csv_sha256":null,"date":"2026-08-02","mode":"sunday","products":'
+        '{"csv_sha256":null,"date":"2026-08-02","matcher_version":"1.0.0","mode":"sunday","products":'
         '[{"product_id":"e942e8bf7f30","research_keyword":"mochila personalizada"},'
         '{"product_id":"be385ea0e349","research_keyword":"camisola portugal"}],'
         '"scoring_version":"1.0.0"}'

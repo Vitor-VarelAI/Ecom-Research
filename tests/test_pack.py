@@ -129,8 +129,9 @@ def test_decision_and_digest_are_advisory_not_vender():
 
 
 def test_ads_section_audits_filtered_breakdown(temp_pack_dirs):
-    """O pack expõe porquê a amostra encolheu: inativos vs irrelevantes e a
-    política de relevância, sem guardar payloads brutos."""
+    """O pack expõe porquê a amostra encolheu: inativos vs irrelevantes, a
+    política de relevância e a classificação completa (candidatos/matched/
+    needs_review/rejected), sem guardar payloads brutos."""
     ads = {
         **ADS_DATA,
         "raw_ads_count": 100,
@@ -138,13 +139,20 @@ def test_ads_section_audits_filtered_breakdown(temp_pack_dirs):
         "filtered_out_count": 54,
         "filtered_inactive_count": 12,
         "filtered_irrelevant_count": 42,
-        "relevance_policy": "gate1: phrase/coverage; gate2: high-intent fields",
+        "candidate_count": 46,
+        "matched_count": 12,
+        "needs_review_count": 20,
+        "rejected_count": 14,
+        "duplicates_removed": 3,
+        "relevance_policy": "gate1: phrase/coverage; matching: matched/needs_review/rejected",
     }
     result = score.compute(TRENDS_DATA, CSV_DATA, ads)
     path = pack.generate("tapete yoga", TRENDS_DATA, CSV_DATA, ads, result)
     content = open(path, encoding="utf-8").read()
     assert "- Amostra: 100/100; capped=True" in content
-    assert "inativos=12 | irrelevantes=42 | total excluídos=54 | retidos=12" in content
+    assert "inativos=12 | irrelevantes=42 | total excluídos=54 | duplicados=3" in content
+    assert "candidatos=46 | matched=12 | needs_review=20 | rejected=14" in content
+    assert "(matched)" in content
 
 
 class TestPeakDeadline:

@@ -23,6 +23,7 @@ import requests
 from pipeline import suggestions
 from pipeline.adapters import http_errors
 from pipeline.adapters.url_sanitize import sanitize_url as _sanitize_url
+from pipeline.matching.product_ads import MATCHING_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,21 @@ REQUEST_TIMEOUT = (10, 135)
 # UTC); timestamps de ads acima disso são malformados e devolvem None.
 _MAX_EPOCH_SECONDS = 253402300799
 
-# Second (fail-closed) relevance gate: the source keyword's product-head
-# token must appear in a commercial-intent field.  Creative
-# title/headline/link-block text and the landing/destination URL are the only
-# fields that count; body/copy text alone never satisfies this gate.
+# Source-limiting relevance gate (gate 1): the query's product-head token
+# (``suggestions.product_head_token``) must appear anywhere in the broad
+# candidate text (copy + advertiser/page text), under the shared
+# exact-or-single-trailing-``s`` rule (``suggestions.tokens_equivalent``).
+# Deliberately broad: generic product mentions stay canonical candidates so
+# the matcher decides strong vs ambiguous vs rejected; geo-only/non-head
+# noise and keywords without any head token drop here.  The old second gate
+# (product-head in commercial-intent fields) no longer filters here — it
+# moved to ``pipeline.matching.product_ads``, which classifies every
+# canonical candidate this adapter persists.
+
+# Strong commercial-intent fields: creative title/headline/link-block text
+# and the landing/destination URL are the only fields that count as strong
+# proof for the product head and non-geographic meaningful tokens.
+# Body/copy text alone never satisfies strong proof.
 HIGH_INTENT_TEXT_FIELDS = (
     "title",
     "headline",
@@ -57,8 +69,8 @@ HIGH_INTENT_TEXT_FIELDS = (
 # link descriptions) and body/copy, advertiser/page name or caption text
 # never prove geographic market intent, so a Benfica or compression shirt
 # whose title and URL say nothing about Portugal but whose
-# link_description mentions delivery to Portugal must not satisfy
-# ``camisola de portugal``.
+# link_description mentions delivery to Portugal can only be classified
+# ``needs_review`` by the matcher.
 GEO_PROOF_TEXT_FIELDS = (
     "title",
     "headline",
@@ -77,43 +89,45 @@ HIGH_INTENT_URL_FIELDS = (
     "link",
 )
 
-# Folded country-name tokens that act as geographic country/market
-# qualifiers.  A query token in this set must appear in the strict
-# geo-proof fields (see ``GEO_PROOF_TEXT_FIELDS`` plus the landing/
-# destination/link URL path or domain), so ``camisola portugal`` cannot
-# be satisfied by a generic compression or Benfica shirt whose title/URL
-# is non-Portugal but whose body or link_description merely mentions
-# delivery to Portugal.  The set is deliberately small and explicit: the
-# project's core markets (PT/ES/FR) plus BR, accent/case folded; country
-# adjectives/demonyms (português/espanhol/...) are not included because
-# they describe language/origin in ad copy too loosely to prove market
-# intent, and non-geographic modifiers (personalizada, aromáticas) are
-# never required here.
-GEOGRAPHIC_QUALIFIERS = frozenset({
-    "portugal",
-    "espanha",
-    "franca",
-    "brasil",
-})
+# Weak/context text fields: body/copy, captions and advertiser/page text.
+# These prove gate-1 source relevance but never strong product intent —
+# a meaningful token present only here makes the matcher classify the
+# candidate as ``needs_review``.
+WEAK_TEXT_FIELDS = (
+    "copy",
+    "ad_creative_bodies",
+    "body",
+    "ad_text",
+    "primary_text",
+)
+
+WEAK_CONTEXT_FIELDS = (
+    "caption",
+    "ad_creative_link_captions",
+    "description",
+    "message",
+)
 
 # Structured, deterministic description of the local relevance policy so
 # artifacts can audit why a sample shrank without storing raw payloads.
+# Gate 2 is no longer a filter: every active, gate-1-relevant, deduplicated
+# ad becomes a persisted canonical candidate classified by
+# pipeline.matching.product_ads (matched / needs_review / rejected).
 RELEVANCE_POLICY = (
-    "gate1: full phrase or >=60% token coverage across copy+advertiser text; "
-    "gate2: product-head token selected by suggestions.product_head_token "
-    "(accent/case folded, exact token equality or a single trailing 's' "
-    "plural variant only — suggestions.tokens_equivalent) present in "
-    "high-intent fields "
-    "(title, headline, link_description, ad_creative_link_titles, "
-    "ad_creative_link_descriptions, landing/link/destination URLs); "
-    "every geographic country/market qualifier token (portugal, espanha, "
-    "franca, brasil; accent/case folded) must also appear in geo-proof "
-    "fields only (product title/headline, ad creative link titles, "
-    "landing/destination/link URL path or domain); body/copy, "
-    "advertiser/page name, caption and link_description/ad creative link "
-    "descriptions never satisfy geography; non-geographic modifiers are "
-    "never required; body/copy alone never satisfies gate2; "
-    "inactive ads excluded first"
+    "gate1: query product-head token (suggestions.product_head_token; "
+    "accent/case folded, exact token equality or a single trailing 's' "
+    "plural variant only — suggestions.tokens_equivalent) present anywhere "
+    "in copy + advertiser/page text; inactive ads excluded first; every "
+    "active gate-1-relevant ad becomes a canonical candidate; matching "
+    "classification (matched/needs_review/rejected) happens in "
+    "pipeline.matching.product_ads over strong commercial fields (title, "
+    "headline, link_description, ad creative link titles/descriptions, "
+    "sanitized landing/link/destination URLs) with geographic qualifiers "
+    "(portugal, espanha, franca, brasil) proven only in geo-proof fields "
+    "(product title/headline, ad creative link titles, sanitized URL "
+    "path/domain); body/copy, advertiser/page name, caption and generic "
+    "link descriptions never satisfy strong proof; non-geographic "
+    "modifiers are required in strong proof"
 )
 
 
@@ -339,48 +353,35 @@ def _geo_proof_text(ad: dict[str, Any]) -> str:
     return _fold(" ".join(part for part in parts if part))
 
 
-def _matches_high_intent(keyword: str, ad: dict[str, Any]) -> bool:
-    """Second gate: product-head token in commercial-intent fields; every
-    geographic qualifier in strict geo-proof fields.
-
-    ``suggestions.product_head_token`` selects the first source token that is
-    neither a stopword nor a geographic qualifier, so ``portugal camisolas``
-    requires ``camisolas`` in a commercial-intent field.  Each query token
-    recognized as a geographic
-    country/market qualifier (see ``GEOGRAPHIC_QUALIFIERS``) must appear
-    in the stricter geo-proof fields (product title/headline, ad creative
-    link titles, landing/destination/link URL path or domain), so
-    ``camisola portugal`` needs ``camisola`` in a commercial-intent field
-    and ``portugal`` in a geo-proof field.  Token matching uses the shared
-    ``suggestions.tokens_equivalent`` rule (exact or a single trailing
-    ``s`` — ``camisola``~``camisolas``; never arbitrary shared prefixes),
-    so ``pasta``~``pastelaria``, ``arte``~``artesa`` or ``sol``~``sola``
-    stay unrelated.  A generic compression or Benfica shirt whose
-    title/URL is non-Portugal but whose body or link_description merely
-    mentions delivery to Portugal stays rejected.  Non-geographic
-    modifiers (``personalizada``, ``aromáticas``) stay exempt —
-    mochila/caneca/velas keep their fail-closed but usable behavior.
-    """
-    query_tokens = list(dict.fromkeys(_tokens(keyword)))
-    product_head = suggestions.product_head_token(keyword)
-    if not query_tokens or product_head is None:
-        return False
-    field_tokens = list(dict.fromkeys(_tokens(_high_intent_text(ad))))
-    if not any(suggestions.tokens_equivalent(product_head, token) for token in field_tokens):
-        return False
-    geo_tokens = list(dict.fromkeys(_tokens(_geo_proof_text(ad))))
-    return all(
-        token not in GEOGRAPHIC_QUALIFIERS
-        or any(suggestions.tokens_equivalent(token, geo) for geo in geo_tokens)
-        for token in query_tokens
-    )
+def _weak_text(ad: dict[str, Any]) -> str:
+    """Folded weak/context text: body/copy, captions and advertiser/page
+    text.  Gate 1 may use it for broad source relevance, but it never proves
+    strong product intent — the matcher treats a meaningful token that
+    appears only here as ``needs_review``."""
+    parts = [
+        _as_text(_first_value(ad, *WEAK_TEXT_FIELDS)),
+        _as_text(_first_value(ad, *WEAK_CONTEXT_FIELDS)),
+        _as_text(_first_value(ad, "page_name", "advertiser", "page", "brand")),
+    ]
+    return _fold(" ".join(part for part in parts if part))
 
 
 def _is_relevant(keyword: str, ad: dict[str, Any]) -> bool:
-    query_tokens = list(dict.fromkeys(_tokens(keyword)))
-    if not query_tokens:
-        return False
+    """Gate 1 — broad source relevance: the query's product-head token must
+    appear anywhere in the broad candidate text (copy + advertiser/page
+    text), under the shared ``suggestions.tokens_equivalent`` rule.
 
+    This is deliberately broader than the old phrase/coverage gate: a
+    generic school backpack for ``mochila personalizada`` or an oxygen
+    concentrator whose body mentions a mochila both stay canonical
+    candidates so the matcher can classify strong vs ambiguous vs rejected.
+    Requiring the head keeps geo-only/non-head noise (a Portugal travel ad
+    for ``camisola portugal``) filtered here, and a keyword without any
+    head token fails closed.
+    """
+    head = suggestions.product_head_token(keyword)
+    if head is None:
+        return False
     text_parts = [
         _copy_text(ad),
         _as_text(_first_value(
@@ -398,17 +399,7 @@ def _is_relevant(keyword: str, ad: dict[str, Any]) -> bool:
         )),
     ]
     text = _fold(" ".join(text_parts))
-    text_token_string = " ".join(_tokens(text))
-    phrase = " ".join(query_tokens)
-    if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text_token_string):
-        return True
-
-    text_tokens = set(_tokens(text))
-    if len(query_tokens) == 1:
-        return query_tokens[0] in text_tokens
-
-    coverage = sum(token in text_tokens for token in query_tokens) / len(query_tokens)
-    return coverage >= 0.60
+    return any(suggestions.tokens_equivalent(head, token) for token in _tokens(text))
 
 
 def _is_ad_library_url(value: Any) -> bool:
@@ -550,6 +541,15 @@ def _normalise_ad(ad: dict[str, Any], now: datetime) -> dict[str, Any]:
         "copy": copy,
         "publisher_platforms": platforms,
         "countries": countries,
+        # Small explicit canonical matching evidence: folded strong
+        # (commercial-intent), geo-proof and weak/context text built from
+        # the normalized ad — never raw actor payloads.  The matcher
+        # classifies from these fields only.
+        "match_evidence": {
+            "commercial": _high_intent_text(ad),
+            "geo": _geo_proof_text(ad),
+            "weak": _weak_text(ad),
+        },
     }
 
 
@@ -565,15 +565,11 @@ def _empty_success(raw_count: int, filtered_out: int, duplicates_removed: int, c
         "filtered_out_count": filtered_out,
         "filtered_inactive_count": 0,
         "filtered_irrelevant_count": filtered_out,
+        "candidate_count": 0,
         "relevance_policy": RELEVANCE_POLICY,
         "duplicates_removed": duplicates_removed,
-        "total_ads": 0,
-        "ad_ids": [],
-        "top_ads": [],
-        "advertisers": [],
-        "global_market_proven": False,
-        "copy_examples": [],
-        "saturation": "baixa",
+        "matching_schema_version": MATCHING_SCHEMA_VERSION,
+        "candidates": [],
     }
 
 
@@ -606,7 +602,7 @@ def _normalise(keyword: str, raw_ads: list[dict[str, Any]]) -> dict[str, Any]:
         if _is_inactive(ad, now):
             filtered_inactive += 1
             continue
-        if not _is_relevant(keyword, ad) or not _matches_high_intent(keyword, ad):
+        if not _is_relevant(keyword, ad):
             filtered_irrelevant += 1
             continue
         normalised = _normalise_ad(ad, now)
@@ -621,40 +617,15 @@ def _normalise(keyword: str, raw_ads: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         unique[key] = ad
 
-    ads = list(unique.values())
-    duplicate_count = len(filtered) - len(ads)
-    top_ads = sorted(ads, key=lambda item: (-item["days_active"], item["ad_archive_id"], item["advertiser"]))[:3]
-
-    advertiser_groups: dict[str, dict[str, Any]] = {}
-    for ad in ads:
-        group_key = ad["page_id"] or _fold(ad["advertiser"])
-        group = advertiser_groups.setdefault(
-            group_key,
-            {
-                "page_id": ad["page_id"],
-                "page_name": ad["advertiser"],
-                "active_ads": 0,
-                "oldest_ad_days": 0,
-            },
-        )
-        group["active_ads"] += 1
-        group["oldest_ad_days"] = max(group["oldest_ad_days"], ad["days_active"])
-
-    advertisers = sorted(
-        advertiser_groups.values(),
-        key=lambda item: (-item["active_ads"], _fold(item["page_name"]), item.get("page_id", "")),
-    )[:5]
-
-    copy_examples: list[str] = []
-    seen_copies: set[str] = set()
-    for ad in top_ads + ads:
-        copy = ad.get("copy", "").strip()
-        folded = _fold(copy)
-        if copy and folded not in seen_copies:
-            seen_copies.add(folded)
-            copy_examples.append(copy)
-        if len(copy_examples) == 5:
-            break
+    # Canonical candidates: active, gate-1-relevant, deduplicated.  Capped at
+    # the sample limit (the actor never returns more than 100 rows, but the
+    # invariant is defensive for arbitrary payloads).  No product-fit
+    # filtering happens here — the matcher classifies every candidate.
+    # ``duplicates_removed`` is computed against the full unique set *before*
+    # the cap, so unique overflow is never misreported as duplicates.
+    unique_ads = list(unique.values())
+    duplicate_count = len(filtered) - len(unique_ads)
+    ads = unique_ads[:SAMPLE_LIMIT]
 
     sample_capped = len(raw_ads) >= SAMPLE_LIMIT
     return {
@@ -668,15 +639,11 @@ def _normalise(keyword: str, raw_ads: list[dict[str, Any]]) -> dict[str, Any]:
         "filtered_out_count": filtered_inactive + filtered_irrelevant,
         "filtered_inactive_count": filtered_inactive,
         "filtered_irrelevant_count": filtered_irrelevant,
+        "candidate_count": len(ads),
         "relevance_policy": RELEVANCE_POLICY,
         "duplicates_removed": duplicate_count,
-        "total_ads": len(ads),
-        "ad_ids": [ad["ad_archive_id"] for ad in ads if ad["ad_archive_id"]],
-        "top_ads": top_ads,
-        "advertisers": advertisers,
-        "global_market_proven": any(item["active_ads"] >= 5 for item in advertiser_groups.values()),
-        "copy_examples": copy_examples,
-        "saturation": "alta" if len(ads) > 50 else "média" if len(ads) >= 10 else "baixa",
+        "matching_schema_version": MATCHING_SCHEMA_VERSION,
+        "candidates": ads,
     }
 
 

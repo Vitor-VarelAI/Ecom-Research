@@ -4,6 +4,10 @@
 
 O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula de score, pesos, thresholds e labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`) não foi alterada.
 
+A entrega ativa está na branch/worktree `feature/ad-matching-evidence` (`/home/vitor/projects/Ecom-Research-ad-matching-evidence`). A pesquisa WinningHunter e o desenho desta entrega estão em `docs/winninghunter-research/` e `docs/ad-matching/`. O primeiro slice ficou implementado: o adapter Apify preserva candidatos ativos relevantes e deduplicados; `pipeline/matching/product_ads.py` classifica cada candidato como `matched`, `needs_review` ou `rejected`; score, landings, notificações e pulse consomem apenas projeções `matched`; packs novos guardam os candidatos classificados e a proveniência `matcher_version`/`matching_schema_version`. A fórmula numérica do score não mudou, mas `SCORING_VERSION` subiu porque a coorte de entrada mudou.
+
+O gate de fonte exige o product-head em qualquer texto do anúncio, incluindo copy fraca, para que falsos positivos reais cheguem ao matcher em vez de desaparecerem antes da classificação. Assim, mochila personalizada genuína fica `matched`, mochila genérica/porta-bebé fica `needs_review` quando falta prova forte de `personalizada`, e concentrador de oxigénio que apenas menciona mochila no corpo fica `rejected`. Zero candidatos ou todos rejeitados produz `DESCARTAR`; zero matched com candidatos ambíguos produz `DADOS INSUFICIENTES`. Quarta e mensal não comparam nem re-scorizam packs legados sem `matching_schema_version`; preservam-nos e explicam o skip. URLs persistidas em `candidates` e `top_ads` são sanitizadas sem mutar as URLs cruas usadas no fetch.
+
 O outbound Telegram foi implementado e é agora HTML multi-mensagem determinístico por omissão: `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos (retenção, churn/sinais e deltas de anunciantes); `monthly` envia resumo seguido dos produtos afetados. O digest plain text integral continua impresso no stdout e guardado como audit text. O renderer resolve-se por `TELEGRAM_RENDERER` — documentado em `.env.example` e default de código `html`.
 
 O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). A assinatura de erro que dispara o fallback Rich→HTML está completa e baseada em evidência (envelope oficial da Bot API, integrações open-source/live-verificadas e allowlists exatas — ver `docs/telegram-research/08-rich-fallback-signature.md`); Rich só é reativado para uma coorte de clientes compatível.
@@ -77,13 +81,11 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 
 ## Próxima sessão
 
-Não começar pela Mini App, por callbacks/long polling nem pela automação de fornecedores — o núcleo multi-mensagem HTML já está entregue. A ordem recomendada é:
+Retomar diretamente em `/home/vitor/projects/Ecom-Research-ad-matching-evidence`, sem repetir a pesquisa WinningHunter nem redesenhar o matcher. Primeiro confirmar `git status`, o último commit da branch e a suite; depois fazer um review curto do diff contra `docs/ad-matching/IMPLEMENTATION_PLAN.md`. Se não houver P0/P1, integrar a branch em `main` e publicar. Não fazer chamadas Apify/Telegram live para esta validação.
 
-1. **concluído** — duplicação visual Rich diagnosticada como incompatibilidade de renderização específica do cliente, sem double-send da aplicação (ver follow-up em `docs/telegram-research/IMPLEMENTATION_STATUS.md`); Rich permanece desativado para a coorte de clientes atual;
-2. **concluído** — assinatura de erro Rich que dispara o fallback: classificador estreito baseado em evidência, sem chamada Telegram live neste slice — 4xx definitivo consistente **e** token simbólico exato da allowlist (13) ou descrição completa normalizada exata (3); chat/auth/rate/unknown/near-match/inconsistente/5xx continuam fail-closed; Rich→HTML tenta no máximo uma vez e itens demasiado grandes para os 4096 do HTML falham fechado (`render_failed`) sem truncar (32768 Rich vs 4096 HTML). Documentado em `docs/telegram-research/08-rich-fallback-signature.md`;
-3. **concluído** — identity store canónico de produtos: `config/products.json` (`schema_version=1`) como registo operado manualmente; `product_id` imutável preservado do antigo hash de 12 hex; um `research_keyword` ativo por produto com aliases para keywords históricas (camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta); `config/keywords.txt` intacto e sem leitura em runtime; run identity por pares ordenados `(product_id, research_keyword)`; packs/manifestos novos com identidade canónica e históricos read-only; quarta/mensal por `product_id` com fallback legado→alias; token posicional desconhecido sai com exit 2 antes de qualquer chamada de fonte/rede; registo ausente ou inválido falha fechado;
-4. **próxima prioridade** — long polling e decisões (callbacks), num spike entre `python-telegram-bot` e uma implementação mínima;
-5. fornecedores/margem e Legal Gate executável entram em releases separados.
+O passo funcional seguinte é a projeção SQLite idempotente dos packs classificados e o explorer Datasette read-only. SQLPage, React, API própria, revisão manual, callbacks/long polling, fornecedores/margens e Legal Gate executável continuam fora desse próximo slice. O SQLite não substitui os packs como prova: importa-os transacionalmente, e o mesmo `run_id + product_id` com conteúdo diferente deve falhar.
+
+A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: manter regressões reais e caminhos críticos, sem matrizes de SaaS nem testes de constantes/implementação. Quando matcher, projeções matched-only, zero-match, sanitização, legado e idempotência estiverem confirmados, avançar.
 
 ## Garantias existentes a preservar
 
@@ -112,15 +114,13 @@ Não começar pela Mini App, por callbacks/long polling nem pela automação de 
 
 ## Verificação desta sessão
 
-Sessão atual (canonical product identity): baseline completo de **755 testes verdes** (`755 passed`), `compileall` sem erros, `run.py --help` e `git diff --check` limpos. Todos os testes mockam rede; não houve nenhuma chamada Telegram live nem a fornecedores neste slice. Token posicional desconhecido confirmado com exit 2 (`unknown product token`) antes de qualquer chamada de fonte/rede; registo ausente ou inválido falha fechado. Sem alterações a `.env`, dados, schema de estado, defaults do renderer, `config/keywords.txt` nem artefactos históricos — a migração apenas lê packs/manifestos/digests legados.
+A implementação de matching/evidência fechou com **760 testes verdes**, `compileall` e `git diff --check` limpos. Não houve chamadas de rede, Apify ou Telegram, nem alterações a `.env`, `config/keywords.txt`, `data/`, `packs/` ou outros artefactos históricos. A suite foi reduzida de forma deliberada depois do primeiro passe: ficaram os falsos positivos de mochila, fronteira adapter→matcher, projeções matched-only, zero-match, sanitização, proveniência/run identity e guards de legado; testes redundantes ou presos a constantes internas foram removidos.
 
-Histórico da release: o único tráfego real foi o smoke autorizado no chat de teste (na altura com **680 testes verdes**), com Rich e HTML separados por state ID e sem ler credenciais para output — Rich aceite pela API mas desativado após o diagnóstico de duplicação visual específica do cliente (mensagens 17/18 únicas num segundo cliente Telegram). A sessão anterior (fallback-signature) fechou com **65 testes focados de entrega** e **708 testes totais** verdes, sem chamadas Telegram live.
-
-Antes de qualquer alteração futura:
+Nesta worktree não existe `.venv`; usar o ambiente do repositório principal:
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
-.venv/bin/python -m compileall -q run.py pipeline
+/home/vitor/projects/Ecom-Research/.venv/bin/python -m pytest tests/ -q
+/home/vitor/projects/Ecom-Research/.venv/bin/python -m compileall -q run.py pipeline tests
 git diff --check
 ```
 

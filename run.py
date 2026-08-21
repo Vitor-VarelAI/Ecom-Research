@@ -27,6 +27,7 @@ from pipeline import provenance, quota, run_state
 from pipeline.adapters import apify_ads, keyword_csv, landing_price, serp_seo, trends
 from pipeline.adapters.url_sanitize import sanitize_ads_data
 from pipeline.delivery import telegram
+from pipeline.matching import product_ads
 from pipeline.notifications import NotificationBatch, build_batch, notification_snapshot
 from pipeline.output import pack
 from pipeline.products import (
@@ -90,7 +91,7 @@ CSV_CONSUMING_MODES = frozenset({"keyword", "all", "sunday"})
 
 
 def _compute_run_id(mode: str, products: list[Product], csv_path: str | None = None) -> str:
-    """Deterministic identity: date + mode + ordered product descriptors + CSV hash + scoring version.
+    """Deterministic identity: date + mode + ordered product descriptors + CSV hash + scoring version + matcher version.
 
     Each descriptor is the canonical ``(product_id, research_keyword)`` pair:
     renaming a product's research query changes the identity (creating a new
@@ -111,6 +112,7 @@ def _compute_run_id(mode: str, products: list[Product], csv_path: str | None = N
         ],
         csv_sha256=csv_sha,
         scoring_version=score.SCORING_VERSION,
+        matcher_version=product_ads.MATCHER_VERSION,
     )
 
 
@@ -131,6 +133,8 @@ def _begin_manifest(run_id: str, mode: str, products: list[Product], csv_path: s
         "keywords": [product.research_keyword for product in products],
         "csv_sha256": _csv_hash(csv_path) if mode in CSV_CONSUMING_MODES else None,
         "scoring_version": score.SCORING_VERSION,
+        "matcher_version": product_ads.MATCHER_VERSION,
+        "matching_schema_version": product_ads.MATCHING_SCHEMA_VERSION,
         "created_at": run_state.utc_now_iso(),
         "completed_at": None,
         "results": [],
@@ -418,6 +422,8 @@ def _run_metadata(mode: str, run_id: str, source_states: dict[str, Any]) -> dict
         "source_policies": provenance.snapshot(),
         "scoring_version": score.SCORING_VERSION,
         "scoring_config": score.scoring_config_snapshot(),
+        "matcher_version": product_ads.MATCHER_VERSION,
+        "matching_schema_version": product_ads.MATCHING_SCHEMA_VERSION,
     }
 
 
@@ -593,16 +599,24 @@ def _csv_data(csv_path: str | None, keyword: str) -> dict[str, Any]:
     return {"error": "Nenhum CSV encontrado em data/ — exporta do Google Keyword Planner e coloca em data/"}
 
 
-def _incomplete_score(trends_data: dict[str, Any], csv_data: dict[str, Any], ads_data: dict[str, Any]) -> dict[str, Any]:
+def _incomplete_score(
+    trends_data: dict[str, Any],
+    csv_data: dict[str, Any],
+    ads_data: dict[str, Any],
+    *,
+    reason: str | None = None,
+) -> dict[str, Any]:
     """Keep the unchanged numeric formula while preventing a false verdict."""
     result = score.compute(trends_data, csv_data, ads_data)
     result["label"] = "DADOS INSUFICIENTES"
-    result["reason"] = "Facebook Ad Library via Apify indisponível; repetir quando a fonte estiver disponível"
+    result["reason"] = reason or (
+        "Facebook Ad Library via Apify indisponível; repetir quando a fonte estiver disponível"
+    )
     result["incomplete"] = True
     return result
 
 
-def _forced_zero_score() -> dict[str, Any]:
+def _forced_zero_score(reason: str | None = None) -> dict[str, Any]:
     return {
         "score": 0,
         "label": "DESCARTAR",
@@ -612,8 +626,13 @@ def _forced_zero_score() -> dict[str, Any]:
             "ad_longevity": 0.0,
             "saturacao_invertida": 0.0,
         },
-        "reason": "zero ads ativos após filtragem determinística",
+        "reason": reason or "zero ads ativos após filtragem determinística",
     }
+
+
+_ZERO_CANDIDATES_REASON = "zero candidatos canónicos ativos após filtragem determinística"
+_ZERO_MATCHED_REJECTED_REASON = "zero matched (todos os candidatos rejeitados)"
+_NEEDS_REVIEW_REASON = "zero matched; candidatos ambíguos (needs_review) — revisão manual necessária"
 
 
 def run_keyword(
@@ -629,19 +648,43 @@ def run_keyword(
     the canonical identity (``product_id``/``product_name``/
     ``research_keyword``) plus ``keyword`` = the current research query.
     ``mode``/``run_id`` are additive provenance passed through to the pack.
+
+    Every successful Apify result is classified by the matcher immediately:
+    ``total_ads`` is the matched count, and the zero-match policy is
+    applied here (zero candidates => DESCARTAR; zero matched with any
+    needs_review => DADOS INSUFICIENTES; zero matched with all rejected =>
+    DESCARTAR).
     """
     keyword = product.research_keyword
     logger.info("=== INÍCIO: product_id=%s keyword=%r ===", product.product_id, keyword)
     ads_data = apify_ads.fetch(keyword)
     apify_failed = "error" in ads_data
+    if not apify_failed:
+        ads_data = product_ads.classify_ads_data(keyword, ads_data)
     if apify_failed:
         logger.warning("Apify Ads: %s", ads_data["error"])
     else:
-        logger.info("Apify Ads: total=%d saturação=%s", ads_data.get("total_ads", 0), ads_data.get("saturation"))
+        logger.info(
+            "Apify Ads: candidatos=%d matched=%d needs_review=%d rejected=%d saturação=%s",
+            ads_data.get("candidate_count", 0),
+            ads_data.get("matched_count", 0),
+            ads_data.get("needs_review_count", 0),
+            ads_data.get("rejected_count", 0),
+            ads_data.get("saturation"),
+        )
 
     # A source failure must continue the paid sources, but cannot create a
     # negative market decision.  A valid empty result takes the deterministic
-    # zero-ads branch and spends one related-query call for alternatives.
+    # zero-candidates branch and spends one related-query call for
+    # alternatives.  Candidates that exist but never match follow the
+    # zero-match policy: any needs_review keeps the decision open
+    # (DADOS INSUFICIENTES); every candidate rejected is a real negative
+    # signal (DESCARTAR).
+    #
+    # ``candidate_count`` only exists on new-format results; legacy-shaped
+    # passthrough data (test fixtures, already-finalized dicts) falls back
+    # to ``total_ads`` as the zero signal, preserving the historical
+    # zero-ads semantics.
     if apify_failed:
         landing_data = {"error": "sem dados: Apify indisponível; landing não consultada"}
         if skip_serpapi:
@@ -652,15 +695,36 @@ def run_keyword(
             seo_data = serp_seo.fetch(keyword)
         csv_data = _csv_data(csv_path, keyword)
         score_result = _incomplete_score(trends_data, csv_data, ads_data)
-    elif ads_data.get("total_ads", 0) == 0:
-        landing_data = {"error": "sem dados: zero ads; landing não consultada"}
+    elif ads_data.get("candidate_count", 0) == 0 and ads_data.get("total_ads", 0) == 0:
+        landing_data = {"error": "sem dados: zero candidatos; landing não consultada"}
         if skip_serpapi:
             trends_data = {"error": "SerpAPI não executada — modo sem rede"}
         else:
             trends_data = trends.fetch_related(keyword)
-        seo_data = {"error": "SEO não executado: zero ads ativos"}
+        seo_data = {"error": "SEO não executado: zero candidatos ativos"}
         csv_data = _csv_data(csv_path, keyword)
-        score_result = _forced_zero_score()
+        score_result = _forced_zero_score(_ZERO_CANDIDATES_REASON)
+    elif ads_data.get("total_ads", 0) == 0:
+        if ads_data.get("needs_review_count", 0) > 0:
+            # Ambiguous candidates: no negative decision, keep the gate open.
+            landing_data = {"error": "sem dados: zero matched; landing não consultada"}
+            if skip_serpapi:
+                trends_data = {"error": "SerpAPI não executada — modo sem rede"}
+                seo_data = {"error": "SEO não executado — modo sem rede"}
+            else:
+                trends_data = trends.fetch(keyword)
+                seo_data = serp_seo.fetch(keyword)
+            csv_data = _csv_data(csv_path, keyword)
+            score_result = _incomplete_score(trends_data, csv_data, ads_data, reason=_NEEDS_REVIEW_REASON)
+        else:
+            landing_data = {"error": "sem dados: zero matched (todos rejeitados); landing não consultada"}
+            if skip_serpapi:
+                trends_data = {"error": "SerpAPI não executada — modo sem rede"}
+            else:
+                trends_data = trends.fetch_related(keyword)
+            seo_data = {"error": "SEO não executado: zero matched"}
+            csv_data = _csv_data(csv_path, keyword)
+            score_result = _forced_zero_score(_ZERO_MATCHED_REJECTED_REASON)
     else:
         landing_data = landing_price.fetch_prices_from_ads(ads_data)
         if skip_serpapi:
@@ -683,9 +747,10 @@ def run_keyword(
     # Landing URL privacy: the raw landing URL (userinfo/query/fragment) was
     # consumed above exclusively by ``fetch_prices_from_ads`` for the actual
     # fetch.  From here on — result dict, pack JSON/Markdown, manifests and
-    # digests — ads_data is replaced by a copy whose ``top_ads[].landing_url``
-    # is sanitized to scheme + host + safe port + path.  The raw object is
-    # never mutated and never serialized.
+    # digests — ads_data is replaced by a deep copy whose ``landing_url`` in
+    # both ``top_ads`` and ``candidates`` is sanitized to scheme + host +
+    # safe port + path.  The raw object is never mutated and never
+    # serialized.
     ads_data = sanitize_ads_data(ads_data)
     result = {
         "product_id": product.product_id,
@@ -830,6 +895,24 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                 if not previous:
                     continue
                 previous_ads = previous.get("facebook_ads", {})
+                if not isinstance(previous_ads, dict) or previous_ads.get("matching_schema_version") != product_ads.MATCHING_SCHEMA_VERSION:
+                    # Fail-closed legacy guard: the baseline pack predates
+                    # classified candidates, so comparing ad_ids/advertisers
+                    # (matched-only semantics) against it would mix
+                    # incompatible cohorts.  Skip the pulse, preserve the
+                    # pack, never rewrite history.
+                    reason = "pack anterior sem matching_schema_version; pulse não executado (coorte incompatível)"
+                    logger.warning("Pulse %s: %s", keyword, reason)
+                    results.append({
+                        "product_id": product.product_id,
+                        "product_name": product.name,
+                        "research_keyword": keyword,
+                        "keyword": keyword,
+                        "error": reason,
+                        "ads_data": {"error": reason},
+                        "preserved": True,
+                    })
+                    continue
                 current_ads = apify_ads.fetch(keyword)
                 if "error" in current_ads:
                     logger.warning("Pulse %s: %s; pack anterior preservado", keyword, current_ads["error"])
@@ -844,6 +927,7 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                     })
                     continue
 
+                current_ads = product_ads.classify_ads_data(keyword, current_ads)
                 changes, advertiser_deltas = _compare_ads(previous_ads, current_ads)
                 cohort = _ad_cohort(previous_ads, current_ads, baseline_date=previous.get("date"))
                 # Landing URL privacy: only the actual fetch may use the raw
@@ -921,10 +1005,32 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                 previous = _load_previous_pack(product, registry=registry)
                 if not previous:
                     continue
+                previous_ads = previous.get("facebook_ads", {})
+                if not isinstance(previous_ads, dict) or previous_ads.get("matching_schema_version") != product_ads.MATCHING_SCHEMA_VERSION:
+                    # Fail-closed legacy guard: re-scoring a pack produced
+                    # under the old ads semantics (no classified candidates)
+                    # with the new scoring cohort would reinterpret
+                    # incompatible history.  Skip before spending the Trends
+                    # call, preserve the pack, never rewrite it.
+                    reason = "pack anterior sem matching_schema_version; re-score não executado (semântica de coorte incompatível)"
+                    logger.warning("Re-score %s: %s", keyword, reason)
+                    results.append({
+                        "product_id": product.product_id,
+                        "product_name": product.name,
+                        "research_keyword": keyword,
+                        "keyword": keyword,
+                        "error": reason,
+                        "preserved": True,
+                        "score_result": previous.get("score", {"score": 0, "label": "DADOS INSUFICIENTES"}),
+                        "trends_data": {"error": reason},
+                        "ads_data": previous_ads,
+                    })
+                    continue
                 trends_data = trends.fetch(keyword, timeseries_only=True, force_refresh=True)
-                ads_data = previous.get("facebook_ads", {})
+                ads_data = previous_ads
                 # Landing URL privacy: legacy packs may carry raw landing URLs;
-                # what is re-persisted in the new pack is always sanitized.
+                # what is re-persisted in the new pack is always sanitized
+                # (candidates + top_ads).
                 ads_data = sanitize_ads_data(ads_data)
                 csv_data = previous.get("keyword_planner", {})
                 seo_data = previous.get("seo", {})
