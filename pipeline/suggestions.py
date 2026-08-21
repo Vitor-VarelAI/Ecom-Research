@@ -208,6 +208,15 @@ def is_stopword(token: str) -> bool:
     return token in _PRODUCT_STOPWORDS
 
 
+def is_geographic_qualifier(token: str) -> bool:
+    """True when a folded token is a geographic qualifier (country,
+    demonym, region or major city).  It can never be the product head and
+    never counts as meaningful product evidence outside the strict core
+    markets — the matcher requires geo proof only for the four core markets
+    (PT/ES/FR/BR)."""
+    return token in _GEO_QUALIFIERS
+
+
 def product_head_token(source_keyword: str) -> str | None:
     """Deterministic product-head token for a source keyword.
 

@@ -928,12 +928,20 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                     continue
 
                 current_ads = product_ads.classify_ads_data(keyword, current_ads)
+                # Derived-value privacy: both the compatible previous baseline
+                # and the freshly classified current ads are sanitized *before*
+                # the compare/cohort algebra, so page-name fallback advertiser
+                # identities and the changes/advertiser_deltas/cohort they
+                # produce can never carry raw embedded URL credentials/query/
+                # fragments from a legacy or hostile page_name/advertiser.
+                # Landing URL privacy holds too: only the actual fetch may use
+                # the raw landing URL; what is persisted in the result/pack/
+                # checkpoint is the sanitized copy (scheme + host + safe port
+                # + path) — the sanitized current ads continue into result/pack.
+                previous_ads = sanitize_ads_data(previous_ads)
+                current_ads = sanitize_ads_data(current_ads)
                 changes, advertiser_deltas = _compare_ads(previous_ads, current_ads)
                 cohort = _ad_cohort(previous_ads, current_ads, baseline_date=previous.get("date"))
-                # Landing URL privacy: only the actual fetch may use the raw
-                # landing URL.  What is persisted in the result/pack/checkpoint
-                # is the sanitized copy (scheme + host + safe port + path).
-                current_ads = sanitize_ads_data(current_ads)
                 trends_data = previous.get("trends", {})
                 csv_data = previous.get("keyword_planner", {})
                 seo_data = previous.get("seo", {})
@@ -1023,7 +1031,11 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                         "preserved": True,
                         "score_result": previous.get("score", {"score": 0, "label": "DADOS INSUFICIENTES"}),
                         "trends_data": {"error": reason},
-                        "ads_data": previous_ads,
+                        # Fail-closed error-only shape (como no pulse de quarta):
+                        # o ``facebook_ads`` histórico cru — que pode conter
+                        # landing URLs não sanitizadas de packs legados — nunca
+                        # entra no result/manifest/digest.
+                        "ads_data": {"error": reason},
                     })
                     continue
                 trends_data = trends.fetch(keyword, timeseries_only=True, force_refresh=True)

@@ -205,6 +205,44 @@ def test_wednesday_emits_ad_cohort_to_pack_and_results(monkeypatch, tmp_path, ca
     assert "Sinais: high_churn, concentrated_market" in digest
 
 
+def test_wednesday_pulse_derived_values_never_leak_page_name_url_secrets(monkeypatch, tmp_path, capsys):
+    """Regression: um anunciante matched sem page_id cujo page_name/advertiser
+    embute uma URL com credenciais não pode fazer vazar userinfo/query/fragment
+    para os valores derivados do pulse (changes/advertiser_deltas/ad_cohort)
+    nem para o ads_data persistido — o baseline anterior compatível e os ads
+    atuais são sanitizados *antes* da álgebra compare/cohort."""
+    _write_previous(tmp_path)
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    secret_page = "Loja Ágil https://user:pass@evil.test/loja?token=WEDNESDAY_SECRET#frag"
+    candidate = classified_ads_data()["candidates"][0]
+    candidate["ad_archive_id"] = "a2"
+    candidate["page_id"] = ""
+    candidate["advertiser"] = secret_page
+    current = classified_ads_data(candidates=[candidate])
+    monkeypatch.setattr(run.apify_ads, "fetch", lambda keyword: current)
+    generated = []
+    monkeypatch.setattr(run.pack, "generate", lambda **kwargs: generated.append(kwargs) or "pack.md")
+
+    results = run._run_wednesday(send=False)
+
+    result = results[0]
+    cohort = result["ad_cohort"]
+    # A identidade fallback por page_name (sem page_id) chega sanitizada aos
+    # valores derivados — host/path seguro sim, segredos nunca.
+    assert any("loja agil https://evil.test/loja" in key for key in cohort["current_advertisers"])
+    blob = json.dumps(result, ensure_ascii=False)
+    for secret in ("WEDNESDAY_SECRET", "user:pass", "?token=", "#frag"):
+        assert secret not in blob
+    # changes/advertiser_deltas nunca carregam o segredo.
+    assert all("WEDNESDAY_SECRET" not in str(item) for item in result["advertiser_deltas"])
+    # O pack recebe exatamente o mesmo ads_data sanitizado.
+    assert generated and generated[0]["ads_data"] is result["ads_data"]
+    # O digest (stdout) também nunca expõe o segredo.
+    out = capsys.readouterr().out
+    assert "WEDNESDAY_SECRET" not in out
+    assert "user:pass" not in out
+
+
 def _ads(ad_ids, advertisers, total_ads):
     return {"total_ads": total_ads, "ad_ids": ad_ids, "advertisers": advertisers}
 
@@ -537,5 +575,60 @@ def test_monthly_skips_legacy_baseline_pack_fail_closed(monkeypatch, tmp_path, c
     assert len(results) == 1
     assert results[0]["preserved"] is True
     assert "matching_schema_version" in results[0]["error"]
+    # Fail-closed error-only ads_data shape (como no pulse de quarta): o
+    # ``facebook_ads`` histórico cru nunca entra no resultado preservado.
+    assert results[0]["ads_data"] == {"error": results[0]["error"]}
     out = capsys.readouterr().out
     assert "matching_schema_version" in out
+
+
+def test_monthly_legacy_preserved_result_never_carries_raw_historical_ads(monkeypatch, tmp_path):
+    """Regression: quando o pack anterior não tem matching_schema_version e o
+    seu ``facebook_ads`` histórico contém uma landing crua com credenciais/
+    query/fragment, o resultado preservado do re-score mensal usa o shape
+    error-only — nenhum URL histórico cru entra no result, no manifest nem no
+    digest."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    legacy_ads = {
+        **ADS,
+        "top_ads": [{
+            "ad_archive_id": "a1",
+            "advertiser": "Loja",
+            "page_id": "p1",
+            "days_active": 30,
+            "landing_url": "https://user:pass@shop.example/x?token=LEGACY_SECRET#frag",
+        }],
+    }
+    previous = {
+        "keyword": "mochila",
+        "date": date.today().isoformat(),
+        "score": {"score": 50, "label": "OBSERVAR", "breakdown": {}},
+        "trends": TRENDS,
+        "keyword_planner": CSV,
+        "facebook_ads": legacy_ads,
+        "seo": SEO,
+        "landing_price": {"price_range": {"min": 10, "max": 20}},
+        "suggested_keywords": [],
+    }
+    (data_dir / f"{date.today().isoformat()}--mochila.json").write_text(json.dumps(previous), encoding="utf-8")
+    write_registry(tmp_path, ["mochila"])
+    monkeypatch.setattr(run, "REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(run.trends, "fetch", lambda *a, **k: TRENDS)
+    monkeypatch.setattr(run.pack, "generate", lambda **kwargs: "pack.md")
+
+    results = run._run_monthly(send=False)
+
+    assert results[0]["preserved"] is True
+    assert results[0]["ads_data"] == {"error": results[0]["error"]}
+    blob = json.dumps(results, ensure_ascii=False)
+    for secret in ("LEGACY_SECRET", "user:pass", "#frag", "?token="):
+        assert secret not in blob
+    # O estado persistido (manifest + digest) também nunca carrega o URL cru.
+    runs_dir = tmp_path / "data" / "runs"
+    manifests = [json.loads(p.read_text(encoding="utf-8")) for p in runs_dir.glob("*.json")]
+    assert len(manifests) == 1
+    manifest_blob = json.dumps(manifests[0], ensure_ascii=False)
+    assert "LEGACY_SECRET" not in manifest_blob
+    assert "user:pass" not in manifest_blob
+    assert "#frag" not in manifest_blob

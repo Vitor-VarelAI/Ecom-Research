@@ -117,13 +117,15 @@ def _evidence_text(candidate: dict[str, Any], key: str) -> str:
 def _meaningful_tokens(keyword: str) -> list[str]:
     """Deduped, order-preserved query tokens that must be proven in strong
     fields: every token that is neither a PT/EN stopword nor a geographic
-    qualifier.  The first entry is the product head (same selection rule as
-    ``suggestions.product_head_token`` for the non-degenerate case)."""
+    qualifier (all of ``suggestions._GEO_QUALIFIERS``, exposed via
+    ``suggestions.is_geographic_qualifier``).  The first entry is the
+    product head (same selection rule as
+    ``suggestions.product_head_token``)."""
     tokens = list(dict.fromkeys(_tokens(keyword)))
     return [
         token
         for token in tokens
-        if token not in GEOGRAPHIC_QUALIFIERS and not suggestions.is_stopword(token)
+        if not suggestions.is_geographic_qualifier(token) and not suggestions.is_stopword(token)
     ]
 
 
@@ -142,7 +144,10 @@ def classify_candidate(keyword: str, candidate: dict[str, Any]) -> dict[str, Any
     """
     query_tokens = list(dict.fromkeys(_tokens(keyword)))
     meaningful = _meaningful_tokens(keyword)
-    head = meaningful[0] if meaningful else suggestions.product_head_token(keyword)
+    # O head é sempre selecionado pela regra partilhada de suggestions (que
+    # já exclui todos os qualificadores geográficos — países, gentílicos,
+    # regiões e cidades): ``lisboa mochila`` nunca escolhe Lisboa como head.
+    head = suggestions.product_head_token(keyword)
     geo_tokens = [token for token in query_tokens if token in GEOGRAPHIC_QUALIFIERS]
     other_tokens = [token for token in meaningful if token != head]
 
@@ -214,14 +219,40 @@ def classify_candidate(keyword: str, candidate: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _is_projectable_candidate(candidate: Any) -> bool:
+    """Minimal canonical/projectable shape check, applied *before*
+    classification.  Adapter candidates always carry string
+    ``ad_archive_id``/``advertiser``/``page_id``/``copy`` and string
+    ``landing_url``/``link`` (the raw landing may be empty, but it is never
+    a dict/int/list), numeric non-bool ``days_active`` and dict-or-string
+    ``match_evidence``; a candidate that passes this check can be classified
+    and, if matched, projected (``_matched_projections`` reads exactly those
+    fields) without crashing.  Anything else — non-dicts and malformed
+    dicts alike — is dropped, so a truthy dict/int/list ``landing_url`` or
+    ``link`` can never become ``matched``, reach ``landing_price``/sort/group
+    code as a non-string, and crash or persist raw URL material."""
+    if not isinstance(candidate, dict):
+        return False
+    for key in ("ad_archive_id", "advertiser", "page_id", "copy", "landing_url", "link"):
+        if not isinstance(candidate.get(key), str):
+            return False
+    days_active = candidate.get("days_active")
+    if isinstance(days_active, bool) or not isinstance(days_active, (int, float)):
+        return False
+    return isinstance(candidate.get("match_evidence"), (dict, str))
+
+
 def classify_candidates(keyword: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return a deep copy of ``candidates`` with a ``match`` verdict attached
-    to each (deterministic, JSON-safe).  The input list and dicts are never
-    mutated."""
+    to each (deterministic, JSON-safe).  Entries that are not dicts or that
+    lack the minimal canonical/projectable shape
+    (``_is_projectable_candidate``) are dropped — they can never be
+    classified, and a malformed dict that somehow matched would crash
+    ``_matched_projections`` — and the result is capped at
+    ``CANDIDATE_CAP``.  The input list and dicts are never mutated."""
     classified: list[dict[str, Any]] = []
     for candidate in candidates:
-        if not isinstance(candidate, dict):
-            classified.append(copy.deepcopy(candidate))
+        if not _is_projectable_candidate(candidate):
             continue
         clean = copy.deepcopy(candidate)
         clean["match"] = classify_candidate(keyword, clean)
@@ -322,6 +353,10 @@ def classify_ads_data(keyword: str, ads_data: dict[str, Any]) -> dict[str, Any]:
     classified = classify_candidates(keyword, candidates)
     result = copy.deepcopy(ads_data)
     result["candidates"] = classified
+    # Recomputed from the capped classified list so the persisted count
+    # always agrees with ``candidates`` (malformed entries dropped, cap
+    # applied).
+    result["candidate_count"] = len(classified)
     result["matcher_version"] = MATCHER_VERSION
     result.update(_classification_counts(classified))
     result.update(_matched_projections(classified))

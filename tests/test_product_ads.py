@@ -14,6 +14,7 @@ overlapping immutability/determinism tests are deliberately not kept here.
 
 from __future__ import annotations
 
+import copy
 import json
 
 from pipeline.matching import product_ads
@@ -388,6 +389,113 @@ class TestClassifyAdsData:
         assert classify_ads_data("kw", error) == error
         no_candidates = {"total_ads": 1, "top_ads": [], "advertisers": []}
         assert classify_ads_data("kw", no_candidates) == no_candidates
+
+    def test_malformed_candidates_are_dropped_and_counts_agree(self):
+        """Entradas não-dict na lista de candidatos são ignoradas (nunca
+        copiadas para valores que depois crasham no ``.get``); as contagens
+        persistidas refletem apenas os candidatos reais."""
+        ads = self._ads()
+        ads["candidates"] = [None, "texto", 42, ["lista"], ads["candidates"][0]]
+        result = classify_ads_data("mochila personalizada", ads)
+        assert len(result["candidates"]) == 1
+        assert result["candidate_count"] == 1
+        assert all(isinstance(item, dict) for item in result["candidates"])
+        assert result["matched_count"] == 1
+
+    def test_malformed_dict_candidates_with_strong_evidence_are_dropped(self):
+        """Regression: um dict com prova forte mas sem os campos mínimos de
+        projeção (ou com tipos errados) é descartado como um não-dict — nunca
+        pode ficar ``matched`` e crashar ``_matched_projections`` no sort/group
+        de ``days_active``/``ad_archive_id``/``advertiser``/``page_id``.  O
+        ``candidate_count`` persistido é recomputado da lista classificada,
+        por isso concorda sempre com ``candidates``."""
+        strong = candidate(
+            "strong",
+            copy="Mochila personalizada premium",
+            commercial="mochilas personalizadas premium",
+            geo="mochilas personalizadas",
+            weak="mochila personalizada premium",
+        )
+        malformed = [
+            ("sem days_active", lambda c: c.pop("days_active")),
+            ("days_active string", lambda c: c.update(days_active="30")),
+            ("days_active bool", lambda c: c.update(days_active=True)),
+            ("ad_archive_id int", lambda c: c.update(ad_archive_id=42)),
+            ("sem advertiser", lambda c: c.pop("advertiser")),
+            ("sem copy", lambda c: c.pop("copy")),
+            ("match_evidence lista", lambda c: c.update(match_evidence=["x"])),
+            ("landing_url dict", lambda c: c.update(landing_url={"url": "https://x.test/p"})),
+            ("landing_url int", lambda c: c.update(landing_url=42)),
+            ("landing_url list", lambda c: c.update(landing_url=["https://x.test/p"])),
+            ("landing_url bool", lambda c: c.update(landing_url=True)),
+            ("sem landing_url", lambda c: c.pop("landing_url")),
+            ("link dict", lambda c: c.update(link={"url": "https://x.test"})),
+            ("link int", lambda c: c.update(link=42)),
+            ("sem link", lambda c: c.pop("link")),
+        ]
+        for name, mutate in malformed:
+            bad = copy.deepcopy(strong)
+            mutate(bad)
+            ads = self._ads()
+            ads["candidates"] = [bad, ads["candidates"][0]]
+            result = classify_ads_data("mochila personalizada", ads)
+            assert len(result["candidates"]) == 1, name
+            assert result["candidate_count"] == 1, name
+            assert result["candidates"][0]["ad_archive_id"] == "m0", name
+            assert result["matched_count"] == 1, name
+
+    def test_over_cap_candidates_are_capped_and_count_agrees(self):
+        """Mais de 100 candidatos são limitados ao cap e o
+        ``candidate_count`` persistido é recomputado a partir da lista
+        classificada (concorda com ``candidates``)."""
+        many = [
+            candidate(str(i), commercial="mochilas personalizadas",
+                      geo="mochilas personalizadas", weak="x")
+            for i in range(150)
+        ]
+        result = classify_ads_data("mochila personalizada", self._ads(candidates=many, raw_ads_count=150))
+        assert len(result["candidates"]) == product_ads.CANDIDATE_CAP
+        assert result["candidate_count"] == product_ads.CANDIDATE_CAP
+        assert result["matched_count"] == product_ads.CANDIDATE_CAP
+
+
+# ── Query liderada por cidade: head e geo_tokens canónicos ─────────────────
+
+
+class TestCityLedQuery:
+    """Um qualificador geográfico de suggestions (ex.: Lisboa) nunca é o head
+    nem um geo_token estrito — só os quatro mercados core (PT/ES/FR/BR) são
+    ``geo_tokens`` exigidos; a cidade também não fica como token meaningful
+    que precise de prova."""
+
+    def test_city_led_query_selects_product_head_and_matches(self):
+        ad = candidate(
+            "city",
+            copy="Mochila personalizada com entrega em Lisboa",
+            commercial="mochilas personalizadas",
+            geo="mochilas personalizadas",
+            weak="mochila personalizada com entrega em lisboa",
+        )
+        verdict = _verdict("lisboa mochila", ad)
+        assert verdict["head_token"] == "mochila"
+        assert verdict["geo_tokens"] == []
+        assert verdict["missing_tokens"] == []
+        assert verdict["label"] == "matched"
+
+    def test_city_token_is_never_a_meaningful_requirement(self):
+        """Um anúncio que prova o produto mas não menciona Lisboa não é
+        rejeitado por a cidade faltar: ``lisboa`` sai dos tokens
+        significativos (qualificador geográfico) e não é geo_token estrito."""
+        ad = candidate(
+            commercial="mochilas personalizadas premium",
+            geo="mochilas personalizadas",
+            weak="mochila personalizada premium",
+        )
+        verdict = _verdict("mochila lisboa", ad)
+        assert verdict["head_token"] == "mochila"
+        assert verdict["geo_tokens"] == []
+        assert verdict["missing_tokens"] == []
+        assert verdict["label"] == "matched"
 
 
 def json_dumps(value) -> str:

@@ -10,6 +10,7 @@ classification (matched / needs_review / rejected) moved to
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -505,3 +506,273 @@ def test_match_evidence_never_includes_raw_url_query_fragment_or_userinfo(monkey
     assert "user:pass" not in blob
     assert "#frag" not in blob
     assert "https://loja.example/produto" in candidate["match_evidence"]["commercial"]
+
+
+# ── URLs embutidas em texto livre nunca se tornam prova nem persistem ──────
+
+
+def test_embedded_url_secrets_never_persist_in_evidence_or_copy(monkeypatch):
+    """Tokens/segredos dentro de URLs http(s) embutidas em title,
+    link_description ou copy nunca chegam ao JSON canónico do candidato nem
+    ao match_evidence: userinfo/query/fragment são removidos, o
+    scheme/host/path seguro fica e o texto envolvente sobrevive."""
+    rows = [
+        ad(
+            "1",
+            copy="Compre a mochila em https://user:pass@loja.example/produto?token=SECRET1&utm_source=fb#top",
+            title="Mochilas premium em https://loja.example/produto?campanha=SECRET2",
+            link_description="Envio rápido — https://loja.example/outro?api_key=SECRET3",
+        ),
+    ]
+    result = _fetch(monkeypatch, "mochila", rows)
+    candidate = result["candidates"][0]
+    blob = json.dumps(candidate)
+    for secret in ("SECRET1", "SECRET2", "SECRET3"):
+        assert secret not in blob
+    assert "user:pass" not in blob
+    assert "utm_source=fb" not in blob
+    assert "campanha=" not in blob
+    assert "#top" not in blob
+    # Scheme/host/path seguros permanecem na prova forte.
+    assert "https://loja.example/produto" in candidate["match_evidence"]["commercial"]
+    assert "https://loja.example/outro" in candidate["match_evidence"]["commercial"]
+    # O copy canónico persistido também é sanitizado (texto envolvente intacto).
+    assert "SECRET1" not in candidate["copy"]
+    assert "https://loja.example/produto" in candidate["copy"]
+    assert "Compre a mochila em" in candidate["copy"]
+
+
+def test_embedded_url_query_tokens_cannot_fabricate_matched_proof(monkeypatch):
+    """Tokens em query de URLs embutidas (country=portugal, camisola) não
+    podem fabricar prova forte nem geo: após sanitização a evidência só tem o
+    host/path seguro, por isso um anúncio cujos únicos tokens 'camisola'/
+    'portugal' vivem numa query é rejeitado pelo matcher."""
+    rows = [
+        ad(
+            "1",
+            copy="Sem mochila nem camisolas à venda",
+            title="Oferta especial https://loja.example/produto?country=portugal&camisola=desconto&token=SECRET",
+            link_description="",
+        ),
+    ]
+    result = _fetch(monkeypatch, "camisola portugal", rows)
+    candidate = result["candidates"][0]
+    commercial = candidate["match_evidence"]["commercial"]
+    assert "camisola" not in commercial
+    assert "portugal" not in commercial
+    assert "SECRET" not in json.dumps(candidate)
+    classified = product_ads.classify_ads_data("camisola portugal", result)
+    assert classified["candidates"][0]["match"]["label"] == "rejected"
+
+
+# ── Query liderada por cidade: o head é o produto, nunca a cidade ──────────
+
+
+def test_city_led_query_head_agreement(monkeypatch):
+    """Regression: ``lisboa mochila`` deve escolher ``mochila`` como head no
+    adapter (gate 1) e no matcher — Lisboa (qualificador geográfico de
+    suggestions) nunca é o head nem bloqueia a classificação."""
+    rows = [
+        ad("1", copy="Mochila personalizada com entrega em Lisboa",
+           title="Mochilas personalizadas",
+           link_url="https://loja.example/mochila-personalizada"),
+        ad("2", copy="Visita Lisboa com guia turístico",
+           title="Férias em Lisboa", page_name="Agência de Viagens"),
+    ]
+    result = _fetch(monkeypatch, "lisboa mochila", rows)
+    # Gate 1 mantém apenas o anúncio cujo texto tem o head (mochila).
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["ad_archive_id"] == "1"
+    assert result["filtered_irrelevant_count"] == 1
+    classified = product_ads.classify_ads_data("lisboa mochila", result)
+    verdict = classified["candidates"][0]["match"]
+    assert verdict["head_token"] == "mochila"
+    assert verdict["label"] == "matched"
+
+
+# ── Dedup de fallback usa a landing sanitizada (sem query de tracking) ─────
+
+
+def test_no_id_ads_differing_only_by_tracking_query_deduplicate(monkeypatch):
+    """Dois anúncios sem ID e sem URL da Ad Library cujas landings diferem
+    só na query de tracking colapsam num candidato via a landing sanitizada
+    (scheme/host/path); o sobrevivente mantém a landing URL crua intacta para
+    o fetch posterior."""
+    rows = [
+        ad(None, copy="Mochila personalizada mesma", ad_snapshot_url="",
+           snapshot_links=[{"url": "https://loja.example/produto?utm_source=fb-a&gclid=111"}]),
+        ad(None, copy="Mochila personalizada mesma", ad_snapshot_url="",
+           snapshot_links=[{"url": "https://loja.example/produto?utm_source=fb-b&gclid=222"}]),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+    assert result["candidate_count"] == 1
+    assert result["duplicates_removed"] == 1
+    survivor = result["candidates"][0]
+    # A URL crua do sobrevivente nunca é mutada pela deduplicação.
+    assert survivor["landing_url"] == "https://loja.example/produto?utm_source=fb-a&gclid=111"
+
+
+# ── Landing URL com scheme maiúsculo: aceite e mantida crua ───────────────
+
+
+def test_landing_url_accepts_uppercase_scheme_and_keeps_raw_url(monkeypatch):
+    """Regression review-3: ``HTTPS://``/``HTTP://`` são esquemas de landing
+    válidos (case-insensitive) e a URL crua original é retida sem mutação
+    para o fetch posterior — a sanitização só acontece na fronteira final de
+    persistência (``sanitize_ads_data``)."""
+    from pipeline.adapters.url_sanitize import sanitize_ads_data
+
+    raw = "HTTPS://loja.example/produto?utm_source=fb&token=RAW_SECRET#frag"
+    rows = [
+        ad("1", copy="Mochila personalizada premium",
+           snapshot_links=[{"url": raw}]),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+
+    assert result["candidate_count"] == 1
+    # O candidato retém a URL crua exata (scheme maiúsculo, query, fragment)
+    # antes da sanitização final — o fetch consome-a como veio.
+    assert result["candidates"][0]["landing_url"] == raw
+
+    # Na fronteira final de persistência a URL é reduzida a scheme/host/path.
+    clean = sanitize_ads_data(result)
+    assert clean["candidates"][0]["landing_url"] == "https://loja.example/produto"
+    assert "RAW_SECRET" not in json.dumps(clean)
+    assert "utm_source=fb" not in json.dumps(clean)
+    assert "#frag" not in json.dumps(clean)
+
+
+# ── Gate 1 agrega todos os campos de texto relevantes ───────────────────────
+
+
+def test_gate1_title_head_not_masked_by_unrelated_body_or_page_name(monkeypatch):
+    """Regression: o gate 1 agrega *todos* os campos de texto relevantes em
+    vez de ``_first_value`` — um body e um page_name não relacionados não
+    podem mascarar um head válido no title/headline/link block."""
+    rows = [
+        ad("title-head", copy="Oferta da semana em eletrónica",
+           title="Mochilas personalizadas premium", page_name="Tech Store"),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+    assert result["candidate_count"] == 1
+    assert result["filtered_irrelevant_count"] == 0
+    assert result["candidates"][0]["ad_archive_id"] == "title-head"
+
+
+def test_gate1_head_only_in_embedded_url_query_is_not_relevant(monkeypatch):
+    """Regression: URLs http(s) embutidas em texto livre são sanitizadas
+    antes da tokenização do gate 1 — um head que só existe na query de uma
+    URL embutida (``?mochila=desconto``) nunca fabrica relevância de fonte."""
+    rows = [
+        ad("url-query", copy="Oferta especial https://loja.example/produto?mochila=desconto",
+           title=""),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+    assert result["candidate_count"] == 0
+    assert result["filtered_irrelevant_count"] == 1
+    assert result["candidates"] == []
+
+
+# ── _stable_key: URLs distintas da Ad Library nunca colapsam ────────────────
+
+
+def test_no_id_ads_with_distinct_ad_library_urls_stay_distinct(monkeypatch):
+    """Regression: URLs distintas da Ad Library identificam creatives
+    distintas mesmo sem ``ad_id`` — dois anúncios sem ID, com URLs de
+    snapshot diferentes e a mesma landing sanitizada continuam dois
+    candidatos (colapsá-los subcontaria creatives separadas).  O fallback de
+    dedup por landing sanitizada só se aplica quando faltam ambos o ID e a
+    identidade Ad Library."""
+    rows = [
+        ad(None, copy="Mochila personalizada criativo A",
+           ad_snapshot_url="https://www.facebook.com/ads/library/?id=AAA",
+           snapshot_links=[{"url": "https://loja.example/produto?utm_source=fb-a"}]),
+        ad(None, copy="Mochila personalizada criativo B",
+           ad_snapshot_url="https://www.facebook.com/ads/library/?id=BBB",
+           snapshot_links=[{"url": "https://loja.example/produto?utm_source=fb-b"}]),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+    assert result["candidate_count"] == 2
+    assert result["duplicates_removed"] == 0
+    assert [item["ad_archive_id"] for item in result["candidates"]] == ["", ""]
+    # As landings cruas coincidem na forma sanitizada, mas a identidade Ad
+    # Library (URL de snapshot distinta) tem precedência na chave estável.
+    assert {item["link"] for item in result["candidates"]} == {
+        "https://www.facebook.com/ads/library/?id=AAA",
+        "https://www.facebook.com/ads/library/?id=BBB",
+    }
+
+
+# ── Hosts da Ad Library: allowlist exata, nunca sufixo ──────────────────────
+
+
+def test_is_ad_library_url_uses_exact_facebook_host_allowlist():
+    """Regression: ``_is_ad_library_url`` usa a mesma allowlist exata de hosts
+    que ``_is_facebook_library_link`` — ``evilfacebook.com`` (sufixo
+    ``facebook.com``) nunca é confundido com a Ad Library pública."""
+    for value in (
+        "https://www.facebook.com/ads/library/?id=1",
+        "https://facebook.com/ads/library/?id=1",
+        "https://m.facebook.com/ads/library/?id=1",
+    ):
+        assert apify_ads._is_ad_library_url(value) is True, value
+        assert apify_ads._is_facebook_library_link(value) is True, value
+    for value in (
+        "https://evilfacebook.com/ads/library/?id=1",
+        "https://notfacebook.com/ads/library/?id=1",
+        "https://www.facebook.com.evil.test/ads/library/?id=1",
+        "https://facebook.com/landing",
+        "not a url",
+        "",
+        42,
+    ):
+        assert apify_ads._is_ad_library_url(value) is False, value
+        assert apify_ads._is_facebook_library_link(value) is False, value
+
+
+def test_evilfacebook_library_link_is_a_landing_not_a_reference(monkeypatch):
+    """Regression: um ``ad_snapshot_url``/link ``evilfacebook.com/ads/library``
+    não é uma referência da Ad Library — é tratado como landing (nunca
+    excluído como link de biblioteca), e o ``link`` canónico do candidato só é
+    emitido para os hosts exatos da Ad Library."""
+    rows = [
+        ad(None, copy="Mochila personalizada premium",
+           ad_snapshot_url="https://evilfacebook.com/ads/library/?id=EVIL",
+           snapshot_links=[{"url": "https://evilfacebook.com/ads/library/?id=EVIL"}]),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+    assert result["candidate_count"] == 1
+    # Nem ``_is_ad_library_url`` nem ``_is_facebook_library_link`` reconhecem
+    # o host malicioso como referência pública da Ad Library.
+    assert apify_ads._is_ad_library_url("https://evilfacebook.com/ads/library/?id=EVIL") is False
+    assert apify_ads._is_facebook_library_link("https://evilfacebook.com/ads/library/?id=EVIL") is False
+    # O link da Ad Library não é fabricado a partir do host malicioso: sem
+    # ad_id e com snapshot não-Facebook, o link canónico fica vazio.
+    assert result["candidates"][0]["link"] == ""
+    # A landing ``evilfacebook.com/ads/library`` sobrevive crua para o fetch.
+    assert result["candidates"][0]["landing_url"] == "https://evilfacebook.com/ads/library/?id=EVIL"
+
+
+# ── Gate 1: o path seguro de uma landing contribui o head ───────────────────
+
+
+def test_gate1_head_in_sanitized_landing_url_path_is_relevant(monkeypatch):
+    """Regression: o gate 1 inclui os valores de URL de alta intenção
+    sanitizados (scheme/host/path) — um head que só existe no path de uma
+    landing segura (``/mochilas-personalizadas``) chega ao matcher; o mesmo
+    head numa query (``?mochila=desconto``) continua a não fabricar
+    relevância de fonte."""
+    rows = [
+        ad("url-path", copy="Oferta especial da semana", title="",
+           link_url="https://loja.example/mochilas-personalizadas"),
+        ad("url-query", copy="Oferta especial da semana", title="",
+           link_url="https://loja.example/produto?mochila=desconto"),
+    ]
+    result = _fetch(monkeypatch, "mochila personalizada", rows)
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["ad_archive_id"] == "url-path"
+    assert result["filtered_irrelevant_count"] == 1
+    # O candidato sobrevivente mantém a landing crua para o fetch; só a prova
+    # de relevância usa o path seguro.
+    assert result["candidates"][0]["landing_url"] == "https://loja.example/mochilas-personalizadas"
+    assert "mochila" in result["candidates"][0]["match_evidence"]["commercial"]

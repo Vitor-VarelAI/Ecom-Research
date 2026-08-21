@@ -22,7 +22,10 @@ import requests
 
 from pipeline import suggestions
 from pipeline.adapters import http_errors
-from pipeline.adapters.url_sanitize import sanitize_url as _sanitize_url
+from pipeline.adapters.url_sanitize import (
+    sanitize_embedded_urls as _sanitize_embedded_urls,
+    sanitize_url as _sanitize_url,
+)
 from pipeline.matching.product_ads import MATCHING_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,23 @@ WEAK_CONTEXT_FIELDS = (
     "message",
 )
 
+# Broad gate-1 relevance text: the union of every copy/context, page/
+# advertiser and commercial-intent text field the adapter can read.  All of
+# them contribute to relevance — ``_first_value`` would let an unrelated
+# body or page name mask a valid product head in the title/headline or link
+# block.  ``text`` is the legacy actor copy key; ``page``/``brand`` are the
+# legacy page-name aliases.
+_GATE1_TEXT_FIELDS = (
+    *WEAK_TEXT_FIELDS,
+    *WEAK_CONTEXT_FIELDS,
+    *HIGH_INTENT_TEXT_FIELDS,
+    "text",
+    "page_name",
+    "advertiser",
+    "page",
+    "brand",
+)
+
 # Structured, deterministic description of the local relevance policy so
 # artifacts can audit why a sample shrank without storing raw payloads.
 # Gate 2 is no longer a filter: every active, gate-1-relevant, deduplicated
@@ -117,7 +137,11 @@ RELEVANCE_POLICY = (
     "gate1: query product-head token (suggestions.product_head_token; "
     "accent/case folded, exact token equality or a single trailing 's' "
     "plural variant only — suggestions.tokens_equivalent) present anywhere "
-    "in copy + advertiser/page text; inactive ads excluded first; every "
+    "in the aggregated ad text (copy, captions, page/advertiser text, the "
+    "commercial-intent title/headline/link-block fields and the sanitized "
+    "landing/link URL scheme/host/path; embedded http(s) URLs reduced to "
+    "scheme/host/path before tokenization); "
+    "inactive ads excluded first; every "
     "active gate-1-relevant ad becomes a canonical candidate; matching "
     "classification (matched/needs_review/rejected) happens in "
     "pipeline.matching.product_ads over strong commercial fields (title, "
@@ -322,7 +346,10 @@ def _high_intent_text(ad: dict[str, Any]) -> str:
     """Folded text of every commercial-intent field, URLs included.
 
     Deliberately excludes body/copy and advertiser/page text: an ad whose
-    body merely mentions the keyword must not pass the second gate.
+    body merely mentions the keyword must not pass the second gate.  Any
+    http(s) URL embedded in the free text is reduced to its safe
+    scheme/host/path first (``url_sanitize.sanitize_embedded_urls``), so
+    query/fragment/userinfo tokens can never become proof.
     """
     parts: list[str] = []
     for field in HIGH_INTENT_TEXT_FIELDS:
@@ -330,7 +357,8 @@ def _high_intent_text(ad: dict[str, Any]) -> str:
         if value not in (None, "", [], {}):
             parts.append(_as_text(value))
     parts.extend(_iter_high_intent_urls(ad))
-    return _fold(" ".join(part for part in parts if part))
+    text = _sanitize_embedded_urls(" ".join(part for part in parts if part))
+    return _fold(text)
 
 
 def _geo_proof_text(ad: dict[str, Any]) -> str:
@@ -350,7 +378,8 @@ def _geo_proof_text(ad: dict[str, Any]) -> str:
         if value not in (None, "", [], {}):
             parts.append(_as_text(value))
     parts.extend(_iter_high_intent_urls(ad))
-    return _fold(" ".join(part for part in parts if part))
+    text = _sanitize_embedded_urls(" ".join(part for part in parts if part))
+    return _fold(text)
 
 
 def _weak_text(ad: dict[str, Any]) -> str:
@@ -363,13 +392,35 @@ def _weak_text(ad: dict[str, Any]) -> str:
         _as_text(_first_value(ad, *WEAK_CONTEXT_FIELDS)),
         _as_text(_first_value(ad, "page_name", "advertiser", "page", "brand")),
     ]
-    return _fold(" ".join(part for part in parts if part))
+    text = _sanitize_embedded_urls(" ".join(part for part in parts if part))
+    return _fold(text)
+
+
+def _gate1_text(ad: dict[str, Any]) -> str:
+    """Folded broad relevance text for gate 1: every copy/context,
+    page/advertiser and commercial-intent text field contributes — an
+    unrelated body or page name never masks a valid product head in the
+    title/headline or link block.  The sanitized high-intent URL values
+    (scheme/host/path of landing/destination/link fields) contribute too, so
+    a head that lives only in a safe landing path reaches the matcher.
+    Embedded http(s) URLs are reduced to their safe scheme/host/path first
+    (``url_sanitize.sanitize_embedded_urls``), so query/fragment/userinfo
+    tokens can never fabricate gate-1 relevance."""
+    parts: list[str] = []
+    for field in _GATE1_TEXT_FIELDS:
+        value = ad.get(field)
+        if value not in (None, "", [], {}):
+            parts.append(_as_text(value))
+    parts.extend(_iter_high_intent_urls(ad))
+    text = _sanitize_embedded_urls(" ".join(part for part in parts if part))
+    return _fold(text)
 
 
 def _is_relevant(keyword: str, ad: dict[str, Any]) -> bool:
     """Gate 1 — broad source relevance: the query's product-head token must
-    appear anywhere in the broad candidate text (copy + advertiser/page
-    text), under the shared ``suggestions.tokens_equivalent`` rule.
+    appear anywhere in the aggregated ad text (copy, captions, page/
+    advertiser text and the commercial-intent title/headline/link block),
+    under the shared ``suggestions.tokens_equivalent`` rule.
 
     This is deliberately broader than the old phrase/coverage gate: a
     generic school backpack for ``mochila personalizada`` or an oxygen
@@ -382,27 +433,15 @@ def _is_relevant(keyword: str, ad: dict[str, Any]) -> bool:
     head = suggestions.product_head_token(keyword)
     if head is None:
         return False
-    text_parts = [
-        _copy_text(ad),
-        _as_text(_first_value(
-            ad,
-            "page_name",
-            "advertiser",
-            "title",
-            "headline",
-            "ad_creative_link_titles",
-            "ad_creative_link_descriptions",
-            "link_description",
-            "ad_creative_link_captions",
-            "caption",
-            "primary_text",
-        )),
-    ]
-    text = _fold(" ".join(text_parts))
-    return any(suggestions.tokens_equivalent(head, token) for token in _tokens(text))
+    return any(suggestions.tokens_equivalent(head, token) for token in _tokens(_gate1_text(ad)))
 
 
 def _is_ad_library_url(value: Any) -> bool:
+    """True when the URL is a Facebook Ad Library origin link.
+
+    Uses the exact same host allowlist as ``_is_facebook_library_link`` —
+    never a ``facebook.com`` suffix match, so ``evilfacebook.com/ads/library``
+    is a landing, not a library reference."""
     if not isinstance(value, str) or not value:
         return False
     try:
@@ -410,7 +449,7 @@ def _is_ad_library_url(value: Any) -> bool:
     except ValueError:
         return False
     hostname = (parsed.hostname or "").casefold()
-    return hostname.endswith("facebook.com") and "/ads/library" in (parsed.path or "").casefold()
+    return hostname in {"facebook.com", "www.facebook.com", "m.facebook.com"} and "/ads/library" in (parsed.path or "").casefold()
 
 
 def _is_facebook_library_link(value: Any) -> bool:
@@ -453,7 +492,7 @@ def _landing_url(ad: dict[str, Any]) -> str:
     )
     for field in fields:
         for candidate in _iter_urls(ad.get(field)):
-            if candidate.startswith(("http://", "https://")) and not _is_facebook_library_link(candidate):
+            if candidate.casefold().startswith(("http://", "https://")) and not _is_facebook_library_link(candidate):
                 return candidate
     return ""
 
@@ -513,7 +552,12 @@ def _stable_key(ad: dict[str, Any], ad_id: str, ad_library_url: str, landing_url
     if ad_library_url:
         return f"url:{ad_library_url}"
     if landing_url:
-        return f"url:{landing_url}"
+        # Fallback identity: the sanitized landing (scheme/host/path, no
+        # query/fragment/userinfo) so tracking-only differences never split
+        # the same ad into duplicates.  The raw landing URL stays on the
+        # canonical candidate for the later fetch.
+        safe = _sanitize_url(landing_url)
+        return f"url:{safe or landing_url}"
     page = _fold(_first_value(ad, "page_id", "page_name", "advertiser"))
     copy = _fold(_copy_text(ad))
     date_value = _fold(_first_value(ad, "ad_creation_time", "ad_delivery_start_time", "created_at", "start_date"))
@@ -524,7 +568,11 @@ def _normalise_ad(ad: dict[str, Any], now: datetime) -> dict[str, Any]:
     ad_id = _as_text(_first_value(ad, "ad_archive_id", "id", "ad_id"))
     advertiser = _as_text(_first_value(ad, "page_name", "advertiser", "page", "brand")) or "Desconhecido"
     page_id = _as_text(_first_value(ad, "page_id", "pageId"))
-    copy = _copy_text(ad)
+    # O copy canónico é persistido com URLs embutidas sanitizadas
+    # (scheme/host/path) — tokens de query/fragment/userinfo nunca persistem
+    # no campo ``copy``.  A ``landing_url`` crua não é alterada aqui: o
+    # landing_price consome-a antes da sanitização caller-side.
+    copy = _sanitize_embedded_urls(_copy_text(ad))
     reported_active_time = _as_text(_first_value(ad, "reported_active_time"))
     countries = _countries(ad)
     platforms = _first_value(ad, "publisher_platform", "publisher_platforms", "platforms") or []
