@@ -4,7 +4,7 @@
 
 O projeto continua a ser um pipeline CLI determinístico e advisory. A fórmula de score, pesos, thresholds e labels (`AVANÇAR`, `OBSERVAR`, `DESCARTAR`) não foi alterada.
 
-A entrega ativa está na branch/worktree `feature/ad-matching-evidence` (`/home/vitor/projects/Ecom-Research-ad-matching-evidence`). A pesquisa WinningHunter e o desenho desta entrega estão em `docs/winninghunter-research/` e `docs/ad-matching/`. O primeiro slice ficou implementado: o adapter Apify preserva candidatos ativos relevantes e deduplicados; `pipeline/matching/product_ads.py` classifica cada candidato como `matched`, `needs_review` ou `rejected`; score, landings, notificações e pulse consomem apenas projeções `matched`; packs novos guardam os candidatos classificados e a proveniência `matcher_version`/`matching_schema_version`. A fórmula numérica do score não mudou, mas `SCORING_VERSION` subiu porque a coorte de entrada mudou.
+A entrega de matching/evidência está integrada em `main`. A pesquisa WinningHunter e o desenho desta entrega estão em `docs/winninghunter-research/` e `docs/ad-matching/`. O primeiro slice ficou implementado: o adapter Apify preserva candidatos ativos relevantes e deduplicados; `pipeline/matching/product_ads.py` classifica cada candidato como `matched`, `needs_review` ou `rejected`; score, landings, notificações e pulse consomem apenas projeções `matched`; packs novos guardam os candidatos classificados e a proveniência `matcher_version`/`matching_schema_version`. A fórmula numérica do score não mudou, mas `SCORING_VERSION` subiu porque a coorte de entrada mudou.
 
 O gate de fonte exige o product-head em qualquer texto do anúncio, incluindo copy fraca, para que falsos positivos reais cheguem ao matcher em vez de desaparecerem antes da classificação. Assim, mochila personalizada genuína fica `matched`, mochila genérica/porta-bebé fica `needs_review` quando falta prova forte de `personalizada`, e concentrador de oxigénio que apenas menciona mochila no corpo fica `rejected`. Zero candidatos ou todos rejeitados produz `DESCARTAR`; zero matched com candidatos ambíguos produz `DADOS INSUFICIENTES`. Quarta e mensal não comparam nem re-scorizam packs legados sem `matching_schema_version`; preservam-nos e explicam o skip. URLs persistidas em `candidates` e `top_ads` são sanitizadas sem mutar as URLs cruas usadas no fetch.
 
@@ -81,9 +81,9 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 
 ## Próxima sessão
 
-Retomar diretamente em `/home/vitor/projects/Ecom-Research-ad-matching-evidence`, sem repetir a pesquisa WinningHunter nem redesenhar o matcher. Primeiro confirmar `git status`, o último commit da branch e a suite; depois fazer um review curto do diff contra `docs/ad-matching/IMPLEMENTATION_PLAN.md`. Se não houver P0/P1, integrar a branch em `main` e publicar. Não fazer chamadas Apify/Telegram live para esta validação.
+Retomar diretamente em `/home/vitor/projects/Ecom-Research` na `main`; não repetir a pesquisa WinningHunter nem redesenhar o matcher. O review final dual passou sem P0/P1 nem must-fix (96/100 e 97/100), e a entrega já foi integrada. Não fazer chamadas Apify/Telegram live para iniciar o próximo slice.
 
-O passo funcional seguinte é a projeção SQLite idempotente dos packs classificados e o explorer Datasette read-only. SQLPage, React, API própria, revisão manual, callbacks/long polling, fornecedores/margens e Legal Gate executável continuam fora desse próximo slice. O SQLite não substitui os packs como prova: importa-os transacionalmente, e o mesmo `run_id + product_id` com conteúdo diferente deve falhar.
+O passo funcional seguinte é a projeção SQLite idempotente dos packs classificados e o explorer Datasette read-only. SQLPage, React, API própria, revisão manual, callbacks/long polling, fornecedores/margens e Legal Gate executável continuam fora desse próximo slice. O SQLite não substitui os packs como prova: importa-os transacionalmente, e o mesmo `run_id + product_id` com conteúdo diferente deve falhar. Follow-ups não bloqueantes do matcher: identidade de pulse para ads sem `ad_archive_id`, estratégia de limite para `match_evidence`, tokenização de keywords hifenizadas e polimento do regex de URLs embutidas.
 
 A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: manter regressões reais e caminhos críticos, sem matrizes de SaaS nem testes de constantes/implementação. Quando matcher, projeções matched-only, zero-match, sanitização, legado e idempotência estiverem confirmados, avançar.
 
@@ -114,9 +114,9 @@ A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: man
 
 ## Verificação desta sessão
 
-A implementação de matching/evidência fechou com **760 testes verdes**, `compileall` e `git diff --check` limpos. Não houve chamadas de rede, Apify ou Telegram, nem alterações a `.env`, `config/keywords.txt`, `data/`, `packs/` ou outros artefactos históricos. A suite foi reduzida de forma deliberada depois do primeiro passe: ficaram os falsos positivos de mochila, fronteira adapter→matcher, projeções matched-only, zero-match, sanitização, proveniência/run identity e guards de legado; testes redundantes ou presos a constantes internas foram removidos.
+A implementação de matching/evidência e o hardening do review fecharam com **794 testes verdes**, `compileall` e `git diff --check` limpos. O review final dual passou com 96/100 e 97/100, sem P0/P1 nem must-fix. Não houve chamadas de rede, Apify ou Telegram, nem alterações a `.env`, `config/keywords.txt`, `data/`, `packs/` ou artefactos históricos. As regressões cobrem falsos positivos de mochila, fronteira adapter→matcher, projeções matched-only, zero-match, sanitização recursiva e ciclo raw-URL→fetch→persistência segura, proveniência/run identity, guards de legado, pulse sanitizado, candidatos malformados e deduplicação.
 
-Nesta worktree não existe `.venv`; usar o ambiente do repositório principal:
+Usar o ambiente do repositório principal:
 
 ```bash
 /home/vitor/projects/Ecom-Research/.venv/bin/python -m pytest tests/ -q
