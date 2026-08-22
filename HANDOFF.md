@@ -14,6 +14,8 @@ O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenv
 
 A investigação técnica e comercial está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis em [`REPORT.md`](docs/telegram-research/REPORT.md) e o registo da implementação/smoke em [`IMPLEMENTATION_STATUS.md`](docs/telegram-research/IMPLEMENTATION_STATUS.md). O identity store canónico de produtos foi implementado e está completo: `config/products.json` (`schema_version=1`) é o registo operado manualmente, com cinco produtos e `product_id` imutável (preservado do antigo hash de 12 hex da keyword); `config/keywords.txt` permanece intacto e deixou de ser lido em runtime. A identidade de run usa pares ordenados `(product_id, research_keyword)` — mudar a query ativa cria um run novo (nova pesquisa), enquanto o `product_id` estável preserva o histórico. Packs/manifestos novos carregam `product_id`/`product_name`/`research_keyword`; packs, manifestos e digests históricos são read-only e nunca reescritos; a migração apenas lê artefactos legados. Quarta/mensal selecionam por `product_id` com fallback read-only keyword-legada→alias, mantendo a watchlist e o baseline do pack anterior num produto renomeado. A idempotência de entrega e a segurança contra duplicação não mudaram.
 
+A projeção SQLite idempotente e o explorer Datasette read-only estão implementados em `pipeline/projection/` e `explore.py`. Os packs JSON continuam a ser a prova canónica e nunca são reescritos; apenas packs atuais classificados entram na base descartável. A identidade é `(run_id, product_id)`, conteúdo idêntico é no-op e conteúdo divergente com a mesma identidade falha fechado sem alterar linhas existentes. Pack e candidatos entram na mesma transação, a base valida versão/estrutura/integridade antes de importar ou servir, e Datasette arranca com `--immutable` em localhost. Os 32 JSON atuais são legados ou ficheiros auxiliares, por isso o primeiro import produz uma base válida vazia e reporta os skips read-only.
+
 Fora do âmbito continuam callbacks, long polling, Mini App, fornecedores/margens automáticos, Legal Gate executável e monitorização jurídica.
 
 ## Decisão Telegram
@@ -78,14 +80,15 @@ O modelo financeiro separa receita líquida, IVA de venda/recuperável, importa�
 - `docs/telegram-research/08-rich-fallback-signature.md` — assinatura de rejeição Rich: classificador baseado em evidência (4xx definitivo consistente + token simbólico exato da allowlist ou descrição completa normalizada exata; fail-closed; limite 32768 Rich vs 4096 HTML).
 - `docs/telegram-research/REPORT.md` — índice dos 22 entregáveis.
 - `docs/telegram-research/IMPLEMENTATION_STATUS.md` — registo da implementação, smoke Rich/HTML e ativação/rollback.
+- `docs/sqlite-projection/IMPLEMENTATION_PLAN.md` — contrato, schema, idempotência e runbook da projeção SQLite/Datasette.
 
 ## Próxima sessão
 
-Retomar diretamente em `/home/vitor/projects/Ecom-Research` na `main`; não repetir a pesquisa WinningHunter nem redesenhar o matcher. O review final dual passou sem P0/P1 nem must-fix (96/100 e 97/100), e a entrega já foi integrada. Não fazer chamadas Apify/Telegram live para iniciar o próximo slice.
+Retomar diretamente em `/home/vitor/projects/Ecom-Research` na `main`; não repetir a pesquisa WinningHunter, não redesenhar o matcher e não voltar a implementar a projeção SQLite/Datasette. Não fazer chamadas Apify/Telegram live apenas para iniciar trabalho.
 
-O passo funcional seguinte é a projeção SQLite idempotente dos packs classificados e o explorer Datasette read-only. SQLPage, React, API própria, revisão manual, callbacks/long polling, fornecedores/margens e Legal Gate executável continuam fora desse próximo slice. O SQLite não substitui os packs como prova: importa-os transacionalmente, e o mesmo `run_id + product_id` com conteúdo diferente deve falhar. Follow-ups não bloqueantes do matcher: identidade de pulse para ads sem `ad_archive_id`, estratégia de limite para `match_evidence`, tokenização de keywords hifenizadas e polimento do regex de URLs embutidas.
+O próximo slice funcional ainda não foi escolhido. SQLPage, React, API própria, revisão manual, callbacks/long polling, fornecedores/margens e Legal Gate executável permanecem fora do âmbito até nova decisão do operador. Follow-ups não bloqueantes do matcher: identidade de pulse para ads sem `ad_archive_id`, estratégia de limite para `match_evidence`, tokenização de keywords hifenizadas e polimento do regex de URLs embutidas.
 
-A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: manter regressões reais e caminhos críticos, sem matrizes de SaaS nem testes de constantes/implementação. Quando matcher, projeções matched-only, zero-match, sanitização, legado e idempotência estiverem confirmados, avançar.
+A disciplina de testes continua pragmática porque esta é uma ferramenta pessoal: manter regressões reais e caminhos críticos, sem matrizes de SaaS nem testes de constantes/implementação.
 
 ## Garantias existentes a preservar
 
@@ -111,16 +114,18 @@ A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: man
 - batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência;
 - itens com entrega ambígua exigem reconciliação manual antes de qualquer reenvio;
 - token Telegram anteriormente exposto continua a precisar de rotação pelo operador.
+- follow-ups não bloqueantes da projeção: validar afinidades/`NOT NULL`/ações da FK além de nomes e chaves; distinguir schema futuro ou malformado de legado; decidir se score/evidência canónicos devem ser sempre obrigatórios; percent-encode de caminhos SQLite com `?` ou `#` no serve.
 
 ## Verificação desta sessão
 
-A implementação de matching/evidência e o hardening do review fecharam com **794 testes verdes**, `compileall` e `git diff --check` limpos. O review final dual passou com 96/100 e 97/100, sem P0/P1 nem must-fix. Não houve chamadas de rede, Apify ou Telegram, nem alterações a `.env`, `config/keywords.txt`, `data/`, `packs/` ou artefactos históricos. As regressões cobrem falsos positivos de mochila, fronteira adapter→matcher, projeções matched-only, zero-match, sanitização recursiva e ciclo raw-URL→fetch→persistência segura, proveniência/run identity, guards de legado, pulse sanitizado, candidatos malformados e deduplicação.
+A projeção SQLite/Datasette e o hardening do review fecharam com **918 testes verdes** — 124 da projeção —, `compileall`, `pip check` e `git diff --check` limpos. O review independente final não encontrou P0/P1 nem must-fix. O smoke real importou os 32 JSON existentes como skips read-only e criou uma base schema v1 válida com zero packs/candidatos atuais. Não houve chamadas Apify ou Telegram, nem alterações a `.env`, `config/keywords.txt`, `data/`, `packs/` ou artefactos históricos. As regressões cobrem validação de packs/candidatos, JSON estrito, schema SQLite/integridade/FK, transação e rollback, fingerprint/no-op/conflito, CLI sem tracebacks e Datasette imutável.
 
 Usar o ambiente do repositório principal:
 
 ```bash
 /home/vitor/projects/Ecom-Research/.venv/bin/python -m pytest tests/ -q
-/home/vitor/projects/Ecom-Research/.venv/bin/python -m compileall -q run.py pipeline tests
+/home/vitor/projects/Ecom-Research/.venv/bin/python -m compileall -q run.py explore.py pipeline tests
+/home/vitor/projects/Ecom-Research/.venv/bin/python -m pip check
 git diff --check
 ```
 

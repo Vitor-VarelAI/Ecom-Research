@@ -156,11 +156,24 @@ O progresso de entrega é persistido em `data/digests/<state_id>.json` com `sche
 
 As recomendações são operacionais, não decisões automáticas: `AVANÇAR` prepara o ad-machine após aprovação manual, `OBSERVAR` mantém watchlist/recheck, `DESCARTAR` arquiva salvo nova evidência e `DADOS INSUFICIENTES` pede retry do Apify.
 
+## Explorer SQLite (projeção read-only)
+
+Os packs JSON continuam a ser a evidência canónica e **nunca são reescritos**. Uma projeção SQLite descartável e idempotente (`pipeline/projection/` + `explore.py`) importa apenas os packs completos classificados atuais — `run_id`/`product_id` top-level não vazios, `artifact_complete=true`, data e score label válidos, `facebook_ads.matching_schema_version` igual ao `MATCHING_SCHEMA_VERSION` atual e candidatos classificados presentes. Chave por `(run_id, product_id)`, com fingerprint SHA-256 do JSON canónico completo do pack: reimportar conteúdo idêntico é no-op e a mesma identidade com conteúdo diferente falha com erro de conflito específico, sem alterar linhas. Cada pack é importado com a linha e todos os candidatos numa única transação, foreign keys ativas e schema version fixada via `PRAGMA user_version`; uma base com schema incompatível é descartável — apaga e reimporta.
+
+```bash
+.venv/bin/python explore.py import [--db data/ecom_research.db] [--data-dir data]
+.venv/bin/python explore.py serve [--db data/ecom_research.db] [--host 127.0.0.1] [--port 8001]
+```
+
+`import` descobre `data/*.json` deterministicamente: packs legados válidos (sem `matching_schema_version`) e ficheiros não-pack (ex.: `data/quota.json`) são saltados read-only e reportados com razão; JSON malformado ou um pack que reivindica a schema atual mas viola a shape exigida falha fechado com erro acionável. `serve` recusa uma base ausente e lança Datasette em modo imutável/read-only com queries read-only prontas (últimos packs, candidatos `needs_review`, anunciantes matched), ligado a localhost por omissão.
+
+**Expectativa zero-current-classified-packs:** enquanto o pipeline não voltar a produzir packs com `matching_schema_version` atual e candidatos classificados, `import` importa zero packs e salta todos read-only — é o comportamento esperado (exit 0), não um erro.
+
 ## Verificação
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-.venv/bin/python -m compileall run.py pipeline
+.venv/bin/python -m compileall run.py pipeline explore.py
 .venv/bin/python run.py --help
 git diff --check
 ```

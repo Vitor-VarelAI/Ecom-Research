@@ -42,3 +42,8 @@ data/cron.log
 data/*.csv
 data/runs/
 data/digests/
+
+# SQLite projection (disposable, rebuilt from packs via explore.py import)
+data/*.db
+data/*.db-wal
+data/*.db-shm
