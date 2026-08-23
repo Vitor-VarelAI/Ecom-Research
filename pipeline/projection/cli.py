@@ -70,13 +70,14 @@ def cmd_import(args: argparse.Namespace) -> int:
     except PackConflictError as exc:
         print(f"ERRO (conflito): {exc}", file=sys.stderr)
         return EXIT_CONFLICT
-    except (SchemaMismatchError, ProjectionError, sqlite3.Error) as exc:
+    except (SchemaMismatchError, ProjectionError, sqlite3.Error, OSError) as exc:
         print(f"ERRO (fail closed): {exc}", file=sys.stderr)
         return EXIT_FAIL_CLOSED
 
 
 def _run_import(args: argparse.Namespace) -> int:
     files = sorted(glob.glob(os.path.join(args.data_dir, "*.json")))
+    os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
     imported = 0
     unchanged = 0
     skipped: list[tuple[str, str]] = []

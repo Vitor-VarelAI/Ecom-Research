@@ -79,6 +79,15 @@ class TestImportCli:
         assert cmd_import(_make_args("import", db=str(db), data_dir=str(data_dir))) == 0
         assert "importados: 0" in capsys.readouterr().out
 
+    def test_default_import_creates_missing_data_directory(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / "data").exists()
+
+        assert main(["import"]) == 0
+
+        assert (tmp_path / "data" / "ecom_research.db").is_file()
+        assert "importados: 0" in capsys.readouterr().out
+
     def test_conflicting_reimport_exits_nonzero_and_keeps_rows(self, tmp_path, capsys):
         data_dir = tmp_path / "data"
         data_dir.mkdir()
