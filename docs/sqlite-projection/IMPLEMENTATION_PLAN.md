@@ -50,14 +50,13 @@ não há rescoring/reclassificação e nenhum pack/JSON histórico muda.
    omissão. Dependência `datasette` em `requirements.txt`.
 9. `data/*.db`, `data/*.db-wal`, `data/*.db-shm` ignorados no Git.
 
-## Expectativa zero-current-classified-packs
+## Comportamento sem packs classificados atuais
 
-Nenhum pack atual em `data/` carrega `matching_schema_version`/candidatos
-classificados (todos são pré-classificação ou legacy). Portanto, na data
-desta entrega, `explore.py import` importa **zero** packs e salta todos
-read-only — comportamento documentado e **exit 0**, não erro. A projeção
-começa a encher quando o pipeline voltar a produzir packs com a schema de
-matching atual.
+Se `data/` contiver apenas packs legados ou ficheiros auxiliares,
+`explore.py import` cria uma projeção válida vazia, reporta todos os skips
+read-only e termina com **exit 0**. Quando existirem packs com
+`matching_schema_version` atual e candidatos classificados, estes são
+importados normalmente.
 
 ## Estrutura
 

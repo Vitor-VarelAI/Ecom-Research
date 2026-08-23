@@ -167,7 +167,7 @@ Os packs JSON continuam a ser a evidência canónica e **nunca são reescritos**
 
 `import` descobre `data/*.json` deterministicamente: packs legados válidos (sem `matching_schema_version`) e ficheiros não-pack (ex.: `data/quota.json`) são saltados read-only e reportados com razão; JSON malformado ou um pack que reivindica a schema atual mas viola a shape exigida falha fechado com erro acionável. `serve` recusa uma base ausente e lança Datasette em modo imutável/read-only com queries read-only prontas (últimos packs, candidatos `needs_review`, anunciantes matched), ligado a localhost por omissão.
 
-**Expectativa zero-current-classified-packs:** enquanto o pipeline não voltar a produzir packs com `matching_schema_version` atual e candidatos classificados, `import` importa zero packs e salta todos read-only — é o comportamento esperado (exit 0), não um erro.
+**Comportamento sem packs classificados atuais:** se `data/` contiver apenas packs legados ou ficheiros auxiliares, `import` cria uma projeção válida vazia, reporta os skips read-only e termina com exit 0. Quando existirem packs com `matching_schema_version` atual e candidatos classificados, estes são importados normalmente.
 
 ## Verificação
 

@@ -59,7 +59,7 @@ O outbound é determinístico e HTML multi-mensagem por omissão (`TELEGRAM_REND
 .venv/bin/python explore.py serve [--db data/ecom_research.db] [--host 127.0.0.1] [--port 8001]
 ```
 
-`import` descobre `data/*.json` deterministicamente; packs legados e ficheiros não-pack são saltados read-only e reportados, JSON malformado e packs que reivindicam a schema atual com shape inválida falham fechado. `serve` recusa base ausente e lança Datasette em modo imutável/read-only com queries read-only (últimos packs, needs_review, anunciantes matched), localhost por omissão. `data/*.db`, `-wal` e `-shm` estão no `.gitignore`. Esperado: zero packs atuais importados até o pipeline voltar a produzir packs com `matching_schema_version` atual — exit 0, não erro. Detalhes em `docs/sqlite-projection/IMPLEMENTATION_PLAN.md`.
+`import` descobre `data/*.json` deterministicamente; packs legados e ficheiros não-pack são saltados read-only e reportados, JSON malformado e packs que reivindicam a schema atual com shape inválida falham fechado. `serve` recusa base ausente e lança Datasette em modo imutável/read-only com queries read-only (últimos packs, needs_review, anunciantes matched), localhost por omissão. `data/*.db`, `-wal` e `-shm` estão no `.gitignore`. Se não existirem packs atuais, uma projeção vazia com os skips reportados continua a ser sucesso (exit 0); packs com `matching_schema_version` atual são importados normalmente. Detalhes em `docs/sqlite-projection/IMPLEMENTATION_PLAN.md`.
 
 ## Estado atual
 
