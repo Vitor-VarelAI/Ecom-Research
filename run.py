@@ -28,6 +28,8 @@ from pipeline.adapters import apify_ads, keyword_csv, landing_price, serp_seo, t
 from pipeline.adapters.url_sanitize import sanitize_ads_data
 from pipeline.delivery import telegram
 from pipeline.matching import product_ads
+from pipeline.monetization import config as monetization_config
+from pipeline.monetization import gate as monetization_gate
 from pipeline.notifications import NotificationBatch, build_batch, notification_snapshot
 from pipeline.output import pack
 from pipeline.products import (
@@ -159,6 +161,17 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _without_monetization(result: dict[str, Any]) -> dict[str, Any]:
+    """Affiliate payloads (metadata/URLs) never reach run manifests.
+
+    Monetization is a pack-only concern in this slice: packs carry it, but
+    manifests, digests, Telegram batches and notification snapshots never
+    do (see _compact_result).  This strips the key from full-result shapes
+    that would otherwise be persisted (batch checkpoints and the
+    completed_with_errors path)."""
+    return {key: value for key, value in result.items() if key != "monetization"}
+
+
 def _finish_manifest(
     manifest: dict[str, Any],
     results: list[dict[str, Any]],
@@ -173,7 +186,11 @@ def _finish_manifest(
         os.path.join(_data_dir(), os.path.basename(md).replace(".md", ".json")) for md in md_files
     ]
     completed = run_state.utc_now_iso()
-    stored_results = [_compact_result(r) for r in results] if compact else [dict(r) for r in results]
+    stored_results = (
+        [_compact_result(r) for r in results]
+        if compact
+        else [_without_monetization(dict(r)) for r in results]
+    )
     manifest.update(
         {
             "state": state,
@@ -309,6 +326,17 @@ def _reused_timestamp(previous: dict[str, Any] | None) -> str | None:
 
 _TIMESERIES_KEYS = ("direction", "slope_pct", "seasonal", "peak", "top_geos")
 
+# Keyword Planner row-missing messages (masculine and feminine) describe a
+# keyword that is absent from an existing export — a "not attempted" state,
+# never a parse failure.  Other CSV parse errors remain ``failed``.
+_CSV_ROW_MISSING_SUFFIXES = (" não encontrado no CSV", " não encontrada no CSV")
+
+
+def _csv_row_is_missing(error: Any) -> bool:
+    return isinstance(error, str) and error.startswith("Keyword ") and any(
+        suffix in error for suffix in _CSV_ROW_MISSING_SUFFIXES
+    )
+
 
 def _is_timeseries(trends_data: dict[str, Any]) -> bool:
     """True when the trends evidence includes a real timeseries payload."""
@@ -381,7 +409,7 @@ def _source_states(mode: str, result: dict[str, Any], previous: dict[str, Any] |
     else:
         add("serp_seo", "not_attempted", "SEO não executado")
     if "error" in csv:
-        if "não encontrado" in csv["error"] or "Nenhum CSV" in csv["error"]:
+        if _csv_row_is_missing(csv["error"]) or "Nenhum CSV" in csv["error"]:
             add("keyword_csv", "not_attempted", f"{csv['error']}", force_status="missing")
         else:
             add("keyword_csv", "error", f"{csv['error']}")
@@ -589,6 +617,24 @@ def _load_previous_pack(
     return _read_pack_json(os.path.join(data_dir, best[1]))
 
 
+def _evaluate_monetization(result: dict[str, Any], source_states: dict[str, Any]) -> dict[str, Any] | None:
+    """Pure monetization gate over the assembled result + source states.
+
+    The committed ``config/affiliate_offers.json`` is loaded fail-closed
+    (missing/invalid => None => disabled); config/catalog changes are
+    deliberately not part of run identity.  The environment VALUE of each
+    ``affiliate_url_env`` is probed for non-emptiness but never inspected
+    into the emission — only the variable NAME travels as
+    ``affiliate_link_ref``."""
+    return monetization_gate.evaluate(
+        result=result,
+        source_states=source_states,
+        catalog=monetization_config.load(os.path.join(REPO_ROOT, "config", "affiliate_offers.json")),
+        today=date.today(),
+        env_get=os.environ.get,
+    )
+
+
 def _csv_data(csv_path: str | None, keyword: str) -> dict[str, Any]:
     """Parse do export do Keyword Planner seleccionando a linha da keyword
     pedida (matching exacto normalizado); erro explícito se a keyword não
@@ -734,7 +780,14 @@ def run_keyword(
             trends_data = trends.fetch(keyword)
             seo_data = serp_seo.fetch(keyword)
         csv_data = _csv_data(csv_path, keyword)
-        score_result = score.compute(trends_data, csv_data, ads_data)
+        if "error" in csv_data:
+            # Fail-closed CSV semantics: a missing/invalid Keyword Planner row
+            # must not produce a false verdict through a silent zero volume —
+            # the numeric score/breakdown are preserved but the label is
+            # forced to DADOS INSUFICIENTES with the CSV error as reason.
+            score_result = _incomplete_score(trends_data, csv_data, ads_data, reason=csv_data["error"])
+        else:
+            score_result = score.compute(trends_data, csv_data, ads_data)
 
     # Product-relevance gate: apply the filter once over a *copy* of
     # trends_data before both suggestion extraction and pack rendering
@@ -766,6 +819,9 @@ def run_keyword(
         "suggested_keywords": suggested,
     }
     run_mode = mode or "keyword"
+    source_states = _source_states(run_mode, result, None)
+    monetization = _evaluate_monetization(result, source_states)
+    result["monetization"] = monetization
     result["md_path"] = pack.generate(
         keyword=keyword,
         trends_data=trends_data,
@@ -779,7 +835,8 @@ def run_keyword(
         product_id=product.product_id,
         product_name=product.name,
         research_keyword=keyword,
-        **_run_metadata(run_mode, run_id or None, _source_states(run_mode, result, None)),
+        monetization=monetization,
+        **_run_metadata(run_mode, run_id or None, source_states),
     )
     return result
 
@@ -839,7 +896,9 @@ def _run_batch(
             for product in pending:
                 result = _safe_run_keyword(product, csv_path=csv_path, mode=mode, run_id=run_id)
                 results.append(result)
-                manifest["results"] = [dict(r) for r in results]  # checkpoint
+                # Checkpoint without the monetization payload: affiliate
+                # metadata/URLs are pack-only and never reach the manifest.
+                manifest["results"] = [_without_monetization(dict(r)) for r in results]
                 store.save(run_id, manifest)
 
             # Deterministic digest order even after a resume appended retries.

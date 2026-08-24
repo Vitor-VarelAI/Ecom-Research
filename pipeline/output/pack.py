@@ -10,6 +10,7 @@ from datetime import date, datetime
 from typing import Any
 
 from pipeline.run_state import atomic_write_json, atomic_write_text, utc_now_iso
+from pipeline.monetization.render import render_markdown
 
 _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 
@@ -539,6 +540,7 @@ def generate(
     scoring_config: dict[str, Any] | None = None,
     matcher_version: str | None = None,
     matching_schema_version: int | None = None,
+    monetization: dict[str, Any] | None = None,
     generated_at: str | None = None,
     completed_at: str | None = None,
 ) -> str:
@@ -564,6 +566,11 @@ def generate(
         completed_at=done_at,
         source_states=source_states,
     )
+
+    # Optional monetization section (pack-only): absent by default so every
+    # existing caller/legacy pack is byte-unchanged.
+    monetization_section = render_markdown(monetization)
+    monetization_block = f"{monetization_section}\n\n" if monetization_section else ""
 
     md_content = f"""# RESEARCH PACK — {keyword} — {run_date.isoformat()}
 
@@ -601,7 +608,7 @@ Fórmula determinística. Sem LLM no score.
 ## Próximo passo sugerido
 {_format_next_step(score_result.get('label', 'DADOS INSUFICIENTES'))}
 
-{provenance}"""
+{monetization_block}{provenance}"""
     atomic_write_text(md_path, md_content)
 
     raw_pack: dict[str, Any] = {
@@ -646,6 +653,13 @@ Fórmula determinística. Sem LLM no score.
         raw_pack["source_states"] = source_states
     if source_policies is not None:
         raw_pack["source_policies"] = source_policies
+    # Optional monetization payload (pack-only, never in manifests/digests):
+    # only written when the gate emitted it, so every existing caller is
+    # byte-unchanged.  It carries validated metadata, sanitized public URLs
+    # and the env-variable NAME as ``affiliate_link_ref`` — never the tracked
+    # affiliate URL value.
+    if monetization is not None:
+        raw_pack["monetization"] = monetization
     # Written last: a run-scoped JSON without this flag is an incomplete
     # artifact and readers ignore it (an orphan Markdown without a JSON can
     # never replace an older complete JSON, thanks to unique run paths).
