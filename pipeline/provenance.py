@@ -19,6 +19,7 @@ Policies contain no credentials and no token-bearing URLs.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from pipeline.adapters import trends
@@ -61,6 +62,17 @@ SOURCE_POLICIES: dict[str, dict[str, Any]] = {
         "firecrawl_limit": 1000,
         "firecrawl_pause_s": 6,
         "fallback": "ignora landing não legível; nunca bloqueia o run",
+        "ssrf": {
+            "guard": "esquemas HTTP(S); sem userinfo; só endereços públicos unicast (is_global, sem categorias reservadas/multicast)",
+            "checks": "preflight DNS + revalidação de cada hop de redirect",
+            "max_redirects": 5,
+            "redirect_status_codes": "301/302/303/307/308",
+            "blocked_chain": "suprime o fallback Firecrawl (poderia seguir o mesmo redirect inseguro); alvo bloqueado nunca faz POST nem gasta credit",
+            "residual_limits": [
+                "DNS-rebinding TOCTOU: preflight DNS + per-hop checks não eliminam rebinding",
+                "Firecrawl segue os próprios redirects server-side (limitação residual explícita)"
+            ],
+        },
     },
 }
 
@@ -107,4 +119,4 @@ def source_state(
 
 def snapshot() -> dict[str, Any]:
     """Deep-copied, credential-free policy snapshot for pack/run metadata."""
-    return {name: dict(policy) for name, policy in SOURCE_POLICIES.items()}
+    return deepcopy(SOURCE_POLICIES)

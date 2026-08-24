@@ -3,7 +3,10 @@ Testes do adapter Landing Price.
 
 Usa fixtures HTML simuladas — sem chamadas reais à rede.
 """
+import ipaddress
 import json
+import logging
+import socket
 import pytest
 import os
 from unittest.mock import patch, Mock
@@ -22,6 +25,20 @@ def _isolate_quota(monkeypatch, tmp_path, *, firecrawl_credits=0, firecrawl_limi
     }), encoding="utf-8")
     monkeypatch.setattr(landing_price.quota, "QUOTA_FILE", str(quota_file))
     return quota_file
+
+
+@pytest.fixture(autouse=True)
+def _no_live_dns(monkeypatch):
+    """Nunca fazer DNS real nos testes de landing: literais IPv4/IPv6 resolvem
+    para si próprias e hostnames resolvem para um endereço público de teste.
+    Testes que precisem de comportamento por-host voltam a patch o seam."""
+    def fake_resolve(host, port):
+        try:
+            ipaddress.ip_address(host)
+            return [host]
+        except ValueError:
+            return ["93.184.216.34"]
+    monkeypatch.setattr(landing_price.ssrf_guard, "_resolve_addresses", fake_resolve)
 
 # ── Fixtures HTML ──────────────────────────────────────────────────────────
 
@@ -815,7 +832,7 @@ class TestSanitizedFetchAndProvenance:
     def test_provenance_source_url_is_sanitized_no_secret_values(self):
         ads_data = {
             "top_ads": [
-                {"advertiser": "A", "landing_url": "https://user:pass@loja.com/p?api_key=TOPSECRET&token=SECRET2#frag", "days_active": 100},
+                {"advertiser": "A", "landing_url": "https://loja.com/p?api_key=TOPSECRET&token=SECRET2#frag", "days_active": 100},
             ]
         }
         mock_resp = Mock()
@@ -1006,7 +1023,7 @@ class TestSafeFloatNonFinite:
 class TestLandingFailureLogsSanitized:
     def test_http_failure_log_uses_sanitized_url_not_raw(self, caplog):
         import logging
-        raw = "https://user:pass@loja.com/p?api_key=TOPSECRET&utm=x#frag"
+        raw = "https://loja.com/p?api_key=TOPSECRET&utm=x#frag"
         with caplog.at_level(logging.DEBUG, logger="pipeline.adapters.landing_price"), \
              patch.object(landing_price.requests, "get", side_effect=landing_price.requests.ConnectionError("boom")), \
              patch.object(landing_price, "_fetch_via_firecrawl", return_value=None):
@@ -1033,7 +1050,7 @@ class TestLandingFailureLogsSanitized:
         echo the raw userinfo/query/fragment nor the exception body — only the
         sanitized URL and the exception type are logged."""
         import logging
-        raw = "https://user:secret@loja.com/p?api_key=LEAKEDTOKEN&utm=cred#frag"
+        raw = "https://loja.com/p?api_key=LEAKEDTOKEN&utm=cred#frag"
         boom = landing_price.requests.ConnectionError(
             f"HTTPSConnectionPool(host='loja.com'): Max retries exceeded with url: {raw} (Caused by ConnectTimeoutError)"
         )
@@ -1056,7 +1073,7 @@ class TestLandingFailureLogsSanitized:
         import logging
         monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
         _isolate_quota(monkeypatch, tmp_path)
-        raw = "https://user:hush@loja.com/js?api_key=HUSHED#x"
+        raw = "https://loja.com/js?api_key=HUSHED#x"
         boom = landing_price.requests.ConnectionError(
             f"Connection broken: connection refused to {raw} (underlying transport)"
         )
@@ -1070,3 +1087,173 @@ class TestLandingFailureLogsSanitized:
         assert "connection refused" not in caplog.text  # corpo da exceção nunca aparece
         assert "ConnectionError" in caplog.text
         assert "https://loja.com/js" in caplog.text
+
+
+# ── Tests: SSRF guard na interface pública (fetch_price) ───────────────────
+
+class TestSsrfGuardFetchPrice:
+    """Alvos inseguros (privados/userinfo/DNS falhado) nunca são fetches nem
+    chegam ao Firecrawl; redirects são validados hop a hop antes de cada GET."""
+
+    def test_initial_private_target_no_get_no_firecrawl(self):
+        with patch.object(landing_price.requests, "get", side_effect=AssertionError("GET não deve ocorrer")), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("http://10.0.0.5/internal") is None
+
+    def test_initial_userinfo_target_no_get_no_firecrawl(self):
+        with patch.object(landing_price.requests, "get", side_effect=AssertionError("GET não deve ocorrer")), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://user:pass@example.com/p") is None
+
+    def test_initial_dns_failure_no_get_no_firecrawl(self):
+        with patch.object(landing_price.ssrf_guard, "_resolve_addresses", side_effect=socket.gaierror("NXDOMAIN")), \
+             patch.object(landing_price.requests, "get", side_effect=AssertionError("GET não deve ocorrer")), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://nxdomain.example/") is None
+
+    def test_blocked_control_target_logs_only_safe_reason(self, caplog):
+        raw = "https://example.com/\x00INJECT?token=TOPSECRET"
+        with caplog.at_level(logging.DEBUG, logger="pipeline.adapters.landing_price"), \
+             patch.object(landing_price.requests, "get", side_effect=AssertionError("GET não deve ocorrer")), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price(raw) is None
+
+        assert "control-chars" in caplog.text
+        assert "\x00" not in caplog.text
+        assert "INJECT" not in caplog.text
+        assert "TOPSECRET" not in caplog.text
+
+    def test_public_relative_redirect_succeeds(self):
+        resp1 = Mock()
+        resp1.status_code = 301
+        resp1.headers = {"Location": "/next"}
+        resp2 = Mock()
+        resp2.status_code = 200
+        resp2.text = HTML_WITH_JSONLD
+
+        with patch.object(landing_price.requests, "get", side_effect=[resp1, resp2]), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            result = landing_price.fetch_price("https://example.com/start")
+        assert result is not None
+        assert result["via"] == "http"
+        assert 45.99 in result["prices"]
+
+    def test_redirect_control_whitespace_blocked_before_urljoin(self):
+        resp = Mock()
+        resp.status_code = 302
+        resp.headers = {"Location": "\thttps://example.com/next"}
+
+        with patch.object(landing_price.requests, "get", return_value=resp) as mock_get, \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/start") is None
+        assert mock_get.call_count == 1
+
+    def test_public_to_private_redirect_blocked_before_second_get(self):
+        resp = Mock()
+        resp.status_code = 301
+        resp.headers = {"Location": "http://10.0.0.5/internal"}
+
+        with patch.object(landing_price.requests, "get", return_value=resp) as mock_get, \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/start") is None
+        assert mock_get.call_count == 1  # o hop privado nunca é chamado
+
+    def test_public_to_userinfo_redirect_blocked_before_second_get(self):
+        resp = Mock()
+        resp.status_code = 302
+        resp.headers = {"Location": "https://user:pass@example.com/next"}
+
+        with patch.object(landing_price.requests, "get", return_value=resp) as mock_get, \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/start") is None
+        assert mock_get.call_count == 1
+
+    def test_redirect_loop_detected(self):
+        counter = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            counter["n"] += 1
+            resp = Mock()
+            resp.status_code = 302
+            resp.headers = {"Location": "/b" if counter["n"] == 1 else "/a"}
+            return resp
+
+        with patch.object(landing_price.requests, "get", side_effect=fake_get) as mock_get, \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/a") is None
+        assert mock_get.call_count == 2  # A→B→A detetado antes do terceiro GET
+
+    def test_redirect_without_location_fails_safely(self):
+        resp = Mock()
+        resp.status_code = 301
+        resp.headers = {}
+
+        with patch.object(landing_price.requests, "get", return_value=resp) as mock_get, \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/start") is None
+        assert mock_get.call_count == 1
+
+    def test_redirect_limit_exhausted_fails_safely(self):
+        locations = iter(["/hop1", "/hop2", "/hop3", "/hop4", "/hop5", "/hop6"])
+
+        def fake_get(url, **kwargs):
+            resp = Mock()
+            resp.status_code = 302
+            resp.headers = {"Location": next(locations)}
+            return resp
+
+        with patch.object(landing_price.requests, "get", side_effect=fake_get) as mock_get, \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/start") is None
+        assert mock_get.call_count == 1 + landing_price.MAX_REDIRECTS
+
+
+# ── Tests: SSRF guard no nível Firecrawl ───────────────────────────────────
+
+class TestSsrfGuardFirecrawl:
+    """Alvo bloqueado nunca faz POST nem gasta credit; alvo público mantém o
+    caminho normal."""
+
+    def test_blocked_target_no_post_no_quota(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
+
+        with patch.object(landing_price.requests, "post", side_effect=AssertionError("POST não deve ocorrer")):
+            result = landing_price._fetch_via_firecrawl("http://10.0.0.5/internal")
+        assert result is None
+        assert quota.get_firecrawl_usage()["credits"] == 0
+
+    def test_blocked_userinfo_target_no_post_no_quota(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
+
+        with patch.object(landing_price.requests, "post", side_effect=AssertionError("POST não deve ocorrer")):
+            result = landing_price._fetch_via_firecrawl("https://user:pass@example.com/p")
+        assert result is None
+        assert quota.get_firecrawl_usage()["credits"] == 0
+
+    def test_public_target_still_posts_and_charges(self, monkeypatch, tmp_path):
+        """Regressão: o guard não bloqueia o caminho Firecrawl normal."""
+        monkeypatch.setenv("FIRECRAWL_KEY", "fake-key")
+        _isolate_quota(monkeypatch, tmp_path)
+
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": {"html": HTML_WITH_JSONLD, "markdown": ""}}
+
+        with patch.object(landing_price.requests, "post", return_value=mock_resp):
+            result = landing_price._fetch_via_firecrawl("https://example.com/js-heavy")
+        assert result is not None
+        assert result["via"] == "firecrawl"
+        assert quota.get_firecrawl_usage()["credits"] == 1
+
+    def test_blocked_chain_suppresses_firecrawl_fallback(self):
+        """Cadeia bloqueada (público→privado) nunca chega ao Firecrawl, mesmo
+        que o Firecrawl devolvesse preço se fosse chamado."""
+        resp = Mock()
+        resp.status_code = 301
+        resp.headers = {"Location": "http://10.0.0.5/internal"}
+
+        with patch.object(landing_price.requests, "get", return_value=resp), \
+             patch.object(landing_price, "_fetch_via_firecrawl", side_effect=AssertionError("Firecrawl não deve ser chamado")):
+            assert landing_price.fetch_price("https://example.com/start") is None

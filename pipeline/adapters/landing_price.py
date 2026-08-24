@@ -8,6 +8,14 @@ Estratégia HYBRID em 2 níveis:
 Parser comum: JSON-LD schema.org Product/Offer PRIMEIRO (com priceCurrency),
 depois regex €XX/XX€/XX,XX EUR (moeda explícita — EUR).
 
+Segurança SSRF: cada alvo (inicial e cada destino de redirect) é validado por
+``ssrf_guard.validate_target`` antes de qualquer request — apenas http(s)
+com endereços públicos unicast (`is_global`, excluindo explicitamente redes privadas, loopback, link-local, reservadas, multicast e unspecified), sem userinfo. Redirects são
+seguidos manualmente (301/302/303/307/308, máx. MAX_REDIRECTS=5); uma
+cadeia bloqueada ou inválida suprime o fallback Firecrawl (que poderia
+seguir o mesmo redirect inseguro). Falha de rede ou resposta final segura
+sem preço continuam a cair no Firecrawl.
+
 Moeda: preços JSON-LD só são aceites com priceCurrency explícito e
 normalizável (ISO-4217-like, ex.: ARS/EUR/USD). Preços JSON-LD sem moeda
 clara nunca são assumidos como EUR — falham com segurança e caem no regex de
@@ -37,8 +45,11 @@ import json as json_lib
 from typing import Any
 
 import requests
+from urllib.parse import urljoin
 
 from pipeline import quota
+from pipeline.adapters import ssrf_guard
+from pipeline.adapters.ssrf_guard import validate_target as _validate_target
 from pipeline.adapters.url_sanitize import (
     domain_of as _domain_of,
     is_ad_library_url as _is_ad_library_url,
@@ -56,6 +67,9 @@ BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
+
+MAX_REDIRECTS = 5
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 
 # Código ISO-4217-like: exatamente 3 letras ASCII (ARS, BRL, EUR, USD, ...).
 _ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
@@ -219,6 +233,85 @@ def _safe_float(val: Any) -> float | None:
     return f
 
 
+def _http_get_with_redirects(
+    url: str, headers: dict[str, str]
+) -> tuple[requests.Response | None, bool]:
+    """GET com redirecionamentos manuais, cada hop validado contra SSRF.
+
+    Devolve ``(resp, blocked)``:
+    - ``resp`` é a resposta do hop final (ou None em rede/segurança/limite);
+    - ``blocked`` é True quando a cadeia foi interrompida por segurança
+      (alvo inicial ou redirect inseguro, Location ausente/inválida, loop,
+      limite de MAX_REDIRECTS) — nesse caso o caller NÃO deve usar o fallback
+      Firecrawl, porque o Firecrawl poderia seguir o mesmo redirect inseguro.
+
+    O alvo inicial e cada destino de redirect são validados ANTES do request
+    (o hop bloqueado nunca é chamado). Apenas 301/302/303/307/308 são
+    seguidos; Location relativa resolve com urljoin contra o URL do hop
+    atual. Falhas de rede (RequestException) NÃO marcam ``blocked`` — o
+    fallback Firecrawl continua permitido para essas.
+    """
+    current = url
+    seen: set[str] = set()
+    for _ in range(MAX_REDIRECTS + 1):
+        ok, reason = _validate_target(current)
+        if not ok:
+            logger.debug(
+                "Landing price: alvo bloqueado (%s) — sem fallback Firecrawl",
+                reason,
+            )
+            return None, True
+        if current in seen:
+            logger.debug(
+                "Landing price: loop de redirecionamento em %s — sem fallback Firecrawl",
+                _sanitize_url(current) or "",
+            )
+            return None, True
+        seen.add(current)
+        try:
+            resp = requests.get(
+                current, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=False
+            )
+        except requests.RequestException as e:
+            # Nunca logar o texto da exceção: pode ecoar a URL crua
+            # (userinfo/query/fragment) ou credenciais. Só o tipo e a URL
+            # sanitizada saem do processo.
+            logger.debug(
+                "Landing price (HTTP): erro de rede para %s (%s)",
+                _sanitize_url(current) or "", type(e).__name__,
+            )
+            return None, False
+        if resp.status_code not in _REDIRECT_STATUS_CODES:
+            return resp, False
+        location = resp.headers.get("Location")
+        if not location:
+            logger.debug(
+                "Landing price: redirect sem Location em %s — sem fallback Firecrawl",
+                _sanitize_url(current) or "",
+            )
+            return None, True
+        if ssrf_guard.has_forbidden_url_characters(location):
+            logger.debug(
+                "Landing price: Location com caracteres proibidos em %s — sem fallback Firecrawl",
+                _sanitize_url(current) or "",
+            )
+            return None, True
+        try:
+            next_url = urljoin(current, location)
+        except ValueError:
+            logger.debug(
+                "Landing price: Location inválida em %s — sem fallback Firecrawl",
+                _sanitize_url(current) or "",
+            )
+            return None, True
+        current = next_url
+    logger.debug(
+        "Landing price: limite de %d redirecionamentos excedido em %s — sem fallback Firecrawl",
+        MAX_REDIRECTS, _sanitize_url(url) or "",
+    )
+    return None, True
+
+
 def fetch_price(url: str) -> dict[str, Any] | None:
     """
     Extrai preço de uma landing page usando estratégia híbrida.
@@ -245,17 +338,13 @@ def fetch_price(url: str) -> dict[str, Any] | None:
     # URL crua com userinfo/query/fragment.
     safe_url = _sanitize_url(url) or ""
 
-    # ── Nível 1: HTTP simples ──
+    # ── Nível 1: HTTP simples (redirects manuais, cada hop validado) ──
     headers = {"User-Agent": BROWSER_UA}
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-    except requests.RequestException as e:
-        # Nunca logar o texto da exceção: pode ecoar a URL crua (userinfo/
-        # query/fragment) ou credenciais. Só o tipo da exceção e a URL
-        # sanitizada (scheme+host+path) saem do processo.
-        logger.debug("Landing price (HTTP): erro de rede para %s (%s)", safe_url, type(e).__name__)
-        resp = None
+    resp, chain_blocked = _http_get_with_redirects(url, headers)
+    if chain_blocked:
+        # Cadeia bloqueada/inválida: o fallback Firecrawl é suprimido — o
+        # Firecrawl poderia seguir o mesmo redirect inseguro.
+        return None
 
     if resp and resp.status_code == 200:
         html = resp.text
@@ -292,6 +381,15 @@ def _fetch_via_firecrawl(url: str) -> dict[str, Any] | None:
     safe_url = _sanitize_url(url)
     if safe_url is None:
         return None  # sem URL pública válida não há source_url persistível
+
+    # Revalidação imediata antes da reserva de quota/POST: um alvo bloqueado
+    # (privado/userinfo/DNS falhado) nunca gasta credit nem sai do processo —
+    # e a cadeia bloqueada em nível 1 já suprimiu este fallback, por isso esta
+    # revalidação é a última fronteira antes de Firecrawl ver a URL.
+    ok, reason = _validate_target(url)
+    if not ok:
+        logger.debug("Firecrawl: alvo bloqueado (%s) — sem POST nem credit", reason)
+        return None
 
     with quota.transaction(1, firecrawl=True) as reservation:
         if not reservation.available:

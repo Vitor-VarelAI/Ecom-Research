@@ -33,6 +33,12 @@ def test_policies_are_credential_free_and_snapshot_is_isolated():
     serialized = str(policies)
     assert "token" not in serialized and "Bearer" not in serialized and "http" not in serialized.replace("timeout", "").replace("url", "")
 
+    policies["landing_price"]["ssrf"]["max_redirects"] = 999
+    policies["landing_price"]["ssrf"]["residual_limits"].append("mutated")
+    fresh = provenance.snapshot()
+    assert fresh["landing_price"]["ssrf"]["max_redirects"] == 5
+    assert "mutated" not in fresh["landing_price"]["ssrf"]["residual_limits"]
+
 
 def test_full_run_all_sources_valid():
     result = {"ads_data": ADS, "trends_data": TRENDS, "csv_data": CSV, "seo_data": SEO,

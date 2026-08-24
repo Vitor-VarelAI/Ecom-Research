@@ -12,6 +12,8 @@ O outbound Telegram foi implementado e é agora HTML multi-mensagem determiníst
 
 O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). A assinatura de erro que dispara o fallback Rich→HTML está completa e baseada em evidência (envelope oficial da Bot API, integrações open-source/live-verificadas e allowlists exatas — ver `docs/telegram-research/08-rich-fallback-signature.md`); Rich só é reativado para uma coorte de clientes compatível.
 
+O slice de hardening SSRF do fetch de landings está implementado: `pipeline/adapters/ssrf_guard.py` valida cada alvo (inicial e cada hop de redirect) com `validate_target` — apenas http(s), sem userinfo, com host/porta válidos e só endereços públicos unicast (`ipaddress.is_global`, excluindo explicitamente redes privadas, loopback, link-local, reservadas, multicast e unspecified), rejeitando DNS falhado/vazio e respostas DNS mistas público+privado. `landing_price.py` segue redirects manualmente (301/302/303/307/308, máx. 5, loops/Location ausente/limite detetados) e uma cadeia bloqueada ou inválida suprime o fallback Firecrawl, porque o Firecrawl poderia seguir o mesmo redirect inseguro; falha de rede ou resposta final segura sem preço continuam a cair no Firecrawl. `_fetch_via_firecrawl` revalida o alvo antes da reserva de quota/POST, para que um alvo bloqueado nunca gaste credit nem saia do processo. URLs com userinfo são rejeitadas em vez de limpas (o `url_sanitize.py` mantém-se privacy-only e inalterado). Limitações residuais aceites e documentadas: DNS-rebinding TOCTOU (o preflight DNS não elimina rebinding) e os redirects server-side do próprio Firecrawl.
+
 A investigação técnica e comercial está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis em [`REPORT.md`](docs/telegram-research/REPORT.md) e o registo da implementação/smoke em [`IMPLEMENTATION_STATUS.md`](docs/telegram-research/IMPLEMENTATION_STATUS.md). O identity store canónico de produtos foi implementado e está completo: `config/products.json` (`schema_version=1`) é o registo operado manualmente, com cinco produtos e `product_id` imutável (preservado do antigo hash de 12 hex da keyword); `config/keywords.txt` permanece intacto e deixou de ser lido em runtime. A identidade de run usa pares ordenados `(product_id, research_keyword)` — mudar a query ativa cria um run novo (nova pesquisa), enquanto o `product_id` estável preserva o histórico. Packs/manifestos novos carregam `product_id`/`product_name`/`research_keyword`; packs, manifestos e digests históricos são read-only e nunca reescritos; a migração apenas lê artefactos legados. Quarta/mensal selecionam por `product_id` com fallback read-only keyword-legada→alias, mantendo a watchlist e o baseline do pack anterior num produto renomeado. A idempotência de entrega e a segurança contra duplicação não mudaram.
 
 Fora do âmbito continuam callbacks, long polling, Mini App, fornecedores/margens automáticos, Legal Gate executável e monitorização jurídica.
@@ -94,6 +96,8 @@ A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: man
 - timeout/5xx/JSON ilegível/resposta malformada mantém o item ambíguo e bloqueia reenvio (fail-closed);
 - item `sent` nunca é reenviado; v1 `success` é no-op histórico;
 - tokens, chat ID, URL Bot API e descrição Telegram raw fora de logs, estado e report;
+- alvos de landing validados contra SSRF antes de qualquer request (inicial e cada hop de redirect); cadeia bloqueada/inválida suprime o fallback Firecrawl; alvo bloqueado nunca gasta credit Firecrawl;
+- logs de landing contêm apenas a URL sanitizada + reason code seguro, nunca URL crua, userinfo, texto de exceção ou lista de IPs resolvidos;
 - batch tecnicamente incompleto não é entregue ao Telegram (digest deferred no stdout);
 - digest plain text integral como audit text no estado v2;
 - scoring permanece advisory.
@@ -102,7 +106,6 @@ A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: man
 
 - packs legados podem reutilizar `source_url` de landing não sanitizada;
 - quota pode falhar aberta se a persistência falhar;
-- fetch de landing ainda precisa de defesa SSRF;
 - CSV malformado pode levantar `UnicodeDecodeError`;
 - valores gigantes/não finitos não têm guarda total em todos os caches;
 - `_is_inactive` pode ignorar `is_active: false` em casos específicos;
@@ -112,9 +115,14 @@ A disciplina de testes é pragmática porque esta é uma ferramenta pessoal: man
 - itens com entrega ambígua exigem reconciliação manual antes de qualquer reenvio;
 - token Telegram anteriormente exposto continua a precisar de rotação pelo operador.
 
+## Limitações residuais do SSRF (aceites, sem sobrestimar)
+
+- o preflight DNS + revalidação por hop não eliminam o DNS-rebinding TOCTOU: um resolver que responda público na validação e privado no connect real contorna o guard;
+- o Firecrawl segue os seus próprios redirects server-side, fora do controlo do pipeline — um alvo público pode redirecionar lá para um destino privado;
+
 ## Verificação desta sessão
 
-A implementação de matching/evidência e o hardening do review fecharam com **794 testes verdes**, `compileall` e `git diff --check` limpos. O review final dual passou com 96/100 e 97/100, sem P0/P1 nem must-fix. Não houve chamadas de rede, Apify ou Telegram, nem alterações a `.env`, `config/keywords.txt`, `data/`, `packs/` ou artefactos históricos. As regressões cobrem falsos positivos de mochila, fronteira adapter→matcher, projeções matched-only, zero-match, sanitização recursiva e ciclo raw-URL→fetch→persistência segura, proveniência/run identity, guards de legado, pulse sanitizado, candidatos malformados e deduplicação.
+O slice de SSRF fechou com a suite completa verde (853 testes), `compileall` e `git diff --check` limpos. Novos testes: `tests/test_ssrf_guard.py` (44 casos: schemes/userinfo/control chars/portas, ranges IPv4+IPv6 não-públicos incluindo metadata IP, multicast, endereços reservados e loopback IPv4-mapped, literais públicos, DNS público/privado/misto/vazio/erro) e testes de interface pública em `tests/test_landing_price.py` com stub autouse do resolver (sem DNS real): alvo inicial privado/userinfo/DNS falhado → zero GET e zero Firecrawl; redirect relativo público funciona; redirect público→privado e público→userinfo bloqueados antes do segundo GET e nunca chegam ao Firecrawl; loops/Location ausente/>5 hops falham com segurança; alvo Firecrawl bloqueado não faz POST nem gasta quota. Os testes de privacidade existentes com userinfo foram adaptados (removido o userinfo, mantidas as queries secretas) e a rejeição dedicada de userinfo foi adicionada. A revisão GPT acrescentou regressões para whitespace de controlo em `Location`, logs sem caracteres de controlo e isolamento deep-copy da proveniência SSRF. Não houve chamadas de rede, Apify, Telegram ou DNS, nem alterações a `.env`, `data/`, `packs/` ou artefactos históricos.
 
 Usar o ambiente do repositório principal:
 
