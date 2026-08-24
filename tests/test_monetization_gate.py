@@ -15,6 +15,7 @@ import pytest
 from pipeline.monetization import gate
 from tests.fixtures.monetization_helpers import (
     PRODUCT_ID_MOCHILA,
+    candidate_offer,
     catalog_model,
     offer,
     offer_model,
@@ -245,6 +246,103 @@ def test_mixed_active_and_inactive_emits_only_active():
     emission = _evaluate(catalog=catalog)
     assert emission is not None
     assert [offer["offer_id"] for offer in emission["offers"]] == ["mochila-pt-primary"]
+
+
+# ── Lifecycle nullability in the gate (Part A) ─────────────────────────────
+
+
+@pytest.mark.parametrize("status", ["candidate", "applied", "approved", "rejected"])
+def test_non_active_status_with_nulls_never_emits(status):
+    """Every non-active status may carry nulls and is never emitted — the
+    gate stays dark."""
+    catalog = catalog_model(products=(product_model(offers=(
+        offer_model(offer_id="n", status=status,
+                    destination_url=None, affiliate_url_env=None,
+                    commission_type=None, commission_value=None,
+                    cookie_duration_days=None, payout_eligibility=None,
+                    shipping_markets=None, asset_rights=None,
+                    traffic_policy=None, evidence_url=None,
+                    checked_at=None, valid_until=None),
+    )),))
+    assert _evaluate(catalog=catalog) is None
+
+
+def test_null_candidate_beside_complete_active_sibling_emits_only_active():
+    """An incomplete candidate sibling does not block or contaminate the
+    emission of a complete active offer."""
+    offers = (
+        offer_model(offer_id="null-cand", status="candidate",
+                    destination_url=None, affiliate_url_env=None,
+                    commission_type=None, commission_value=None,
+                    cookie_duration_days=None, payout_eligibility=None,
+                    shipping_markets=None, asset_rights=None,
+                    traffic_policy=None, evidence_url=None,
+                    checked_at=None, valid_until=None),
+        offer_model(),  # complete active primary
+    )
+    catalog = catalog_model(products=(product_model(offers=offers),))
+    emission = _evaluate(catalog=catalog)
+    assert emission is not None
+    assert [entry["offer_id"] for entry in emission["offers"]] == ["mochila-pt-primary"]
+
+
+def test_malformed_active_dataclass_with_nulls_is_skipped_without_exception():
+    """Defensive guard: a hand-built active Offer with an unexpected null is
+    skipped (never crashes, never emits); a healthy sibling still emits."""
+    mixed = catalog_model(products=(
+        product_model(offers=(
+            offer_model(offer_id="broken", destination_url=None),
+            offer_model(),  # healthy active sibling
+        )),
+    ))
+    emission = _evaluate(catalog=mixed)
+    assert emission is not None
+    assert [entry["offer_id"] for entry in emission["offers"]] == ["mochila-pt-primary"]
+
+    only_broken = catalog_model(products=(
+        product_model(offers=(
+            offer_model(offer_id="broken", destination_url=None),
+        )),
+    ))
+    assert _evaluate(catalog=only_broken) is None
+
+
+def test_malformed_active_dataclass_with_non_date_values_is_skipped_without_exception():
+    broken = catalog_model(products=(
+        product_model(offers=(
+            offer_model(offer_id="broken", checked_at="2026-08-24", valid_until="2026-12-31"),
+        )),
+    ))
+    assert _evaluate(catalog=broken) is None
+
+
+def test_malformed_active_dataclass_with_null_commission_is_skipped():
+    broken = catalog_model(products=(
+        product_model(offers=(
+            offer_model(offer_id="broken", commission_type=None, commission_value=None),
+        )),
+    ))
+    assert _evaluate(catalog=broken) is None
+
+
+def test_malformed_active_dataclass_with_empty_shipping_is_skipped():
+    broken = catalog_model(products=(
+        product_model(offers=(
+            offer_model(offer_id="broken", shipping_markets=()),
+        )),
+    ))
+    assert _evaluate(catalog=broken) is None
+
+
+def test_candidates_only_catalog_through_real_loader_never_emits(tmp_path):
+    """End-to-end through the real loader: five null-candidate offers produce
+    no emission even when the product is approved."""
+    catalog = write_affiliate_config(tmp_path, [{
+        "product_id": PRODUCT_ID_MOCHILA, "market": "PT", "approved": True,
+        "offers": [candidate_offer()],
+    }])
+    emission = _evaluate(catalog=catalog)
+    assert emission is None
 
 
 # ── No env value leakage, no ranking by commission ─────────────────────────

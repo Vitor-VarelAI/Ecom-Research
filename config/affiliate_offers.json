@@ -1,4 +1,107 @@
 {
   "schema_version": 1,
-  "products": []
+  "products": [
+    {
+      "product_id": "433621eb147d",
+      "market": "US",
+      "approved": false,
+      "offers": [
+        {
+          "offer_id": "pur-copper-primary",
+          "role": "primary",
+          "merchant": "PUR Copper Water Bottles (purcopper.com)",
+          "status": "candidate",
+          "destination_url": "https://purcopper.com/product/copper-water-bottle/",
+          "affiliate_url_env": null,
+          "commission_type": "percentage",
+          "commission_value": 15.0,
+          "commission_currency": null,
+          "cookie_duration_days": null,
+          "payout_eligibility": null,
+          "shipping_markets": ["US", "CA"],
+          "asset_rights": null,
+          "traffic_policy": null,
+          "evidence_url": "https://purcopper.com/pur-brand-ambassador-earn-15-commission-sharing-copper-water-bottles/",
+          "checked_at": "2026-08-24",
+          "valid_until": "2026-11-22"
+        },
+        {
+          "offer_id": "sama-homes-primary",
+          "role": "primary",
+          "merchant": "SAMA Homes (samahomes.ca)",
+          "status": "candidate",
+          "destination_url": "https://samahomes.ca/products/pure-copper-water-bottle-jumbo-1300ml-ayurvedic",
+          "affiliate_url_env": null,
+          "commission_type": null,
+          "commission_value": null,
+          "commission_currency": null,
+          "cookie_duration_days": 30,
+          "payout_eligibility": "Pagamentos automáticos mensais via Shopify Collabs",
+          "shipping_markets": ["US"],
+          "asset_rights": "Dashboard, links de tracking, códigos de desconto personalizados e imagens de marketing após aprovação",
+          "traffic_policy": "Proibido publicar códigos de desconto em sites de cupões, extensões de browser ou diretórios de descontos (zero tolerância)",
+          "evidence_url": "https://samahomes.ca/pages/affiliate-program",
+          "checked_at": "2026-08-24",
+          "valid_until": "2026-11-22"
+        },
+        {
+          "offer_id": "copperwater-primary",
+          "role": "primary",
+          "merchant": "CopperWater.com (copperwater.com)",
+          "status": "candidate",
+          "destination_url": "https://copperwater.com/products/the-copper-water-bottle",
+          "affiliate_url_env": null,
+          "commission_type": null,
+          "commission_value": null,
+          "commission_currency": null,
+          "cookie_duration_days": null,
+          "payout_eligibility": null,
+          "shipping_markets": ["US"],
+          "asset_rights": null,
+          "traffic_policy": null,
+          "evidence_url": "https://copperwater.com/pages/affiliateprogram",
+          "checked_at": "2026-08-24",
+          "valid_until": "2026-11-22"
+        },
+        {
+          "offer_id": "amazon-us-trust-fallback",
+          "role": "trust_fallback",
+          "merchant": "Amazon Associates US (amazon.com)",
+          "status": "candidate",
+          "destination_url": "https://www.amazon.com/Kosdeg-Hammered-Copper-Water-Bottle/dp/B079ZL8FS3",
+          "affiliate_url_env": null,
+          "commission_type": null,
+          "commission_value": null,
+          "commission_currency": null,
+          "cookie_duration_days": 1,
+          "payout_eligibility": null,
+          "shipping_markets": ["US"],
+          "asset_rights": "Conteúdo do programa (textos, imagens, links) só conforme licença: não alterar conteúdo, não guardar/cachear imagens (apenas link até 24h) e ligar sempre à página de detalhe do produto",
+          "traffic_policy": "Proibido paid search com a palavra amazon, marcas Amazon ou variações; anúncios pagos apenas para queries genéricas que levem ao nosso site, nunca diretamente a uma página da Amazon",
+          "evidence_url": "https://affiliate-program.amazon.com/help/operating/commission-income-statement",
+          "checked_at": "2026-08-24",
+          "valid_until": "2026-11-22"
+        },
+        {
+          "offer_id": "copper-utensil-online-primary",
+          "role": "primary",
+          "merchant": "Copper Utensil Online (copperutensilonline.com)",
+          "status": "candidate",
+          "destination_url": "https://www.copperutensilonline.com/hammered-pure-copper-water-bottle-seamless-1000-ml-capacity.php",
+          "affiliate_url_env": null,
+          "commission_type": null,
+          "commission_value": null,
+          "commission_currency": null,
+          "cookie_duration_days": null,
+          "payout_eligibility": null,
+          "shipping_markets": null,
+          "asset_rights": "Banners de texto/gráficos, email ads e HTML ads com ID de afiliado único (ferramentas oficiais do programa)",
+          "traffic_policy": null,
+          "evidence_url": "https://www.copperutensilonline.com/programs/affiliate",
+          "checked_at": "2026-08-24",
+          "valid_until": "2026-11-22"
+        }
+      ]
+    }
+  ]
 }

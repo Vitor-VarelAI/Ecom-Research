@@ -3,9 +3,10 @@
 Public surface for the research pipeline: ``load_catalog`` (strict,
 fail-closed config loading), ``evaluate_gate`` (pure eligibility/emission)
 and ``render_markdown`` (pack section).  The committed
-``config/affiliate_offers.json`` currently configures no products/offers, so
-the gate yields nothing until the operator adds an approved product with an
-active, unexpired offer whose ``affiliate_url_env`` is set.
+``config/affiliate_offers.json`` configures one unapproved copper product
+with five ``candidate`` offers (no env references, no active offers), so
+the gate stays dark until the operator approves the product and activates
+a fully validated, unexpired offer whose ``affiliate_url_env`` is set.
 """
 
 from __future__ import annotations

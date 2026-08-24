@@ -23,6 +23,36 @@ from pipeline.monetization.model import DISCLOSURE_PT_PT, AffiliateCatalog, Offe
 # ads evidence, trend evidence and keyword-volume evidence.
 CRITICAL_SOURCE_NAMES = ("apify_ads", "trends", "keyword_csv")
 
+# Fields an ACTIVE offer must carry before it can emit (defensive guard).
+_ACTIVE_REQUIRED_FIELDS = (
+    "destination_url", "affiliate_url_env", "commission_type",
+    "commission_value", "cookie_duration_days", "payout_eligibility",
+    "shipping_markets", "asset_rights", "traffic_policy", "evidence_url",
+    "checked_at", "valid_until",
+)
+
+
+def _active_offer_complete(offer: Offer) -> bool:
+    """Defensive completeness guard for emission.
+
+    Only fully validated active offers emit.  A hand-built (or future)
+    active offer with an unexpected null is skipped — never crashes, never
+    emits.  ``commission_currency`` is ``None`` only for percentage offers.
+    """
+    if any(getattr(offer, name) is None for name in _ACTIVE_REQUIRED_FIELDS):
+        return False
+    if not offer.shipping_markets:
+        return False
+    if not isinstance(offer.checked_at, date) or not isinstance(offer.valid_until, date):
+        return False
+    if offer.checked_at > offer.valid_until:
+        return False
+    if offer.commission_type == "percentage":
+        return offer.commission_currency is None
+    if offer.commission_type == "fixed":
+        return offer.commission_currency is not None
+    return False
+
 
 def evaluate(
     *,
@@ -88,7 +118,7 @@ def evaluate(
 
     eligible = []
     for offer in product.offers:
-        if offer.status != "active":
+        if offer.status != "active" or not _active_offer_complete(offer):
             continue
         if offer.valid_until < today:
             continue

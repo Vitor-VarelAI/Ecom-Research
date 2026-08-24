@@ -32,25 +32,33 @@ DISCLOSURE_PT_PT = (
 
 @dataclass(frozen=True, slots=True)
 class Offer:
-    """One strictly validated affiliate offer (operator-configured)."""
+    """One strictly validated affiliate offer (operator-configured).
+
+    Identity fields (``offer_id``/``role``/``merchant``/``status``) are
+    mandatory/non-null for every status.  The optional fields are JSON
+    ``null`` (unknown) for ``candidate``/``applied``/``rejected`` and always
+    complete for ``approved``/``active`` — validated exactly like the legacy
+    strict schema, so only fully validated active offers can emit.
+    ``commission_currency`` is ``None`` for percentage offers.
+    """
 
     offer_id: str
     role: str
     merchant: str
     status: str
-    destination_url: str
-    affiliate_url_env: str
-    commission_type: str
-    commission_value: float
+    destination_url: str | None
+    affiliate_url_env: str | None
+    commission_type: str | None
+    commission_value: float | None
     commission_currency: str | None
-    cookie_duration_days: int
-    payout_eligibility: str
-    shipping_markets: tuple[str, ...]
-    asset_rights: str
-    traffic_policy: str
-    evidence_url: str
-    checked_at: date
-    valid_until: date
+    cookie_duration_days: int | None
+    payout_eligibility: str | None
+    shipping_markets: tuple[str, ...] | None
+    asset_rights: str | None
+    traffic_policy: str | None
+    evidence_url: str | None
+    checked_at: date | None
+    valid_until: date | None
 
 
 @dataclass(frozen=True, slots=True)

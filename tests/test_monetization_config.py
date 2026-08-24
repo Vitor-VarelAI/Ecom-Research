@@ -16,6 +16,7 @@ import pytest
 from pipeline.monetization import config as monetization_config
 from tests.fixtures.monetization_helpers import (
     PRODUCT_ID_MOCHILA,
+    candidate_offer,
     offer,
     product_config,
     write_affiliate_config,
@@ -76,6 +77,207 @@ def test_market_case_insensitive_in_shipping_markets(tmp_path):
     catalog = write_affiliate_config(tmp_path, payload["products"])
     assert catalog is not None
     assert catalog.products[0].market == "pt"
+
+
+# ── Lifecycle-aware nullability ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("status", ["candidate", "applied", "rejected"])
+def test_incomplete_status_with_all_nullable_fields_null_loads(tmp_path, status):
+    """candidate/applied/rejected may express every optional fact as JSON
+    null (unknown) while the identity fields stay mandatory."""
+    catalog = write_affiliate_config(
+        tmp_path, [product_config(offers=[candidate_offer(status=status)])]
+    )
+    assert catalog is not None
+    offer_entry = catalog.products[0].offers[0]
+    assert offer_entry.status == status
+    assert offer_entry.offer_id == "mochila-pt-candidate"
+    assert offer_entry.role == "primary"
+    assert offer_entry.merchant == "Merchant X"
+    for name in (
+        "destination_url", "affiliate_url_env", "commission_type",
+        "commission_value", "commission_currency", "cookie_duration_days",
+        "payout_eligibility", "shipping_markets", "asset_rights",
+        "traffic_policy", "evidence_url", "checked_at", "valid_until",
+    ):
+        assert getattr(offer_entry, name) is None, name
+
+
+@pytest.mark.parametrize("status", ["active", "approved"])
+def test_active_or_approved_requires_complete_fields(tmp_path, status):
+    """approved/active demand every field complete: an all-null offer is
+    invalid for them exactly as under the legacy strict schema."""
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(status=status)]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+
+
+def test_approved_offer_with_complete_fields_loads_but_stays_inert(tmp_path):
+    """A fully validated approved offer loads; the gate never emits it
+    (only active emits)."""
+    catalog = write_affiliate_config(tmp_path, [product_config(offers=[offer(status="approved")])])
+    assert catalog is not None
+    assert catalog.products[0].offers[0].status == "approved"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # Present-but-malformed candidate fields must fail closed.
+        lambda o: o.__setitem__("destination_url", "https://x.example/p?q=1"),
+        lambda o: o.__setitem__("destination_url", "ftp://x.example/p"),
+        lambda o: o.__setitem__("affiliate_url_env", "MY TAG"),
+        lambda o: o.__setitem__("commission_type", "per-click"),
+        lambda o: o.__setitem__("commission_value", 0),
+        lambda o: o.__setitem__("commission_value", float("inf")),
+        lambda o: o.__setitem__("commission_currency", "eur"),
+        lambda o: o.__setitem__("commission_currency", "EU"),
+        lambda o: o.__setitem__("cookie_duration_days", 0),
+        lambda o: o.__setitem__("cookie_duration_days", 30.5),
+        lambda o: o.__setitem__("payout_eligibility", " "),
+        lambda o: o.__setitem__("shipping_markets", []),
+        lambda o: o.__setitem__("shipping_markets", ["PT", ""]),
+        lambda o: o.__setitem__("asset_rights", "\n"),
+        lambda o: o.__setitem__("traffic_policy", "  "),
+        lambda o: o.__setitem__("evidence_url", "https://x.example/e#top"),
+        lambda o: o.__setitem__("checked_at", "not-a-date"),
+        lambda o: o.__setitem__("valid_until", "2026-13-40"),
+    ],
+)
+def test_malformed_present_candidate_fields_fail_closed(tmp_path, mutate):
+    payload = _valid_payload()
+    candidate = candidate_offer()
+    mutate(candidate)
+    payload["products"][0]["offers"] = [candidate]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+
+
+def test_commission_type_and_value_must_both_be_present_or_both_null(tmp_path):
+    # type present, value null -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(commission_type="percentage")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # value present, type null -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(commission_value=5.0)]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # currency alone (no commission) -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(commission_currency="USD")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+
+
+def test_fixed_requires_currency_and_percentage_forbids_currency(tmp_path):
+    # fixed without currency -> invalid (legacy rule)
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(
+        commission_type="fixed", commission_value=2.5, commission_currency=None)]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # percentage with a currency -> invalid (cross-field rule)
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(
+        commission_type="percentage", commission_value=5.0, commission_currency="USD")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # fixed with currency -> valid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(
+        commission_type="fixed", commission_value=2.5, commission_currency="USD")]
+    catalog = write_affiliate_config(tmp_path, payload["products"])
+    assert catalog is not None
+    assert catalog.products[0].offers[0].commission_currency == "USD"
+
+
+def test_evidence_url_and_dates_are_all_or_none(tmp_path):
+    # evidence_url present, dates null -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(evidence_url="https://x.example/e")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # checked_at present alone -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(checked_at="2026-08-24")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # valid_until present alone -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(valid_until="2026-11-22")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # all three present but checked_at > valid_until -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(
+        evidence_url="https://x.example/e", checked_at="2026-12-01", valid_until="2026-11-22")]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # all three present and ordered -> valid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer(
+        evidence_url="https://x.example/e", checked_at="2026-08-24", valid_until="2026-11-22")]
+    catalog = write_affiliate_config(tmp_path, payload["products"])
+    assert catalog is not None
+    assert catalog.products[0].offers[0].checked_at.isoformat() == "2026-08-24"
+
+
+def test_nullable_shipping_markets_must_cover_market_when_present(tmp_path):
+    # null shipping markets on a candidate -> valid
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [candidate_offer()]
+    assert write_affiliate_config(tmp_path, payload["products"]) is not None
+    # present but missing the operator market -> invalid
+    payload = _valid_payload()
+    payload["products"][0]["market"] = "US"
+    payload["products"][0]["offers"] = [candidate_offer(shipping_markets=("DE",))]
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
+    # present and covering the market -> valid
+    payload = _valid_payload()
+    payload["products"][0]["market"] = "US"
+    payload["products"][0]["offers"] = [candidate_offer(shipping_markets=("US", "CA"))]
+    catalog = write_affiliate_config(tmp_path, payload["products"])
+    assert catalog is not None
+    assert catalog.products[0].offers[0].shipping_markets == ("US", "CA")
+
+
+def test_exact_keys_still_required_for_nullable_candidate(tmp_path):
+    """Null must be explicit: omitting an optional key is still invalid, and
+    identity fields can never be null for any status."""
+    for field in (
+        "destination_url", "affiliate_url_env", "commission_type",
+        "commission_value", "commission_currency", "cookie_duration_days",
+        "payout_eligibility", "shipping_markets", "asset_rights",
+        "traffic_policy", "evidence_url", "checked_at", "valid_until",
+    ):
+        payload = _valid_payload()
+        candidate = candidate_offer()
+        del candidate[field]
+        payload["products"][0]["offers"] = [candidate]
+        assert monetization_config.load(write_raw_config(tmp_path, payload)) is None, field
+    for field in ("offer_id", "role", "merchant", "status"):
+        payload = _valid_payload()
+        candidate = candidate_offer()
+        candidate[field] = None
+        payload["products"][0]["offers"] = [candidate]
+        assert monetization_config.load(write_raw_config(tmp_path, payload)) is None, field
+
+
+def test_multiple_candidate_primaries_are_valid(tmp_path):
+    """Only multiple ACTIVE offers per role are forbidden; several candidate
+    primaries are a legitimate research state."""
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [
+        candidate_offer(offer_id="cand-1"),
+        candidate_offer(offer_id="cand-2"),
+    ]
+    catalog = write_affiliate_config(tmp_path, payload["products"])
+    assert catalog is not None
+    assert len(catalog.products[0].offers) == 2
+
+
+def test_active_plus_null_candidate_same_role_is_valid(tmp_path):
+    payload = _valid_payload()
+    payload["products"][0]["offers"] = [
+        offer(offer_id="primary-1", affiliate_url_env="TAG_A"),
+        candidate_offer(offer_id="primary-2"),
+    ]
+    catalog = write_affiliate_config(tmp_path, payload["products"])
+    assert catalog is not None
+    assert len(catalog.products[0].offers) == 2
 
 
 # ── Malformed -> None (fail-closed) ────────────────────────────────────────
@@ -184,6 +386,14 @@ def test_fixed_commission_without_currency_fails_closed(tmp_path):
     payload["products"][0]["offers"][0] = offer(commission_type="fixed", commission_value=2.5, commission_currency=None)
     path = write_raw_config(tmp_path, payload)
     assert monetization_config.load(path) is None
+
+
+def test_percentage_offer_with_currency_fails_closed(tmp_path):
+    """A present percentage commission must carry a null currency (cross-field
+    rule, also under the legacy active schema)."""
+    payload = _valid_payload()
+    payload["products"][0]["offers"][0]["commission_currency"] = "USD"
+    assert monetization_config.load(write_raw_config(tmp_path, payload)) is None
 
 
 def test_two_active_offers_same_role_fails_closed(tmp_path):

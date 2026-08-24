@@ -149,6 +149,36 @@ def test_eligible_run_attaches_monetization_without_touching_score(monkeypatch, 
     assert generated[0]["score_result"] == expected
 
 
+def test_candidates_only_config_keeps_output_identical_to_disabled(monkeypatch, tmp_path):
+    """A candidates-only config (no active offer, nulls everywhere) behaves
+    exactly like the missing config: monetization stays None and the research
+    output is unchanged (pack/run unchanged when candidates only)."""
+    monkeypatch.setattr(run_module, "REPO_ROOT", str(tmp_path))
+    _install_run_stack(monkeypatch)
+    baseline = run_module.run_keyword(product("mochila personalizada"))
+
+    write_affiliate_config(tmp_path, [{
+        "product_id": stable_id("mochila personalizada"),
+        "market": "PT", "approved": True,
+        "offers": [{
+            "offer_id": "cand-1", "role": "primary", "merchant": "M",
+            "status": "candidate",
+            "destination_url": None, "affiliate_url_env": None,
+            "commission_type": None, "commission_value": None,
+            "commission_currency": None, "cookie_duration_days": None,
+            "payout_eligibility": None, "shipping_markets": None,
+            "asset_rights": None, "traffic_policy": None,
+            "evidence_url": None, "checked_at": None, "valid_until": None,
+        }],
+    }])
+    _install_run_stack(monkeypatch)
+    with_config = run_module.run_keyword(product("mochila personalizada"))
+    for key in ("score_result", "trends_data", "csv_data", "ads_data",
+                "seo_data", "landing_price_data", "suggested_keywords", "md_path"):
+        assert with_config[key] == baseline[key], key
+    assert with_config["monetization"] is None
+
+
 def test_monetization_configuration_never_changes_research_output(monkeypatch, tmp_path):
     """Running the same keyword with and without an eligible monetization
     config yields identical research output; only the additive key differs."""

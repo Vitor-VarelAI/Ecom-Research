@@ -4,16 +4,32 @@ The loader never raises and never leaks file contents or validation details:
 any missing/unreadable/malformed config yields ``None`` (monetization
 disabled) behind a single sanitized log line, so a bad config can never
 break a research run nor expose raw config/errors.  The committed config
-carries ``schema_version: 1`` and no products/offers (empty-but-valid
-config loads as a valid empty catalog; the gate then yields nothing).
+carries ``schema_version: 1`` and one unapproved copper product with five
+``candidate`` offers (no env references, no active offers — the gate stays
+dark); an empty config also loads as a valid empty catalog.
 
 Validation contract (all-or-nothing per file):
 
 * exact top-level/product/offer key sets (unknown keys reject the file);
+  the offer key set is identical for every status — unknown values are
+  represented only by JSON ``null``, never by omitted keys;
 * ``schema_version`` must be exactly 1;
 * ``product_id`` must match the products.json registry format and be unique;
 * ``offer_id`` must match the offer format and be unique across the catalog;
-* product ``market`` must be covered by every offer's ``shipping_markets``;
+* identity fields (``offer_id``/``role``/``merchant``/``status``) are
+  mandatory/non-null for every status;
+* lifecycle-aware nullability: ``candidate``/``applied``/``rejected`` may
+  use null for the optional fields (unknown); ``approved``/``active`` require
+  every field complete, validated exactly like the legacy active schema;
+* any present optional value must pass the existing strict validator
+  (a malformed present candidate field invalidates the whole config);
+* cross-field rules: commission type/value are both present or both null,
+  ``fixed`` requires a 3-letter currency and ``percentage`` requires a null
+  currency; evidence URL + ``checked_at`` + ``valid_until`` are all present
+  or all null with ``checked_at <= valid_until``; shipping markets, when
+  present, are non-empty and must include the product ``market``;
+  ``affiliate_url_env``, when present, matches env-name syntax;
+* product ``market`` must be covered by every present ``shipping_markets``;
 * URLs must be http(s), without userinfo/query/fragment/control characters
   and sanitizable to their public canonical form (stored sanitized);
 * dates must be valid ISO with ``checked_at <= valid_until``;
@@ -127,9 +143,7 @@ def _build(raw: Any) -> AffiliateCatalog:
         offers: list[Offer] = []
         active_by_role: dict[str, int] = {}
         for offer_entry in offers_raw:
-            offer = _build_offer(offer_entry, seen_offer_ids)
-            if _norm(market) not in {_norm(market_item) for market_item in offer.shipping_markets}:
-                raise _InvalidConfig  # the operator's market must ship via this offer
+            offer = _build_offer(offer_entry, seen_offer_ids, market=market)
             if offer.status == "active":
                 active_by_role[offer.role] = active_by_role.get(offer.role, 0) + 1
             offers.append(offer)
@@ -141,7 +155,7 @@ def _build(raw: Any) -> AffiliateCatalog:
     return AffiliateCatalog(schema_version=1, products=tuple(products))
 
 
-def _build_offer(raw: Any, seen_offer_ids: set[str]) -> Offer:
+def _build_offer(raw: Any, seen_offer_ids: set[str], *, market: str) -> Offer:
     if not isinstance(raw, dict) or set(raw.keys()) != _OFFER_KEYS:
         raise _InvalidConfig
     offer_id = raw["offer_id"]
@@ -151,47 +165,59 @@ def _build_offer(raw: Any, seen_offer_ids: set[str]) -> Offer:
         raise _InvalidConfig
     seen_offer_ids.add(offer_id)
 
+    # Identity fields are mandatory/non-null for every status.
     role = _require_choice(raw["role"], OFFER_ROLES)
     merchant = _require_text(raw["merchant"])
     status = _require_choice(raw["status"], OFFER_STATUSES)
-    destination_url = _require_public_url(raw["destination_url"])
-    affiliate_url_env = raw["affiliate_url_env"]
-    if not isinstance(affiliate_url_env, str) or not _ENV_NAME_RE.fullmatch(affiliate_url_env):
-        raise _InvalidConfig
 
-    commission_type = _require_choice(raw["commission_type"], COMMISSION_TYPES)
-    commission_value = raw["commission_value"]
-    if isinstance(commission_value, bool) or not isinstance(commission_value, (int, float)):
-        raise _InvalidConfig
-    try:
-        commission_finite = math.isfinite(float(commission_value))
-    except (OverflowError, ValueError):
-        commission_finite = False
-    if not commission_finite or float(commission_value) <= 0:
-        raise _InvalidConfig
-    commission_currency = raw["commission_currency"]
-    if commission_currency is not None:
-        if not isinstance(commission_currency, str) or not _ISO_CURRENCY_RE.fullmatch(commission_currency):
-            raise _InvalidConfig
-    elif commission_type == "fixed":
-        raise _InvalidConfig  # currency is required for fixed commissions
+    # approved/active demand every field complete (legacy strict schema);
+    # candidate/applied/rejected may express unknown facts as JSON null.
+    strict = status in ("approved", "active")
 
-    cookie = raw["cookie_duration_days"]
-    if isinstance(cookie, bool) or not isinstance(cookie, int) or cookie <= 0:
-        raise _InvalidConfig
-
-    payout_eligibility = _require_text(raw["payout_eligibility"])
+    destination_url = _nullable_url(raw["destination_url"], required=strict)
+    affiliate_url_env = _nullable_env(raw["affiliate_url_env"], required=strict)
+    commission_type = _nullable_choice(raw["commission_type"], COMMISSION_TYPES, required=strict)
+    commission_value = _nullable_positive_number(raw["commission_value"], required=strict)
+    commission_currency = _nullable_currency(raw["commission_currency"])
+    cookie = _nullable_positive_int(raw["cookie_duration_days"], required=strict)
+    payout_eligibility = _nullable_text(raw["payout_eligibility"], required=strict)
     shipping_raw = raw["shipping_markets"]
-    if not isinstance(shipping_raw, list) or not shipping_raw:
-        raise _InvalidConfig
-    shipping_markets = tuple(_require_text(item) for item in shipping_raw)
-    asset_rights = _require_text(raw["asset_rights"])
-    traffic_policy = _require_text(raw["traffic_policy"])
-    evidence_url = _require_public_url(raw["evidence_url"])
+    if shipping_raw is None:
+        if strict:
+            raise _InvalidConfig
+        shipping_markets = None
+    else:
+        if not isinstance(shipping_raw, list) or not shipping_raw:
+            raise _InvalidConfig
+        shipping_markets = tuple(_require_text(item) for item in shipping_raw)
+    asset_rights = _nullable_text(raw["asset_rights"], required=strict)
+    traffic_policy = _nullable_text(raw["traffic_policy"], required=strict)
+    evidence_url = _nullable_url(raw["evidence_url"], required=strict)
+    checked_at = _nullable_date(raw["checked_at"], required=strict)
+    valid_until = _nullable_date(raw["valid_until"], required=strict)
 
-    checked_at = _require_iso_date(raw["checked_at"])
-    valid_until = _require_iso_date(raw["valid_until"])
-    if checked_at > valid_until:
+    # Cross-field rules (applied whenever a field is present):
+    # commission type/value are both present or both null.
+    if (commission_type is None) != (commission_value is None):
+        raise _InvalidConfig
+    if commission_type is not None:
+        if commission_type == "fixed":
+            if commission_currency is None:
+                raise _InvalidConfig  # currency is required for fixed commissions
+        else:
+            if commission_currency is not None:
+                raise _InvalidConfig  # percentage commissions carry no currency
+    elif commission_currency is not None:
+        raise _InvalidConfig  # a currency without a commission is meaningless
+
+    # Evidence URL + checked_at + valid_until: all present or all null.
+    if len({evidence_url is None, checked_at is None, valid_until is None}) != 1:
+        raise _InvalidConfig
+    if evidence_url is not None and checked_at > valid_until:
+        raise _InvalidConfig
+
+    # Shipping markets, when present, are non-empty and cover the market.
+    if shipping_markets is not None and _norm(market) not in {_norm(item) for item in shipping_markets}:
         raise _InvalidConfig
 
     return Offer(
@@ -202,7 +228,7 @@ def _build_offer(raw: Any, seen_offer_ids: set[str]) -> Offer:
         destination_url=destination_url,
         affiliate_url_env=affiliate_url_env,
         commission_type=commission_type,
-        commission_value=float(commission_value),
+        commission_value=commission_value,
         commission_currency=commission_currency,
         cookie_duration_days=cookie,
         payout_eligibility=payout_eligibility,
@@ -217,6 +243,84 @@ def _build_offer(raw: Any, seen_offer_ids: set[str]) -> Offer:
 
 def _norm(value: str) -> str:
     return value.strip().upper()
+
+
+def _nullable_text(value: Any, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    return _require_text(value)
+
+
+def _nullable_url(value: Any, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    return _require_public_url(value)
+
+
+def _nullable_choice(value: Any, choices: tuple[str, ...], *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    return _require_choice(value, choices)
+
+
+def _nullable_env(value: Any, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    if not isinstance(value, str) or not _ENV_NAME_RE.fullmatch(value):
+        raise _InvalidConfig
+    return value
+
+
+def _nullable_currency(value: Any) -> str | None:
+    """Currency is optional for every status (None for percentage); any present
+    value must be a 3-letter ISO code (enforced by the cross-field rules)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _ISO_CURRENCY_RE.fullmatch(value):
+        raise _InvalidConfig
+    return value
+
+
+def _nullable_positive_number(value: Any, *, required: bool) -> float | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _InvalidConfig
+    try:
+        finite = math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        finite = False
+    if not finite or float(value) <= 0:
+        raise _InvalidConfig
+    return float(value)
+
+
+def _nullable_positive_int(value: Any, *, required: bool) -> int | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _InvalidConfig
+    return value
+
+
+def _nullable_date(value: Any, *, required: bool) -> date | None:
+    if value is None:
+        if required:
+            raise _InvalidConfig
+        return None
+    return _require_iso_date(value)
 
 
 def _require_choice(value: Any, choices: tuple[str, ...]) -> str:

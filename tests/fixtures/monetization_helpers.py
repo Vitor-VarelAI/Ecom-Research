@@ -59,6 +59,50 @@ def offer(
     }
 
 
+def candidate_offer(
+    offer_id: str = "mochila-pt-candidate",
+    *,
+    role: str = "primary",
+    merchant: str = "Merchant X",
+    status: str = "candidate",
+    destination_url: str | None = None,
+    affiliate_url_env: str | None = None,
+    commission_type: str | None = None,
+    commission_value: float | None = None,
+    commission_currency: str | None = None,
+    cookie_duration_days: int | None = None,
+    payout_eligibility: str | None = None,
+    shipping_markets: tuple[str, ...] | None = None,
+    asset_rights: str | None = None,
+    traffic_policy: str | None = None,
+    evidence_url: str | None = None,
+    checked_at: str | None = None,
+    valid_until: str | None = None,
+) -> dict[str, Any]:
+    """An incomplete lifecycle offer: every optional field defaults to JSON
+    ``null`` (unknown).  Present values are validated strictly; identity
+    fields stay mandatory for every status."""
+    return {
+        "offer_id": offer_id,
+        "role": role,
+        "merchant": merchant,
+        "status": status,
+        "destination_url": destination_url,
+        "affiliate_url_env": affiliate_url_env,
+        "commission_type": commission_type,
+        "commission_value": commission_value,
+        "commission_currency": commission_currency,
+        "cookie_duration_days": cookie_duration_days,
+        "payout_eligibility": payout_eligibility,
+        "shipping_markets": list(shipping_markets) if shipping_markets is not None else None,
+        "asset_rights": asset_rights,
+        "traffic_policy": traffic_policy,
+        "evidence_url": evidence_url,
+        "checked_at": checked_at,
+        "valid_until": valid_until,
+    }
+
+
 def product_config(
     product_id: str = PRODUCT_ID_MOCHILA,
     *,
