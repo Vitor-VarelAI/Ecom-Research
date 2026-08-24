@@ -1,8 +1,11 @@
 # Copper bottles — pesquisa afiliada verificada (2026-08-24)
 
 Produto: `copper bottles` (`product_id=433621eb147d`), mercado escolhido pelo operador: **US**.
-Estado: **nenhuma candidatura submetida, nenhuma oferta ativa, gate escuro**. Todas as
-ofertas registadas em `config/affiliate_offers.json` têm `status: candidate`,
+Estado: **teste técnico concluído; nenhuma candidatura submetida, nenhuma oferta ativa,
+gate escuro**. O operador confirmou que este catálogo serve apenas para testar o schema
+e o gate; não existe intenção nem tarefa pendente de inscrição. Qualquer candidatura futura
+exige um novo pedido explícito. Todas as ofertas registadas em
+`config/affiliate_offers.json` têm `status: candidate`,
 `affiliate_url_env: null` (sem referências a variáveis de ambiente) e o produto tem
 `approved: false` — mesmo que a aprovação do produto mudasse por engano, o gate
 continuaria sem emitir porque não existe nenhuma oferta `active`.
@@ -81,7 +84,7 @@ the Use of Endorsements and Testimonials in Advertising, referida no próprio ac
 - Traffic policy: sem restrição oficial publicada → null.
 - Evidência: a página do programa acima; datas `2026-08-24` / `2026-11-22`.
 
-## Bloqueadores antes de qualquer candidate → approved/active
+## Verificações exigidas apenas se existir um novo pedido futuro
 
 1. **Aprovação do produto** (`approved: false` hoje) e **aprovação da conta/do site** em cada programa — nenhuma candidatura foi submetida.
 2. **Amazon:** disclosure oficial "As an Amazon Associate I earn from qualifying purchases." obrigatória no destino; categoria viva da listing (hoje Sports & Outdoors = 3%, não Kitchen = 4.5%); payout Portugal/Fx4Cash não reconfirmado (null); listing re-verificada.
@@ -90,6 +93,7 @@ the Use of Endorsements and Testimonials in Advertising, referida no próprio ac
 
 ## Estado
 
-- Nenhuma candidatura submetida; nenhuma oferta `active`; gate nunca emite (produto não aprovado e zero ofertas ativas).
+- Teste técnico encerrado: nenhuma candidatura submetida e nenhuma ação operacional pendente.
+- Nenhuma oferta `active`; gate nunca emite (produto não aprovado e zero ofertas ativas).
 - `checked_at = 2026-08-24`, `valid_until = 2026-11-22` (janela de evidência de 90 dias).
 - Fora de âmbito: resolução de links tracked, geração de páginas, click tracking, chamadas/scraping/inscrições em programas.
