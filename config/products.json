@@ -35,6 +35,13 @@
       "research_keyword": "velas aromáticas",
       "aliases": [],
       "active": true
+    },
+    {
+      "product_id": "433621eb147d",
+      "name": "copper bottles",
+      "research_keyword": "copper bottles",
+      "aliases": [],
+      "active": false
     }
   ]
 }

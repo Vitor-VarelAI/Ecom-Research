@@ -29,6 +29,7 @@ EXPECTED_IDS = [
     "a16e2196eb4d",
     "ef5cd634db44",
     "258053734570",
+    "433621eb147d",
 ]
 EXPECTED_KEYWORDS = [
     "mochila personalizada",
@@ -36,6 +37,7 @@ EXPECTED_KEYWORDS = [
     "caneca personalizada",
     "tapete yoga",
     "velas aromáticas",
+    "copper bottles",
 ]
 
 
@@ -78,8 +80,9 @@ def test_normalize_strips_collapses_whitespace_folds_accents_and_case():
 def test_committed_registry_loads_in_order_and_resolves_variants():
     registry = load_registry(CONFIG_PRODUCTS)
     assert [p.product_id for p in registry.products] == EXPECTED_IDS
-    assert [p.product_id for p in registry.active_products()] == EXPECTED_IDS
-    assert all(p.active for p in registry.products)
+    assert [p.product_id for p in registry.active_products()] == EXPECTED_IDS[:-1]
+    assert all(p.active for p in registry.products[:-1])
+    assert registry.products[-1].active is False
 
     assert registry.resolve("e942e8bf7f30").product_id == "e942e8bf7f30"
     assert registry.resolve("  MOCHILA   Personalizada ").name == "mochila personalizada"
@@ -87,6 +90,7 @@ def test_committed_registry_loads_in_order_and_resolves_variants():
     assert registry.resolve("CANECA PERSONALIZADA").product_id == "a16e2196eb4d"
     assert registry.resolve("tapete  yoga").product_id == "ef5cd634db44"
     assert registry.resolve("VELAS AROMÁTICAS").product_id == "258053734570"
+    assert registry.resolve("COPPER BOTTLES").product_id == "433621eb147d"
 
 
 # ── Validation family: schema / shape ──────────────────────────────────────
@@ -363,7 +367,8 @@ def test_committed_products_json_has_exact_bootstrap_content():
     assert [p["research_keyword"] for p in data["products"]] == EXPECTED_KEYWORDS
     for product in data["products"]:
         assert product["name"] == product["research_keyword"]
-        assert product["active"] is True
+    assert all(product["active"] is True for product in data["products"][:-1])
+    assert data["products"][-1]["active"] is False
     # Historical camisola variants consolidate as aliases so their watchlist
     # history maps onto the canonical product instead of dropping out.
     camisola = data["products"][1]

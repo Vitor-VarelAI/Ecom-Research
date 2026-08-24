@@ -19,7 +19,7 @@ O modo full requer `APIFY_API_TOKEN` e `SERPAPI_KEY`. O repositório não conté
 - `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`: entrega opcional, sempre send-only.
 - `TELEGRAM_RENDERER=html`: renderer do outbound (default de código e documentado; Rich permanece desativado para a coorte de clientes atual).
 
-O registo canónico de produtos é `config/products.json` (`schema_version=1`): cinco produtos com `product_id` imutável (preservado do antigo hash de 12 hex da keyword), um `research_keyword` ativo por produto e aliases para keywords históricas (camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta). `config/keywords.txt` permanece intacto e já não é lido em runtime.
+O registo canónico de produtos é `config/products.json` (`schema_version=1`): seis produtos com `product_id` imutável (cinco ativos; `copper bottles` preservado inativo após o smoke live) (preservado do antigo hash de 12 hex da keyword), um `research_keyword` ativo por produto e aliases para keywords históricas (camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta). `config/keywords.txt` permanece intacto e já não é lido em runtime.
 
 O volume e CPC vêm de um export manual do Google Keyword Planner colocado em `data/`. O parser aceita o formato real em UTF-16 LE com BOM, tabulação e preâmbulo de título/data, além do CSV UTF-8 legado, e liga cada keyword à sua linha de produto exacta após normalização. Sem CSV, o pipeline degrada graciosamente, mas o score perde esse sinal.
 
