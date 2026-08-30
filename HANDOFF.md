@@ -114,7 +114,7 @@ A disciplina de testes continua pragmática porque esta é uma ferramenta pessoa
 - batches Rich já persistidos não mudam automaticamente para HTML, por desenho de idempotência;
 - itens com entrega ambígua exigem reconciliação manual antes de qualquer reenvio;
 - token Telegram anteriormente exposto continua a precisar de rotação pelo operador.
-- follow-ups não bloqueantes da projeção: validar afinidades/`NOT NULL`/ações da FK além de nomes e chaves; distinguir schema futuro ou malformado de legado; decidir se score/evidência canónicos devem ser sempre obrigatórios; percent-encode de caminhos SQLite com `?` ou `#` no serve.
+- follow-ups não bloqueantes da projeção: distinguir schema futuro ou malformado de legado; decidir se score/evidência canónicos devem ser sempre obrigatórios; percent-encode de caminhos SQLite com `?` ou `#` no serve.
 
 ## Verificação desta sessão
 

@@ -47,6 +47,17 @@ VALID_SCORE_LABELS = frozenset({"AVANÇAR", "OBSERVAR", "DESCARTAR", "DADOS INSU
 MATCH_LABELS = frozenset({"matched", "needs_review", "rejected"})
 # Strict canonical pack date format — zero-padded, nothing else.
 _STRICT_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SQLITE_INT64_MIN = -(1 << 63)
+_SQLITE_INT64_MAX = (1 << 63) - 1
+
+
+def _valid_finite_sqlite_number(value: Any) -> bool:
+    """Accept finite floats and signed 64-bit integers, never booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, int):
+        return _SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX
+    return math.isfinite(value)
 
 
 class PackReadError(Exception):
@@ -137,56 +148,57 @@ def _validate_candidate_shape(candidate: dict[str, Any], position: int, problems
     for key in ("ad_archive_id", "advertiser", "page_id", "link", "landing_url", "copy"):
         value = candidate.get(key)
         if not isinstance(value, str):
-            problem(key, f"esperado texto, recebido {type(value).__name__}: {value!r}")
+            problem(key, f"esperado texto, recebido tipo {type(value).__name__}")
     days_active = candidate.get("days_active")
-    if isinstance(days_active, bool) or not isinstance(days_active, (int, float)) or not math.isfinite(days_active):
-        problem("days_active", f"esperado número finito não booleano, recebido {days_active!r}")
+    if not _valid_finite_sqlite_number(days_active):
+        problem(
+            "days_active",
+            "esperado número finito não booleano (inteiros no intervalo SQLite signed 64-bit), "
+            f"recebido tipo {type(days_active).__name__}",
+        )
     reported_active_time = candidate.get("reported_active_time")
     if reported_active_time is not None and not isinstance(reported_active_time, str):
-        problem(
-            "reported_active_time",
-            f"esperado texto, recebido {type(reported_active_time).__name__}: {reported_active_time!r}",
-        )
+        problem("reported_active_time", f"esperado texto, recebido tipo {type(reported_active_time).__name__}")
     for key in ("publisher_platforms", "countries"):
         value = candidate.get(key)
         if value is not None and (not isinstance(value, list) or not all(isinstance(item, str) for item in value)):
-            problem(key, f"esperado lista de textos, recebido {value!r}")
+            problem(key, f"esperado lista de textos, recebido tipo {type(value).__name__}")
     evidence = candidate.get("match_evidence")
     if isinstance(evidence, dict):
         for key in ("commercial", "geo", "weak"):
             value = evidence.get(key)
             if value is not None and not isinstance(value, str):
-                problem(f"match_evidence.{key}", f"esperado texto, recebido {type(value).__name__}: {value!r}")
+                problem(f"match_evidence.{key}", f"esperado texto, recebido tipo {type(value).__name__}")
     elif not isinstance(evidence, str):
-        problem("match_evidence", f"esperado objeto ou texto, recebido {type(evidence).__name__}: {evidence!r}")
+        problem("match_evidence", f"esperado objeto ou texto, recebido tipo {type(evidence).__name__}")
 
     match = candidate.get("match")
     if not isinstance(match, dict):
-        problem("match", f"esperado objeto de classificação, recebido {type(match).__name__}: {match!r}")
+        problem("match", f"esperado objeto de classificação, recebido tipo {type(match).__name__}")
         return
     if "label" not in match or match["label"] not in MATCH_LABELS:
-        problem("match.label", f"label de classificação inválido: {match.get('label')!r}")
+        problem("match.label", f"label de classificação inválido, recebido tipo {type(match.get('label')).__name__}")
     if "confidence" not in match or not isinstance(match["confidence"], str):
-        problem("match.confidence", f"esperado texto, recebido {match.get('confidence')!r}")
+        problem("match.confidence", f"esperado texto, recebido tipo {type(match.get('confidence')).__name__}")
     if (
         "reasons" not in match
         or not isinstance(match["reasons"], list)
         or not all(isinstance(item, str) for item in match["reasons"])
     ):
-        problem("match.reasons", f"esperado lista de textos, recebido {match.get('reasons')!r}")
+        problem("match.reasons", f"esperado lista de textos, recebido tipo {type(match.get('reasons')).__name__}")
     if (
         "matcher_version" not in match
         or not isinstance(match["matcher_version"], str)
         or not match["matcher_version"]
     ):
-        problem("match.matcher_version", f"esperado texto não vazio, recebido {match.get('matcher_version')!r}")
+        problem("match.matcher_version", f"esperado texto não vazio, recebido tipo {type(match.get('matcher_version')).__name__}")
     head_token = match.get("head_token")
     if "head_token" not in match or (head_token is not None and not isinstance(head_token, str)):
-        problem("match.head_token", f"esperado texto ou null, recebido {head_token!r}")
+        problem("match.head_token", f"esperado texto ou null, recebido tipo {type(head_token).__name__}")
     for key in ("geo_tokens", "missing_tokens", "weak_only_tokens"):
         value = match.get(key)
         if key not in match or not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            problem(f"match.{key}", f"esperado lista de textos, recebido {value!r}")
+            problem(f"match.{key}", f"esperado lista de textos, recebido tipo {type(value).__name__}")
 
 
 def _validate_current_shape(pack: dict[str, Any]) -> list[str]:
@@ -197,47 +209,55 @@ def _validate_current_shape(pack: dict[str, Any]) -> list[str]:
     problems: list[str] = []
     run_id = pack.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
-        problems.append("run_id ausente ou vazio")
+        problems.append(f"run_id ausente ou vazio (recebido tipo {type(run_id).__name__})")
     product_id = pack.get("product_id")
     if not isinstance(product_id, str) or not product_id.strip():
-        problems.append("product_id ausente ou vazio")
+        problems.append(f"product_id ausente ou vazio (recebido tipo {type(product_id).__name__})")
     if pack.get("artifact_complete") is not True:
-        problems.append("artifact_complete != true")
-    if not _valid_iso_date(pack.get("date")):
-        problems.append(f"date inválida: {pack.get('date')!r} (esperado YYYY-MM-DD estrito)")
+        problems.append(
+            f"artifact_complete inválido (recebido tipo {type(pack.get('artifact_complete')).__name__}; esperado true)"
+        )
+    date = pack.get("date")
+    if not _valid_iso_date(date):
+        problems.append(f"date inválida (recebido tipo {type(date).__name__}; esperado YYYY-MM-DD estrito)")
     score = pack.get("score")
     label = score.get("label") if isinstance(score, dict) else None
     if label not in VALID_SCORE_LABELS:
-        problems.append(f"score.label inválido: {label!r}")
+        problems.append(f"score.label inválido (recebido tipo {type(label).__name__})")
     if isinstance(score, dict) and "score" in score:
         score_value = score["score"]
-        if (
-            isinstance(score_value, bool)
-            or not isinstance(score_value, (int, float))
-            or not math.isfinite(score_value)
-        ):
-            problems.append(f"score.score inválido: {score_value!r} (esperado número finito não booleano)")
+        if not _valid_finite_sqlite_number(score_value):
+            problems.append(
+                "score.score inválido (esperado número finito não booleano; inteiros no intervalo "
+                f"SQLite signed 64-bit; recebido tipo {type(score_value).__name__})"
+            )
     for key in (
         "keyword", "product_name", "research_keyword", "mode", "scoring_version",
         "matcher_version", "generated_at", "completed_at",
     ):
         value = pack.get(key)
         if value is not None and not isinstance(value, str):
-            problems.append(f"{key} esperado texto, recebido {type(value).__name__}: {value!r}")
+            problems.append(f"{key} esperado texto, recebido tipo {type(value).__name__}")
     source_states = pack.get("source_states")
     if source_states is not None and not isinstance(source_states, dict):
-        problems.append(f"source_states esperado objeto, recebido {type(source_states).__name__}: {source_states!r}")
+        problems.append(f"source_states esperado objeto, recebido tipo {type(source_states).__name__}")
     scoring_config = pack.get("scoring_config")
     if scoring_config is not None and not isinstance(scoring_config, dict):
-        problems.append(f"scoring_config esperado objeto, recebido {type(scoring_config).__name__}: {scoring_config!r}")
+        problems.append(f"scoring_config esperado objeto, recebido tipo {type(scoring_config).__name__}")
     ads = _facebook_ads(pack)
     ads_version = ads.get("matching_schema_version")
     if not isinstance(ads_version, int) or isinstance(ads_version, bool) or ads_version != MATCHING_SCHEMA_VERSION:
         problems.append("facebook_ads.matching_schema_version != atual (int exato)")
     for key in ("candidate_count", "matched_count", "needs_review_count", "rejected_count", "total_ads"):
         value = ads.get(key)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-            problems.append(f"facebook_ads.{key} esperado inteiro, recebido {value!r}")
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not _SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX
+        ):
+            problems.append(
+                f"facebook_ads.{key} esperado inteiro SQLite signed 64-bit, recebido tipo {type(value).__name__}"
+            )
     candidates = ads.get("candidates")
     if not isinstance(candidates, list):
         problems.append("facebook_ads.candidates ausente ou não é lista")
@@ -290,8 +310,13 @@ def classify_pack(pack: dict[str, Any], source_path: str) -> Classification:
         )
     if _looks_like_pack(pack):
         version = _facebook_ads(pack).get("matching_schema_version")
+        safe_version = (
+            str(version)
+            if isinstance(version, int) and not isinstance(version, bool)
+            else type(version).__name__
+        )
         reason = (
-            f"matching_schema_version={version!r} (esperado {MATCHING_SCHEMA_VERSION})"
+            f"matching_schema_version={safe_version} (esperado {MATCHING_SCHEMA_VERSION})"
             if version is not None
             else "sem matching_schema_version (pack pré-classificação)"
         )

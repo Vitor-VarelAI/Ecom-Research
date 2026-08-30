@@ -20,12 +20,11 @@ fields are stored as canonical JSON text (sorted keys, compact separators,
 
 from __future__ import annotations
 
-import math
 import os
 import sqlite3
 from typing import Any
 
-from pipeline.projection.validation import Classification, canonical_json
+from pipeline.projection.validation import Classification, _valid_finite_sqlite_number, canonical_json
 from pipeline.run_state import utc_now_iso
 
 SCHEMA_VERSION = 1
@@ -108,6 +107,7 @@ class PackConflictError(ProjectionError):
 _PACK_PRIMARY_KEY = ("run_id", "product_id")
 _CANDIDATE_PRIMARY_KEY = ("run_id", "product_id", "position")
 _CANDIDATE_FOREIGN_KEY = (("run_id", "run_id"), ("product_id", "product_id"))
+_CANDIDATE_FOREIGN_KEY_ACTION = "CASCADE"
 
 
 def validate_projection_schema(conn: sqlite3.Connection, db_path: str | None = None) -> None:
@@ -132,8 +132,8 @@ def validate_projection_schema(conn: sqlite3.Connection, db_path: str | None = N
     violations = conn.execute("PRAGMA foreign_key_check").fetchall()
     if violations:
         reasons.append(f"foreign key violada em {len(violations)} linha(s)")
-    _validate_table_shape(conn, "pack", _PACK_COLUMNS, _PACK_PRIMARY_KEY, reasons)
-    _validate_table_shape(conn, "candidate", _CANDIDATE_COLUMNS, _CANDIDATE_PRIMARY_KEY, reasons)
+    _validate_table_shape(conn, "pack", _PACK_COLUMN_CONTRACT, _PACK_PRIMARY_KEY, reasons)
+    _validate_table_shape(conn, "candidate", _CANDIDATE_COLUMN_CONTRACT, _CANDIDATE_PRIMARY_KEY, reasons)
     _validate_foreign_key(conn, "candidate", _CANDIDATE_FOREIGN_KEY, "pack", reasons)
     if reasons:
         raise SchemaMismatchError(
@@ -142,10 +142,24 @@ def validate_projection_schema(conn: sqlite3.Connection, db_path: str | None = N
         )
 
 
+def _sqlite_affinity(declared_type: str | None) -> str:
+    """Return SQLite's affinity for a declared column type."""
+    type_name = (declared_type or "").upper()
+    if "INT" in type_name:
+        return "INTEGER"
+    if any(token in type_name for token in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if "BLOB" in type_name or not type_name:
+        return "BLOB"
+    if any(token in type_name for token in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    return "NUMERIC"
+
+
 def _validate_table_shape(
     conn: sqlite3.Connection,
     name: str,
-    expected_columns: tuple[str, ...],
+    column_contract: tuple[tuple[str, str, bool], ...],
     primary_key: tuple[str, ...],
     reasons: list[str],
 ) -> None:
@@ -153,7 +167,8 @@ def _validate_table_shape(
     if not info:
         reasons.append(f"tabela {name} ausente")
         return
-    columns = {row[1]: row[5] for row in info}
+    columns = {row[1]: (row[2], row[3], row[5]) for row in info}
+    expected_columns = tuple(column[0] for column in column_contract)
     if set(columns) != set(expected_columns):
         missing = sorted(set(expected_columns) - set(columns))
         extra = sorted(set(columns) - set(expected_columns))
@@ -164,7 +179,23 @@ def _validate_table_shape(
             details.append(f"colunas inesperadas: {', '.join(extra)}")
         reasons.append(f"tabela {name} com estrutura inesperada ({'; '.join(details)})")
         return
-    actual_pk = {column: order for column, order in columns.items() if order}
+    for column, expected_type, expected_not_null in column_contract:
+        actual_type, actual_not_null, _ = columns[column]
+        actual_type_normalized = (actual_type or "").strip().upper()
+        if actual_type_normalized != expected_type or _sqlite_affinity(actual_type) != _sqlite_affinity(expected_type):
+            reasons.append(
+                f"tipo de {name}.{column} inesperado: {actual_type or '<sem tipo>'} "
+                f"(afinidade {_sqlite_affinity(actual_type)}; esperado {expected_type}/"
+                f"{_sqlite_affinity(expected_type)})"
+            )
+        if bool(actual_not_null) != expected_not_null:
+            expected_nullability = "NOT NULL" if expected_not_null else "NULL permitido"
+            actual_nullability = "NOT NULL" if actual_not_null else "NULL permitido"
+            reasons.append(
+                f"nulabilidade de {name}.{column} inesperada: {actual_nullability} "
+                f"(esperado {expected_nullability})"
+            )
+    actual_pk = {column: order for column, (_, _, order) in columns.items() if order}
     expected_pk = {column: index for index, column in enumerate(primary_key, start=1)}
     if actual_pk != expected_pk:
         reasons.append(
@@ -180,11 +211,17 @@ def _validate_foreign_key(
     reasons: list[str],
 ) -> None:
     rows = conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
-    found = {(row[3], row[4]) for row in rows if row[2] == parent}
-    if set(pairs) != found:
+    grouped: dict[int, list[tuple[str, str, str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append((row[2], row[3], row[4], row[6]))
+    found = sorted(tuple(sorted(entries)) for entries in grouped.values())
+    expected = [
+        tuple(sorted((parent, source, target, _CANDIDATE_FOREIGN_KEY_ACTION) for source, target in pairs))
+    ]
+    if found != expected:
         reasons.append(
-            f"foreign key de {table} para {parent} inesperada: {sorted(found) or 'sem FK'} "
-            f"(esperado {list(pairs)})"
+            f"foreign key de {table} inesperada: {found or 'sem FK'} "
+            f"(esperado {expected}, ON DELETE {_CANDIDATE_FOREIGN_KEY_ACTION})"
         )
 
 
@@ -302,13 +339,34 @@ class ProjectionStore:
         return "imported"
 
 
-_PACK_COLUMNS = (
-    "run_id", "product_id", "fingerprint", "source_path", "keyword", "product_name", "research_keyword",
-    "mode", "pack_date", "score_label", "score_value", "scoring_version", "matcher_version",
-    "matching_schema_version", "generated_at", "completed_at", "candidate_count", "matched_count",
-    "needs_review_count", "rejected_count", "total_ads", "source_states_json", "scoring_config_json",
-    "pack_json", "imported_at",
+_PACK_COLUMN_CONTRACT = (
+    ("run_id", "TEXT", True),
+    ("product_id", "TEXT", True),
+    ("fingerprint", "TEXT", True),
+    ("source_path", "TEXT", True),
+    ("keyword", "TEXT", False),
+    ("product_name", "TEXT", False),
+    ("research_keyword", "TEXT", False),
+    ("mode", "TEXT", False),
+    ("pack_date", "TEXT", True),
+    ("score_label", "TEXT", True),
+    ("score_value", "REAL", False),
+    ("scoring_version", "TEXT", False),
+    ("matcher_version", "TEXT", False),
+    ("matching_schema_version", "INTEGER", True),
+    ("generated_at", "TEXT", False),
+    ("completed_at", "TEXT", False),
+    ("candidate_count", "INTEGER", False),
+    ("matched_count", "INTEGER", False),
+    ("needs_review_count", "INTEGER", False),
+    ("rejected_count", "INTEGER", False),
+    ("total_ads", "INTEGER", False),
+    ("source_states_json", "TEXT", False),
+    ("scoring_config_json", "TEXT", False),
+    ("pack_json", "TEXT", True),
+    ("imported_at", "TEXT", True),
 )
+_PACK_COLUMNS = tuple(column[0] for column in _PACK_COLUMN_CONTRACT)
 
 
 def _project_pack_row(pack: dict[str, Any], fingerprint: str, source_path: str) -> dict[str, Any]:
@@ -316,17 +374,13 @@ def _project_pack_row(pack: dict[str, Any], fingerprint: str, source_path: str) 
     ads = pack.get("facebook_ads") or {}
     score = pack.get("score") or {}
     score_value = score.get("score")
-    if score_value is not None and (
-        isinstance(score_value, bool)
-        or not isinstance(score_value, (int, float))
-        or not math.isfinite(score_value)
-    ):
+    if score_value is not None and not _valid_finite_sqlite_number(score_value):
         # Never silently convert an invalid persisted score to NULL: shape
         # validation rejects these packs at classify time, and the store
         # refuses a forged classification that bypasses it.
         raise ProjectionError(
-            f"score.score não pode ser persistido como NULL: {score_value!r} "
-            "(validação de shape devia ter rejeitado este pack)"
+            "score.score não pode ser persistido como NULL: "
+            "validação de shape devia ter rejeitado este pack"
         )
     return {
         "run_id": pack["run_id"],
@@ -357,12 +411,29 @@ def _project_pack_row(pack: dict[str, Any], fingerprint: str, source_path: str) 
     }
 
 
-_CANDIDATE_COLUMNS = (
-    "run_id", "product_id", "position", "ad_archive_id", "advertiser", "page_id", "days_active",
-    "reported_active_time", "link", "landing_url", "copy", "publisher_platforms_json", "countries_json",
-    "match_evidence_json", "match_label", "match_confidence", "match_reasons_json", "match_head_token",
-    "match_json", "candidate_json",
+_CANDIDATE_COLUMN_CONTRACT = (
+    ("run_id", "TEXT", True),
+    ("product_id", "TEXT", True),
+    ("position", "INTEGER", True),
+    ("ad_archive_id", "TEXT", False),
+    ("advertiser", "TEXT", False),
+    ("page_id", "TEXT", False),
+    ("days_active", "REAL", False),
+    ("reported_active_time", "TEXT", False),
+    ("link", "TEXT", False),
+    ("landing_url", "TEXT", False),
+    ("copy", "TEXT", False),
+    ("publisher_platforms_json", "TEXT", False),
+    ("countries_json", "TEXT", False),
+    ("match_evidence_json", "TEXT", False),
+    ("match_label", "TEXT", False),
+    ("match_confidence", "TEXT", False),
+    ("match_reasons_json", "TEXT", False),
+    ("match_head_token", "TEXT", False),
+    ("match_json", "TEXT", False),
+    ("candidate_json", "TEXT", True),
 )
+_CANDIDATE_COLUMNS = tuple(column[0] for column in _CANDIDATE_COLUMN_CONTRACT)
 
 
 def _project_candidate_row(pack: dict[str, Any], candidate: dict[str, Any], position: int) -> dict[str, Any]:

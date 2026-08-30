@@ -114,6 +114,29 @@ class TestSchema:
             ProjectionStore(str(db_path))
         assert "apaga" in str(exc.value).lower()
 
+    @pytest.mark.parametrize(
+        ("old", "new", "reason"),
+        [
+            ("run_id TEXT NOT NULL", "run_id INTEGER NOT NULL", "tipo"),
+            ("pack_date TEXT NOT NULL", "pack_date TEXT", "nulabilidade"),
+            ("ON DELETE CASCADE", "ON DELETE SET NULL", "foreign key"),
+        ],
+    )
+    def test_same_version_schema_contract_rejects_incompatible_columns_and_fk(
+        self, tmp_path, old, new, reason
+    ):
+        db_path = tmp_path / "incompatible.db"
+        schema = store_module._SCHEMA.replace(old, new, 1)
+        assert schema != store_module._SCHEMA
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(schema)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+        conn.close()
+        with pytest.raises(SchemaMismatchError) as exc:
+            ProjectionStore(str(db_path))
+        assert reason in str(exc.value).lower()
+
     def test_shared_validator_passes_fresh_db(self, tmp_path):
         """The shared schema validator accepts exactly what the store
         creates — guards against drift between _SCHEMA and the validator."""
@@ -231,7 +254,9 @@ class TestIdempotencyAndConflict:
 
 
 class TestScoreProjection:
-    @pytest.mark.parametrize("bad_score", [True, "alto", float("nan"), float("inf"), -float("inf")])
+    @pytest.mark.parametrize(
+        "bad_score", [True, "SCORE_VALUE_SENTINEL", float("nan"), float("inf"), -float("inf"), 10**100]
+    )
     def test_invalid_score_never_silently_nulled(self, tmp_path, bad_score):
         """An invalid persisted score raises ProjectionError instead of being
         converted to NULL — even when classification is forged to bypass the
@@ -249,7 +274,9 @@ class TestScoreProjection:
         )
         with pytest.raises(ProjectionError) as exc:
             store.import_pack(classification)
-        assert "NULL" in str(exc.value)
+        message = str(exc.value)
+        assert "NULL" in message
+        assert "SCORE_VALUE_SENTINEL" not in message
         assert store.count_packs() == 0  # nothing persisted
         store.close()
 

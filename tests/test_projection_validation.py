@@ -270,11 +270,33 @@ class TestCandidateShape:
             classify_pack(pack, "inline.json")
         assert key in str(exc.value)
 
+    @pytest.mark.parametrize("target", ["count", "score", "days_active"])
+    @pytest.mark.parametrize("value", [1 << 63, -(1 << 63) - 1])
+    def test_integer_fields_stay_within_sqlite_signed_range(self, target, value):
+        pack = current_pack()
+        if target == "count":
+            pack["facebook_ads"]["total_ads"] = value
+        elif target == "score":
+            pack["score"]["score"] = value
+        else:
+            pack["facebook_ads"]["candidates"][0]["days_active"] = value
+        with pytest.raises(CurrentPackShapeError) as exc:
+            classify_pack(pack, "inline.json")
+        assert "signed 64-bit" in str(exc.value)
+
     def test_boolean_count_rejected(self):
         pack = current_pack()
         pack["facebook_ads"]["total_ads"] = True
         with pytest.raises(CurrentPackShapeError):
             classify_pack(pack, "inline.json")
+
+    def test_legacy_reason_does_not_echo_schema_version(self):
+        secret = "PACK_SECRET_VERSION"
+        pack = current_pack()
+        pack["facebook_ads"] = dict(pack["facebook_ads"], matching_schema_version=secret)
+        classification = classify_pack(pack, "inline.json")
+        assert classification.kind == "legacy"
+        assert secret not in (classification.reason or "")
 
 
 class TestFingerprint:

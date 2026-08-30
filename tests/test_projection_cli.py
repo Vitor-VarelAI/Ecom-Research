@@ -169,6 +169,27 @@ class TestImportCli:
         assert cmd_import(_make_args("import", db=str(db), data_dir=str(data_dir))) == 2
         assert "score" in capsys.readouterr().err.lower()
 
+    def test_huge_integer_fails_closed_without_traceback(self, tmp_path, capsys):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        _write(data_dir, "a.json", current_pack(score={"score": 10**100, "label": "OBSERVAR", "breakdown": {}}))
+        db = tmp_path / "proj.db"
+        assert cmd_import(_make_args("import", db=str(db), data_dir=str(data_dir))) == 2
+        err = capsys.readouterr().err
+        assert "score.score" in err
+        assert "Traceback" not in err
+
+    def test_shape_error_does_not_echo_pack_value(self, tmp_path, capsys):
+        secret = "PACK_SECRET_SHAPE_VALUE"
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        pack = current_pack()
+        pack["facebook_ads"]["candidates"][0]["landing_url"] = {"secret": secret}
+        _write(data_dir, "a.json", pack)
+        db = tmp_path / "proj.db"
+        assert cmd_import(_make_args("import", db=str(db), data_dir=str(data_dir))) == 2
+        assert secret not in capsys.readouterr().err
+
     def test_malformed_candidate_evidence_fails_closed_through_cli(self, tmp_path, capsys):
         data_dir = tmp_path / "data"
         data_dir.mkdir()
