@@ -17,7 +17,7 @@ CANNED_QUERIES = {
     "latest_packs": {
         "title": "Últimos packs classificados",
         "sql": (
-            "SELECT run_id, product_id, keyword, pack_date, score_label, score_value, "
+            "SELECT run_id, product_id, market_id, keyword, pack_date, score_label, score_value, "
             "candidate_count, matched_count, total_ads, imported_at "
             "FROM pack ORDER BY pack_date DESC, imported_at DESC LIMIT 50"
         ),
@@ -25,18 +25,21 @@ CANNED_QUERIES = {
     "needs_review_candidates": {
         "title": "Candidatos needs_review",
         "sql": (
-            "SELECT c.run_id, c.product_id, c.position, c.advertiser, c.page_id, "
+            "SELECT c.run_id, c.product_id, c.market_id, c.position, c.advertiser, c.page_id, "
             "c.copy, c.match_head_token, c.match_confidence, p.pack_date "
             "FROM candidate c JOIN pack p ON p.run_id = c.run_id AND p.product_id = c.product_id "
+            "AND p.market_id = c.market_id "
             "WHERE c.match_label = 'needs_review' ORDER BY p.pack_date DESC, c.position LIMIT 200"
         ),
     },
     "matched_advertisers": {
         "title": "Anunciantes matched",
         "sql": (
-            "SELECT advertiser, page_id, COUNT(*) AS matched_ads, COUNT(DISTINCT product_id) AS products "
+            "SELECT market_id, advertiser, page_id, COUNT(*) AS matched_ads, "
+            "COUNT(DISTINCT product_id) AS products "
             "FROM candidate WHERE match_label = 'matched' "
-            "GROUP BY advertiser, page_id ORDER BY matched_ads DESC, advertiser LIMIT 100"
+            "GROUP BY market_id, advertiser, page_id "
+            "ORDER BY matched_ads DESC, market_id, advertiser LIMIT 100"
         ),
     },
 }

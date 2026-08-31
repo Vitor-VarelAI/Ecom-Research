@@ -695,15 +695,17 @@ def _normalise(keyword: str, raw_ads: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def fetch(keyword: str) -> dict[str, Any]:
-    """Run the Apify actor once and return a deterministic normalized result."""
+def fetch(keyword: str, market: Any | None = None) -> dict[str, Any]:
+    """Run the actor once for one market, or globally for discovery only."""
     token = _get_token()
     if not token:
         return {"error": "APIFY_API_TOKEN não definido em .env"}
 
+    country = market.ads_country if market is not None else "ALL"
+    targeted_country = "true" if market is not None else "false"
     library_url = (
-        f"{FACEBOOK_AD_LIBRARY_URL}?active_status=active&ad_type=all&country=ALL&"
-        f"is_targeted_country=false&media_type=all&q={quote(keyword, safe='')}&"
+        f"{FACEBOOK_AD_LIBRARY_URL}?active_status=active&ad_type=all&country={quote(country, safe='')}&"
+        f"is_targeted_country={targeted_country}&media_type=all&q={quote(keyword, safe='')}&"
         "search_type=keyword_unordered"
     )
     params = {"clean": "true", "format": "json"}
@@ -747,4 +749,6 @@ def fetch(keyword: str) -> dict[str, Any]:
         return {"error": "Apify: resposta sem lista de anúncios"}
     result = _normalise(keyword, raw_ads)
     result["query"] = keyword
+    result["evidence_scope"] = "market" if market is not None else "global"
+    result["query_country"] = country
     return result

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "markets": [
+    {
+      "market_id": "PT",
+      "name": "Portugal",
+      "currency": "EUR",
+      "ads_country": "PT",
+      "trends_geo": "PT",
+      "serp_gl": "pt",
+      "serp_hl": "pt",
+      "serp_location": "Portugal",
+      "product_queries": {
+        "e942e8bf7f30": "mochila personalizada",
+        "be385ea0e349": "camisola portugal",
+        "a16e2196eb4d": "caneca personalizada",
+        "ef5cd634db44": "tapete yoga",
+        "258053734570": "velas aromáticas"
+      }
+    },
+    {
+      "market_id": "GB",
+      "name": "United Kingdom",
+      "currency": "GBP",
+      "ads_country": "GB",
+      "trends_geo": "GB",
+      "serp_gl": "uk",
+      "serp_hl": "en",
+      "serp_location": "United Kingdom",
+      "product_queries": {
+        "258053734570": "scented candles"
+      }
+    }
+  ]
+}

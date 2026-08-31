@@ -27,6 +27,13 @@ from pipeline import provenance, quota, run_state
 from pipeline.adapters import apify_ads, keyword_csv, landing_price, serp_seo, trends
 from pipeline.adapters.url_sanitize import sanitize_ads_data
 from pipeline.delivery import telegram
+from pipeline.markets import (
+    MarketRegistry,
+    MarketRegistryError,
+    MarketTarget,
+    MarketTargetNotFoundError,
+    load_market_registry,
+)
 from pipeline.matching import product_ads
 from pipeline.notifications import NotificationBatch, build_batch, notification_snapshot
 from pipeline.output import pack
@@ -68,6 +75,14 @@ def _load_products() -> ProductRegistry:
     return load_registry(_products_path())
 
 
+def _markets_path() -> str:
+    return os.path.join(REPO_ROOT, "config", "markets.json")
+
+
+def _load_markets() -> MarketRegistry:
+    return load_market_registry(_markets_path())
+
+
 def _run_store() -> run_state.RunStore:
     return run_state.RunStore(_data_dir())
 
@@ -76,12 +91,41 @@ def _digests_dir() -> str:
     return os.path.join(_data_dir(), "digests")
 
 
-def _csv_hash(csv_path: str | None = None) -> str | None:
-    """SHA-256 of the CSV actually consumed, or None when no CSV is used."""
-    path = csv_path or _find_latest_csv()
-    if not path or not os.path.isfile(path):
-        return None
-    return run_state.file_sha256(path)
+def _csv_hash(
+    csv_path: str | None = None,
+    products: list[Product | MarketTarget] | None = None,
+) -> str | None:
+    """Fingerprint every CSV + sidecar selected by this logical action."""
+    if csv_path is not None:
+        if not os.path.isfile(csv_path):
+            return None
+        entries = [{
+            "path": os.path.basename(csv_path),
+            "csv_sha256": run_state.file_sha256(csv_path),
+            "metadata_sha256": run_state.file_sha256(f"{csv_path}.meta.json"),
+        }]
+    else:
+        entries = []
+        for product in products or []:
+            market = product.market if isinstance(product, MarketTarget) else None
+            path = _find_latest_csv(market)
+            entries.append({
+                "product_id": product.product_id,
+                "market_id": getattr(product, "market_id", "PT"),
+                "path": os.path.basename(path) if path else None,
+                "csv_sha256": run_state.file_sha256(path) if path else None,
+                "metadata_sha256": run_state.file_sha256(f"{path}.meta.json") if path else None,
+            })
+        if not entries:
+            path = _find_latest_csv()
+            if not path:
+                return None
+            entries = [{
+                "path": os.path.basename(path),
+                "csv_sha256": run_state.file_sha256(path),
+                "metadata_sha256": run_state.file_sha256(f"{path}.meta.json"),
+            }]
+    return run_state.sha256_hex(json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 # Modes whose action consumes the Keyword Planner CSV.  Wednesday and monthly
@@ -90,11 +134,15 @@ def _csv_hash(csv_path: str | None = None) -> str | None:
 CSV_CONSUMING_MODES = frozenset({"keyword", "all", "sunday"})
 
 
-def _compute_run_id(mode: str, products: list[Product], csv_path: str | None = None) -> str:
-    """Deterministic identity: date + mode + ordered product descriptors + CSV hash + scoring version + matcher version.
+def _compute_run_id(
+    mode: str,
+    products: list[Product | MarketTarget],
+    csv_path: str | None = None,
+) -> str:
+    """Deterministic identity: date + mode + ordered target descriptors + CSV hash + scoring version + matcher version.
 
-    Each descriptor is the canonical ``(product_id, research_keyword)`` pair:
-    renaming a product's research query changes the identity (creating a new
+    Each descriptor is the canonical ``(product_id, market_id, research_keyword)`` tuple:
+    changing a target's local research query changes the identity (creating a new
     run), while a product name-only or alias-only change does not.  The CSV
     hash is included only when the action actually consumes the CSV
     (``keyword``, ``all`` and ``sunday`` — including Sunday dispatched via
@@ -102,12 +150,16 @@ def _compute_run_id(mode: str, products: list[Product], csv_path: str | None = N
     identity stays stable when unrelated CSV files change.  A direct
     ``--sunday`` and ``--auto`` on a Sunday resolve to the same run id.
     """
-    csv_sha = _csv_hash(csv_path) if mode in CSV_CONSUMING_MODES else None
+    csv_sha = _csv_hash(csv_path, products) if mode in CSV_CONSUMING_MODES else None
     return run_state.compute_run_id(
         logical_date=date.today().isoformat(),
         mode=mode,
         products=[
-            {"product_id": product.product_id, "research_keyword": product.research_keyword}
+            {
+                "product_id": product.product_id,
+                "market_id": getattr(product, "market_id", "PT"),
+                "research_keyword": product.research_keyword,
+            }
             for product in products
         ],
         csv_sha256=csv_sha,
@@ -116,7 +168,18 @@ def _compute_run_id(mode: str, products: list[Product], csv_path: str | None = N
     )
 
 
-def _begin_manifest(run_id: str, mode: str, products: list[Product], csv_path: str | None) -> dict[str, Any]:
+def _target_key(target: Product | MarketTarget | dict[str, Any]) -> tuple[str, str]:
+    if isinstance(target, dict):
+        return str(target.get("product_id", "")), str(target.get("market_id") or "PT")
+    return target.product_id, getattr(target, "market_id", "PT")
+
+
+def _begin_manifest(
+    run_id: str,
+    mode: str,
+    products: list[Product | MarketTarget],
+    csv_path: str | None,
+) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "state": "running",
@@ -125,6 +188,7 @@ def _begin_manifest(run_id: str, mode: str, products: list[Product], csv_path: s
         "products": [
             {
                 "product_id": product.product_id,
+                "market_id": getattr(product, "market_id", "PT"),
                 "name": product.name,
                 "research_keyword": product.research_keyword,
             }
@@ -148,9 +212,10 @@ def _begin_manifest(run_id: str, mode: str, products: list[Product], csv_path: s
 
 
 def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
-    keep = ("keyword", "product_id", "product_name", "research_keyword", "md_path",
-            "score_result", "preserved", "error", "status", "changes",
-            "advertiser_deltas", "ad_cohort", "suggested_keywords")
+    keep = ("keyword", "product_id", "market_id", "market", "product_name",
+            "research_keyword", "md_path", "score_result", "preserved", "error",
+            "status", "changes", "advertiser_deltas", "ad_cohort", "market_signals",
+            "suggested_keywords")
     compact = {key: result.get(key) for key in keep}
     # Minimal credential-free, URL-free notification snapshot so a completed
     # run can rebuild its exact batch for a later --digest without rerunning
@@ -267,8 +332,8 @@ def _is_technical_fatal(result: dict[str, Any] | None) -> bool:
     return bool(result and result.get("status") == "technical_fatal")
 
 
-def _safe_run_keyword(product: Product, csv_path: str | None = None, mode: str | None = None, run_id: str | None = None) -> dict[str, Any]:
-    """Per-product exception containment shared by --all, --sunday and --auto.
+def _safe_run_keyword(product: Product | MarketTarget, csv_path: str | None = None, mode: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    """Per-target exception containment shared by --all, --sunday and --auto.
 
     Adapters still receive only ``product.research_keyword``.  Technical
     exceptions are marked ``status="technical_fatal"`` so the batch
@@ -283,8 +348,10 @@ def _safe_run_keyword(product: Product, csv_path: str | None = None, mode: str |
     except Exception as exc:
         error_type = type(exc).__name__
         logger.error("Erro fatal sanitizado em product_id=%s (tipo=%s)", product.product_id, error_type)
+        market = product.market if isinstance(product, MarketTarget) else None
         return {
             "product_id": product.product_id,
+            **({"market_id": market.market_id, "market": market.as_dict()} if market else {}),
             "product_name": product.name,
             "research_keyword": product.research_keyword,
             "keyword": product.research_keyword,
@@ -427,12 +494,19 @@ def _run_metadata(mode: str, run_id: str, source_states: dict[str, Any]) -> dict
     }
 
 
-def _find_latest_csv() -> str | None:
+def _find_latest_csv(market: Any | None = None) -> str | None:
     data_dir = os.path.join(REPO_ROOT, "data")
     if not os.path.isdir(data_dir):
         return None
-    files = sorted((name for name in os.listdir(data_dir) if name.endswith(".csv")), reverse=True)
-    return os.path.join(data_dir, files[0]) if files else None
+    files = sorted(
+        (name for name in os.listdir(data_dir) if name.endswith(".csv")),
+        reverse=True,
+    )
+    for filename in files:
+        path = os.path.join(data_dir, filename)
+        if market is None or keyword_csv._market_metadata(path, market) is not None:
+            return path
+    return None
 
 
 def _read_pack_json(path: str) -> dict[str, Any] | None:
@@ -498,7 +572,8 @@ def _find_packs_by_label(
     labels: list[str],
     max_age_days: int | None = None,
     registry: ProductRegistry | None = None,
-) -> list[Product]:
+    markets: MarketRegistry | None = None,
+) -> list[Product | MarketTarget]:
     """Watchlist selection grouped by canonical product identity.
 
     Every complete pack maps to the product_id of its canonical product
@@ -514,8 +589,8 @@ def _find_packs_by_label(
     if not os.path.isdir(data_dir):
         return []
     cutoff = date.today() - timedelta(days=max_age_days) if max_age_days is not None else None
-    labeled: dict[str, tuple[tuple[str, str, str], str]] = {}
-    overall: dict[str, tuple[tuple[str, str, str], str]] = {}
+    labeled: dict[Any, tuple[tuple[str, str, str], str]] = {}
+    overall: dict[Any, tuple[tuple[str, str, str], str]] = {}
     for filename in sorted(os.listdir(data_dir)):
         if not filename.endswith(".json") or filename.startswith("quota"):
             continue
@@ -531,31 +606,43 @@ def _find_packs_by_label(
         product_id = _pack_product_id(data, registry)
         if product_id is None:
             continue  # orphaned: no product identity to group under
+        if markets is None:
+            target_key: Any = product_id
+        else:
+            market_id = data.get("market_id")
+            if not isinstance(market_id, str):
+                continue  # packs sem scope são históricos, não evidência local
+            target_key = (product_id, market_id)
         key = _pack_sort_key(data, filename)
-        overall[product_id] = max(overall.get(product_id, (("", "", ""), "")), (key, filename))
+        overall[target_key] = max(overall.get(target_key, (("", "", ""), "")), (key, filename))
         label = data.get("score", {}).get("label", "")
         if label in labels:
-            labeled[product_id] = max(labeled.get(product_id, (("", "", ""), "")), (key, filename))
+            labeled[target_key] = max(labeled.get(target_key, (("", "", ""), "")), (key, filename))
 
-    selected: set[str] = set()
-    for product_id in labeled:
-        overall_key, overall_file = overall[product_id]
+    selected: set[Any] = set()
+    for target_key in labeled:
+        overall_key, overall_file = overall[target_key]
         overall_data = _read_pack_json(os.path.join(data_dir, overall_file)) or {}
         if not _pack_is_complete(overall_data):
             continue
         overall_label = overall_data.get("score", {}).get("label", "")
         if overall_label in labels:
-            selected.add(product_id)  # the newest pack carries a requested label
+            selected.add(target_key)  # the newest pack carries a requested label
         elif overall_label == "DADOS INSUFICIENTES":
             # A failed run must not evict real evidence: keep the older labeled pack.
-            selected.add(product_id)
+            selected.add(target_key)
         # else: newest pack carries another real label (e.g. AVANÇAR) — follows it.
+    if markets is not None:
+        return [
+            target for target in markets.targets_for(registry.products)
+            if _target_key(target) in selected
+        ]
     # Registry order, never keyword sort order; unknown product_ids drop out.
     return [product for product in registry.products if product.product_id in selected]
 
 
 def _load_previous_pack(
-    product: Product,
+    product: Product | MarketTarget,
     registry: ProductRegistry | None = None,
 ) -> dict[str, Any] | None:
     """Newest complete non-failed pack of the product's canonical identity.
@@ -579,6 +666,11 @@ def _load_previous_pack(
             continue
         if _pack_product_id(data, registry) != product.product_id:
             continue
+        if isinstance(product, MarketTarget) and (
+            data.get("market_id") != product.market_id
+            or data.get("research_keyword") != product.research_keyword
+        ):
+            continue
         if (data.get("score", {}).get("label", "")) == "DADOS INSUFICIENTES":
             continue  # failed-run packs are not evidence for the next incremental mode
         key = _pack_sort_key(data, filename)
@@ -589,13 +681,17 @@ def _load_previous_pack(
     return _read_pack_json(os.path.join(data_dir, best[1]))
 
 
-def _csv_data(csv_path: str | None, keyword: str) -> dict[str, Any]:
+def _csv_data(
+    csv_path: str | None,
+    keyword: str,
+    market: Any | None = None,
+) -> dict[str, Any]:
     """Parse do export do Keyword Planner seleccionando a linha da keyword
     pedida (matching exacto normalizado); erro explícito se a keyword não
     existir no CSV — nunca as métricas de outra linha."""
-    path = csv_path or _find_latest_csv()
+    path = csv_path or _find_latest_csv(market)
     if path:
-        return keyword_csv.parse(path, keyword=keyword)
+        return keyword_csv.parse(path, keyword=keyword, market=market)
     return {"error": "Nenhum CSV encontrado em data/ — exporta do Google Keyword Planner e coloca em data/"}
 
 
@@ -614,6 +710,84 @@ def _incomplete_score(
     )
     result["incomplete"] = True
     return result
+
+
+def _market_signal_labels(
+    trends_data: dict[str, Any],
+    ads_data: dict[str, Any],
+    cohort: dict[str, Any] | None = None,
+) -> list[str]:
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    advertisers = [
+        advertiser for advertiser in ads_data.get("advertisers", [])
+        if isinstance(advertiser, dict)
+    ]
+    labels: list[str] = []
+    slope_30d = number(trends_data.get("slope_30d_pct"))
+    slope_90d = number(trends_data.get("slope_90d_pct"))
+    related = trends_data.get("related_queries")
+    if (
+        cohort is not None
+        and slope_30d is not None and slope_30d >= 20
+        and slope_90d is not None and slope_90d >= 0
+        and isinstance(related, list) and bool(related)
+        and len(advertisers) >= 3
+    ):
+        labels.append("EMERGENTE")
+
+    retention = number(cohort.get("ad_retention_pct")) if cohort else None
+    oldest = [
+        number(advertiser.get("oldest_ad_days")) for advertiser in advertisers
+    ]
+    if (retention is not None and retention >= 70) or any(
+        days is not None and days >= 30 for days in oldest
+    ):
+        labels.append("DURÁVEL")
+    return labels
+
+
+def _market_scope_errors(
+    market: Any,
+    ads_data: dict[str, Any],
+    trends_data: dict[str, Any],
+    csv_data: dict[str, Any],
+    seo_data: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    if "error" not in ads_data and (
+        ads_data.get("evidence_scope") != "market"
+        or ads_data.get("query_country") != market.ads_country
+    ):
+        errors.append("Ads sem scope local comprovado")
+    scored_market = "error" not in ads_data and bool(ads_data.get("total_ads", 0))
+    if "error" in trends_data:
+        if scored_market:
+            errors.append("Trends indisponível para decisão local")
+    elif (
+        trends_data.get("market_id") != market.market_id
+        or trends_data.get("query_geo") != market.trends_geo
+    ):
+        errors.append("Trends sem geo local comprovado")
+    if "error" in csv_data or (
+        csv_data.get("market_id") != market.market_id
+        or csv_data.get("currency") != market.currency
+    ):
+        errors.append("Keyword Planner sem mercado/moeda comprovados")
+    if "error" in seo_data:
+        if scored_market:
+            errors.append("SERP indisponível para decisão local")
+    elif (
+        seo_data.get("market_id") != market.market_id
+        or seo_data.get("query_gl") != market.serp_gl
+        or seo_data.get("query_hl") != market.serp_hl
+        or seo_data.get("query_location") != market.serp_location
+    ):
+        errors.append("SERP sem localização local comprovada")
+    return errors
 
 
 def _forced_zero_score(reason: str | None = None) -> dict[str, Any]:
@@ -636,7 +810,7 @@ _NEEDS_REVIEW_REASON = "zero matched; candidatos ambíguos (needs_review) — re
 
 
 def run_keyword(
-    product: Product,
+    product: Product | MarketTarget,
     csv_path: str | None = None,
     skip_serpapi: bool = False,
     mode: str | None = None,
@@ -656,8 +830,15 @@ def run_keyword(
     DESCARTAR).
     """
     keyword = product.research_keyword
+    market = product.market if isinstance(product, MarketTarget) else None
+
+    def csv_data_for_market() -> dict[str, Any]:
+        if market is None:
+            return _csv_data(csv_path, keyword)
+        return _csv_data(csv_path, keyword, market)
+
     logger.info("=== INÍCIO: product_id=%s keyword=%r ===", product.product_id, keyword)
-    ads_data = apify_ads.fetch(keyword)
+    ads_data = apify_ads.fetch(keyword, market=market) if market is not None else apify_ads.fetch(keyword)
     apify_failed = "error" in ads_data
     if not apify_failed:
         ads_data = product_ads.classify_ads_data(keyword, ads_data)
@@ -691,18 +872,18 @@ def run_keyword(
             trends_data = {"error": "SerpAPI não executada — modo sem rede"}
             seo_data = {"error": "SEO não executado — modo sem rede"}
         else:
-            trends_data = trends.fetch(keyword)
-            seo_data = serp_seo.fetch(keyword)
-        csv_data = _csv_data(csv_path, keyword)
+            trends_data = trends.fetch(keyword, market=market) if market is not None else trends.fetch(keyword)
+            seo_data = serp_seo.fetch(keyword, market=market) if market is not None else serp_seo.fetch(keyword)
+        csv_data = csv_data_for_market()
         score_result = _incomplete_score(trends_data, csv_data, ads_data)
     elif ads_data.get("candidate_count", 0) == 0 and ads_data.get("total_ads", 0) == 0:
         landing_data = {"error": "sem dados: zero candidatos; landing não consultada"}
         if skip_serpapi:
             trends_data = {"error": "SerpAPI não executada — modo sem rede"}
         else:
-            trends_data = trends.fetch_related(keyword)
+            trends_data = trends.fetch_related(keyword, market=market) if market is not None else trends.fetch_related(keyword)
         seo_data = {"error": "SEO não executado: zero candidatos ativos"}
-        csv_data = _csv_data(csv_path, keyword)
+        csv_data = csv_data_for_market()
         score_result = _forced_zero_score(_ZERO_CANDIDATES_REASON)
     elif ads_data.get("total_ads", 0) == 0:
         if ads_data.get("needs_review_count", 0) > 0:
@@ -712,18 +893,18 @@ def run_keyword(
                 trends_data = {"error": "SerpAPI não executada — modo sem rede"}
                 seo_data = {"error": "SEO não executado — modo sem rede"}
             else:
-                trends_data = trends.fetch(keyword)
-                seo_data = serp_seo.fetch(keyword)
-            csv_data = _csv_data(csv_path, keyword)
+                trends_data = trends.fetch(keyword, market=market) if market is not None else trends.fetch(keyword)
+                seo_data = serp_seo.fetch(keyword, market=market) if market is not None else serp_seo.fetch(keyword)
+            csv_data = csv_data_for_market()
             score_result = _incomplete_score(trends_data, csv_data, ads_data, reason=_NEEDS_REVIEW_REASON)
         else:
             landing_data = {"error": "sem dados: zero matched (todos rejeitados); landing não consultada"}
             if skip_serpapi:
                 trends_data = {"error": "SerpAPI não executada — modo sem rede"}
             else:
-                trends_data = trends.fetch_related(keyword)
+                trends_data = trends.fetch_related(keyword, market=market) if market is not None else trends.fetch_related(keyword)
             seo_data = {"error": "SEO não executado: zero matched"}
-            csv_data = _csv_data(csv_path, keyword)
+            csv_data = csv_data_for_market()
             score_result = _forced_zero_score(_ZERO_MATCHED_REJECTED_REASON)
     else:
         landing_data = landing_price.fetch_prices_from_ads(ads_data)
@@ -731,10 +912,22 @@ def run_keyword(
             trends_data = {"error": "SerpAPI não executada — modo sem rede"}
             seo_data = {"error": "SEO não executado — modo sem rede"}
         else:
-            trends_data = trends.fetch(keyword)
-            seo_data = serp_seo.fetch(keyword)
-        csv_data = _csv_data(csv_path, keyword)
+            trends_data = trends.fetch(keyword, market=market) if market is not None else trends.fetch(keyword)
+            seo_data = serp_seo.fetch(keyword, market=market) if market is not None else serp_seo.fetch(keyword)
+        csv_data = csv_data_for_market()
         score_result = score.compute(trends_data, csv_data, ads_data)
+
+    if market is not None:
+        scope_errors = _market_scope_errors(
+            market, ads_data, trends_data, csv_data, seo_data
+        )
+        if scope_errors:
+            score_result = _incomplete_score(
+                trends_data,
+                csv_data,
+                ads_data,
+                reason="proveniência geográfica inválida: " + "; ".join(scope_errors),
+            )
 
     # Product-relevance gate: apply the filter once over a *copy* of
     # trends_data before both suggestion extraction and pack rendering
@@ -765,6 +958,12 @@ def run_keyword(
         "landing_price_data": landing_data,
         "suggested_keywords": suggested,
     }
+    market_scope = market.as_dict() if market is not None else None
+    market_signals = _market_signal_labels(trends_data, ads_data) if market is not None else []
+    if market_scope is not None:
+        result["market_id"] = market.market_id
+        result["market"] = market_scope
+        result["market_signals"] = market_signals
     run_mode = mode or "keyword"
     result["md_path"] = pack.generate(
         keyword=keyword,
@@ -779,6 +978,8 @@ def run_keyword(
         product_id=product.product_id,
         product_name=product.name,
         research_keyword=keyword,
+        market=market_scope,
+        market_signals=market_signals if market is not None else None,
         **_run_metadata(run_mode, run_id or None, _source_states(run_mode, result, None)),
     )
     return result
@@ -786,7 +987,7 @@ def run_keyword(
 
 def _run_batch(
     mode: str,
-    products: list[Product],
+    products: list[Product | MarketTarget],
     csv_path: str | None,
     send: bool,
 ) -> list[dict[str, Any]]:
@@ -815,18 +1016,18 @@ def _run_batch(
         if _manifest_completed(manifest):
             return _reuse_run(manifest, send=send)
 
-        product_ids = {product.product_id for product in products}
+        target_keys = {_target_key(product) for product in products}
         if manifest is None:
             results: list[dict[str, Any]] = []
-            pending: list[Product] = list(products)
+            pending: list[Product | MarketTarget] = list(products)
         else:
             results = [
                 r for r in (manifest.get("results") or [])
-                if isinstance(r, dict) and r.get("product_id") in product_ids
+                if isinstance(r, dict) and _target_key(r) in target_keys
                 and not _is_technical_fatal(r)
             ]
-            done = {r.get("product_id") for r in results}
-            pending = [product for product in products if product.product_id not in done]
+            done = {_target_key(result) for result in results}
+            pending = [product for product in products if _target_key(product) not in done]
             if pending:
                 logger.info("run_state: retoma %s — %d produto(s) reutilizado(s), %d a repetir",
                             mode, len(results), len(pending))
@@ -843,8 +1044,12 @@ def _run_batch(
                 store.save(run_id, manifest)
 
             # Deterministic digest order even after a resume appended retries.
-            by_id = {r["product_id"]: r for r in results}
-            results = [by_id[product.product_id] for product in products if product.product_id in by_id]
+            by_target = {_target_key(result): result for result in results}
+            results = [
+                by_target[_target_key(product)]
+                for product in products
+                if _target_key(product) in by_target
+            ]
 
             batch = build_batch(mode=mode, run_id=run_id, results=results, run_date=date.today())
             digest = batch.audit_text
@@ -863,18 +1068,38 @@ def _run_batch(
     return results
 
 
-def _run_sunday(csv_path: str | None = None, send: bool = True, registry: ProductRegistry | None = None) -> list[dict[str, Any]]:
+def _run_sunday(
+    csv_path: str | None = None,
+    send: bool = True,
+    registry: ProductRegistry | None = None,
+    markets: MarketRegistry | None = None,
+) -> list[dict[str, Any]]:
     registry = registry or _load_products()
-    products = registry.active_products()
-    if not products:
-        logger.info("Zero produtos ativos em config/products.json")
+    if markets is None:
+        products = registry.active_products()
+        if not products:
+            logger.info("Zero produtos ativos em config/products.json")
+            return []
+        return _run_batch("sunday", list(products), csv_path, send)
+    targets = markets.targets_for(registry.active_products())
+    if not targets:
+        logger.info("Zero targets ativos em config/products.json + config/markets.json")
         return []
-    return _run_batch("sunday", list(products), csv_path, send)
+    return _run_batch("sunday", list(targets), csv_path, send)
 
 
-def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -> list[dict[str, Any]]:
+def _run_wednesday(
+    send: bool = True,
+    registry: ProductRegistry | None = None,
+    markets: MarketRegistry | None = None,
+) -> list[dict[str, Any]]:
     registry = registry or _load_products()
-    products = _find_packs_by_label(["AVANÇAR", "OBSERVAR"], max_age_days=14, registry=registry)
+    products = _find_packs_by_label(
+        ["AVANÇAR", "OBSERVAR"],
+        max_age_days=14,
+        registry=registry,
+        markets=markets,
+    )
     if not products:
         logger.info("Zero packs AVANÇAR/OBSERVAR com <14 dias. Nada a pulsar.")
         return []
@@ -886,11 +1111,12 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
             return _reuse_run(manifest, send=send)
         manifest = _begin_manifest(run_id, "wednesday", products, None)
         store.save(run_id, manifest)
-        logger.info("=== QUARTA: pulse Apify em %d produtos ===", len(products))
+        logger.info("=== QUARTA: pulse Apify em %d targets ===", len(products))
         results: list[dict[str, Any]] = []
         try:
             for product in products:
                 keyword = product.research_keyword
+                market = product.market if isinstance(product, MarketTarget) else None
                 previous = _load_previous_pack(product, registry=registry)
                 if not previous:
                     continue
@@ -905,6 +1131,7 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                     logger.warning("Pulse %s: %s", keyword, reason)
                     results.append({
                         "product_id": product.product_id,
+                        **({"market_id": market.market_id, "market": market.as_dict()} if market else {}),
                         "product_name": product.name,
                         "research_keyword": keyword,
                         "keyword": keyword,
@@ -913,16 +1140,39 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                         "preserved": True,
                     })
                     continue
-                current_ads = apify_ads.fetch(keyword)
+                current_ads = (
+                    apify_ads.fetch(keyword, market=market)
+                    if market is not None
+                    else apify_ads.fetch(keyword)
+                )
                 if "error" in current_ads:
                     logger.warning("Pulse %s: %s; pack anterior preservado", keyword, current_ads["error"])
                     results.append({
                         "product_id": product.product_id,
+                        **({"market_id": market.market_id, "market": market.as_dict()} if market else {}),
                         "product_name": product.name,
                         "research_keyword": keyword,
                         "keyword": keyword,
                         "error": current_ads["error"],
                         "ads_data": current_ads,
+                        "preserved": True,
+                    })
+                    continue
+
+                if market is not None and (
+                    current_ads.get("evidence_scope") != "market"
+                    or current_ads.get("query_country") != market.ads_country
+                ):
+                    reason = "Apify devolveu Ads sem scope local comprovado; pack anterior preservado"
+                    results.append({
+                        "product_id": product.product_id,
+                        "market_id": market.market_id,
+                        "market": market.as_dict(),
+                        "product_name": product.name,
+                        "research_keyword": keyword,
+                        "keyword": keyword,
+                        "error": reason,
+                        "ads_data": {"error": reason},
                         "preserved": True,
                     })
                     continue
@@ -947,6 +1197,17 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                 seo_data = previous.get("seo", {})
                 landing_data = previous.get("landing_price")
                 score_result = previous.get("score", {})
+                if market is not None:
+                    scope_errors = _market_scope_errors(
+                        market, current_ads, trends_data, csv_data, seo_data
+                    )
+                    if scope_errors:
+                        score_result = _incomplete_score(
+                            trends_data,
+                            csv_data,
+                            current_ads,
+                            reason="proveniência geográfica inválida: " + "; ".join(scope_errors),
+                        )
                 suggested = previous.get("suggested_keywords", [])
                 result = {
                     "product_id": product.product_id,
@@ -964,6 +1225,15 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                     "advertiser_deltas": advertiser_deltas,
                     "ad_cohort": cohort,
                 }
+                market_scope = market.as_dict() if market is not None else None
+                market_signals = (
+                    _market_signal_labels(trends_data, current_ads, cohort)
+                    if market is not None else []
+                )
+                if market_scope is not None:
+                    result["market_id"] = market.market_id
+                    result["market"] = market_scope
+                    result["market_signals"] = market_signals
                 result["md_path"] = pack.generate(
                     keyword=keyword,
                     trends_data=trends_data,
@@ -977,6 +1247,8 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
                     product_id=product.product_id,
                     product_name=product.name,
                     research_keyword=keyword,
+                    market=market_scope,
+                    market_signals=market_signals if market is not None else None,
                     ad_cohort=cohort,
                     **_run_metadata("wednesday", run_id, _source_states("wednesday", result, previous)),
                 )
@@ -991,9 +1263,15 @@ def _run_wednesday(send: bool = True, registry: ProductRegistry | None = None) -
     return results
 
 
-def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> list[dict[str, Any]]:
+def _run_monthly(
+    send: bool = True,
+    registry: ProductRegistry | None = None,
+    markets: MarketRegistry | None = None,
+) -> list[dict[str, Any]]:
     registry = registry or _load_products()
-    products = _find_packs_by_label(["OBSERVAR"], max_age_days=None, registry=registry)
+    products = _find_packs_by_label(
+        ["OBSERVAR"], max_age_days=None, registry=registry, markets=markets
+    )
     if not products:
         logger.info("Zero packs OBSERVAR na watchlist. Nada a re-score.")
         return []
@@ -1005,11 +1283,12 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
             return _reuse_run(manifest, send=send)
         manifest = _begin_manifest(run_id, "monthly", products, None)
         store.save(run_id, manifest)
-        logger.info("=== DIA 1: re-score watchlist de %d produtos ===", len(products))
+        logger.info("=== DIA 1: re-score watchlist de %d targets ===", len(products))
         results: list[dict[str, Any]] = []
         try:
             for product in products:
                 keyword = product.research_keyword
+                market = product.market if isinstance(product, MarketTarget) else None
                 previous = _load_previous_pack(product, registry=registry)
                 if not previous:
                     continue
@@ -1024,6 +1303,7 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                     logger.warning("Re-score %s: %s", keyword, reason)
                     results.append({
                         "product_id": product.product_id,
+                        **({"market_id": market.market_id, "market": market.as_dict()} if market else {}),
                         "product_name": product.name,
                         "research_keyword": keyword,
                         "keyword": keyword,
@@ -1038,7 +1318,16 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                         "ads_data": {"error": reason},
                     })
                     continue
-                trends_data = trends.fetch(keyword, timeseries_only=True, force_refresh=True)
+                trends_data = (
+                    trends.fetch(
+                        keyword,
+                        timeseries_only=True,
+                        force_refresh=True,
+                        market=market,
+                    )
+                    if market is not None
+                    else trends.fetch(keyword, timeseries_only=True, force_refresh=True)
+                )
                 ads_data = previous_ads
                 # Landing URL privacy: legacy packs may carry raw landing URLs;
                 # what is re-persisted in the new pack is always sanitized
@@ -1054,6 +1343,7 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                     logger.warning("Re-score %s: %s; pack anterior preservado", keyword, trends_data["error"])
                     results.append({
                         "product_id": product.product_id,
+                        **({"market_id": market.market_id, "market": market.as_dict()} if market else {}),
                         "product_name": product.name,
                         "research_keyword": keyword,
                         "keyword": keyword,
@@ -1065,6 +1355,17 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                     })
                     continue
                 score_result = score.compute(trends_data, csv_data, ads_data)
+                if market is not None:
+                    scope_errors = _market_scope_errors(
+                        market, ads_data, trends_data, csv_data, seo_data
+                    )
+                    if scope_errors:
+                        score_result = _incomplete_score(
+                            trends_data,
+                            csv_data,
+                            ads_data,
+                            reason="proveniência geográfica inválida: " + "; ".join(scope_errors),
+                        )
                 result = {
                     "product_id": product.product_id,
                     "product_name": product.name,
@@ -1078,6 +1379,15 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                     "landing_price_data": landing_data,
                     "suggested_keywords": suggested,
                 }
+                market_scope = market.as_dict() if market is not None else None
+                market_signals = (
+                    _market_signal_labels(trends_data, ads_data)
+                    if market is not None else []
+                )
+                if market_scope is not None:
+                    result["market_id"] = market.market_id
+                    result["market"] = market_scope
+                    result["market_signals"] = market_signals
                 result["md_path"] = pack.generate(
                     keyword=keyword,
                     trends_data=trends_data,
@@ -1091,6 +1401,8 @@ def _run_monthly(send: bool = True, registry: ProductRegistry | None = None) -> 
                     product_id=product.product_id,
                     product_name=product.name,
                     research_keyword=keyword,
+                    market=market_scope,
+                    market_signals=market_signals if market is not None else None,
                     **_run_metadata("monthly", run_id, _source_states("monthly", result, previous)),
                 )
                 results.append(result)
@@ -1197,25 +1509,41 @@ def _compare_ads(previous: dict[str, Any], current: dict[str, Any]) -> tuple[lis
             deltas.append(f"{key}: {old_adv.get(key, 0)}→{new_adv.get(key, 0)} variantes")
     return changes, deltas
 
-def _run_all(products: list[Product], csv_path: str | None = None, send: bool = True) -> list[dict[str, Any]]:
+def _run_all(products: list[Product | MarketTarget], csv_path: str | None = None, send: bool = True) -> list[dict[str, Any]]:
     """Full run over all active products, with per-product exception isolation."""
     if not products:
         return []
     return _run_batch("all", products, csv_path, send)
 
 
-def _auto_dispatch(send: bool = True, csv_path: str | None = None) -> list[dict[str, Any]]:
+def _auto_dispatch(
+    send: bool = True,
+    csv_path: str | None = None,
+    registry: ProductRegistry | None = None,
+    markets: MarketRegistry | None = None,
+) -> list[dict[str, Any]]:
     """Dispatch all actions for today; day 1 always runs before weekly pulse."""
     today = date.today()
     is_sunday = today.weekday() == 6
     is_wednesday = today.weekday() == 2
     results: list[dict[str, Any]] = []
     if today.day == 1:
-        results.extend(_run_monthly(send=send))
+        if registry is not None and markets is not None:
+            results.extend(_run_monthly(send=send, registry=registry, markets=markets))
+        else:
+            results.extend(_run_monthly(send=send))
     if is_sunday:
-        results.extend(_run_sunday(send=send, csv_path=csv_path))
+        if registry is not None and markets is not None:
+            results.extend(_run_sunday(
+                send=send, csv_path=csv_path, registry=registry, markets=markets
+            ))
+        else:
+            results.extend(_run_sunday(send=send, csv_path=csv_path))
     elif is_wednesday:
-        results.extend(_run_wednesday(send=send))
+        if registry is not None and markets is not None:
+            results.extend(_run_wednesday(send=send, registry=registry, markets=markets))
+        else:
+            results.extend(_run_wednesday(send=send))
     if not results and today.day != 1 and not is_sunday and not is_wednesday:
         logger.info("→ Dia sem ação (%s). Exit 0.", today.strftime("%A"))
     return results
@@ -1230,6 +1558,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--monthly", action="store_true", help="Re-score mensal: uma call Trends por keyword")
     parser.add_argument("--auto", action="store_true", help="Despachar dia 1, domingo ou quarta")
     parser.add_argument("--csv", help="Caminho para CSV do Keyword Planner")
+    parser.add_argument("--market", default="PT", help="Mercado explícito (default: PT)")
     parser.add_argument("--digest", action="store_true", help="Enviar digest para Telegram, com fallback stdout")
     return parser
 
@@ -1303,7 +1632,7 @@ def resolve_mode(args: argparse.Namespace, today: date | None = None) -> dict[st
     return {"mode": mode, "keyword": args.keyword, "warnings": warnings, "csv_fatal": csv_fatal}
 
 
-def _run_keyword_action(product: Product, csv_path: str | None = None, send: bool = False) -> None:
+def _run_keyword_action(product: Product | MarketTarget, csv_path: str | None = None, send: bool = False) -> None:
     """Single-product action with the same idempotency contract as the other modes."""
     keyword = product.research_keyword
     run_id = _compute_run_id("keyword", [product], csv_path)
@@ -1349,38 +1678,46 @@ def main(argv: list[str] | None = None) -> None:
     # config/products.json before any source/network call, so a missing or
     # invalid registry is a hard exit-2 error, never a silent empty run.
     registry = None
+    markets = None
     if mode in ("all", "sunday", "wednesday", "monthly", "keyword", "auto"):
         try:
             registry = _load_products()
-        except ProductRegistryError as exc:
+            markets = _load_markets()
+        except (ProductRegistryError, MarketRegistryError) as exc:
             parser.error(str(exc))
 
     if mode == "auto":
-        _auto_dispatch(send=args.digest, csv_path=args.csv)
+        _auto_dispatch(
+            send=args.digest,
+            csv_path=args.csv,
+            registry=registry,
+            markets=markets,
+        )
         return
     if mode == "sunday":
-        _run_sunday(csv_path=args.csv, send=args.digest, registry=registry)
+        _run_sunday(csv_path=args.csv, send=args.digest, registry=registry, markets=markets)
         return
     if mode == "wednesday":
-        _run_wednesday(send=args.digest, registry=registry)
+        _run_wednesday(send=args.digest, registry=registry, markets=markets)
         return
     if mode == "monthly":
-        _run_monthly(send=args.digest, registry=registry)
+        _run_monthly(send=args.digest, registry=registry, markets=markets)
         return
     if mode == "all":
-        products = registry.active_products()
-        if not products:
-            parser.error("Zero produtos ativos em config/products.json")
-        _run_all(products, csv_path=args.csv, send=args.digest)
+        targets = markets.targets_for(registry.active_products())
+        if not targets:
+            parser.error("Zero targets ativos em config/products.json + config/markets.json")
+        _run_all(list(targets), csv_path=args.csv, send=args.digest)
         return
     if mode == "none":
         parser.print_help()
         return
     try:
         product = registry.resolve(args.keyword)
-    except ProductNotFoundError as exc:
+        target = markets.target(product, args.market)
+    except (ProductNotFoundError, MarketRegistryError, MarketTargetNotFoundError) as exc:
         parser.error(str(exc))
-    _run_keyword_action(product, csv_path=args.csv, send=args.digest)
+    _run_keyword_action(target, csv_path=args.csv, send=args.digest)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ Sem chamadas reais à rede.
 
 import codecs
 import csv
+import json
 import os
 import tempfile
 import textwrap
@@ -41,6 +42,34 @@ def _write_utf16_tsv(content: str) -> str:
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────
+
+
+def test_market_run_requires_matching_keyword_planner_sidecar():
+    path = _write_csv("""
+        Keyword,Avg. monthly searches,Competition,Top of page bid (low range)
+        scented candles,5400,High,0.42
+    """)
+    market = type("Market", (), {"market_id": "GB", "currency": "GBP"})()
+    metadata_path = f"{path}.meta.json"
+    try:
+        missing = keyword_csv.parse(path, keyword="scented candles", market=market)
+        assert "error" in missing
+
+        with open(metadata_path, "w", encoding="utf-8") as target:
+            json.dump({"market_id": "PT", "currency": "EUR"}, target)
+        mismatch = keyword_csv.parse(path, keyword="scented candles", market=market)
+        assert "error" in mismatch
+
+        with open(metadata_path, "w", encoding="utf-8") as target:
+            json.dump({"market_id": "GB", "currency": "GBP"}, target)
+        result = keyword_csv.parse(path, keyword="scented candles", market=market)
+        assert result["volume"] == 5400
+        assert result["market_id"] == "GB"
+        assert result["currency"] == "GBP"
+    finally:
+        os.unlink(path)
+        if os.path.exists(metadata_path):
+            os.unlink(metadata_path)
 
 
 class TestKeywordCsvParse:
@@ -623,3 +652,38 @@ class TestKeywordCsvMalformedNulInput:
         result = keyword_csv.parse(path)
         assert "error" not in result
         assert result["volume"] == 5400
+
+
+def test_invalid_utf8_bom_returns_structured_error(tmp_path):
+    path = tmp_path / "invalid-bom.csv"
+    path.write_bytes(codecs.BOM_UTF8 + b"\xff\xfe")
+
+    result = keyword_csv.parse(str(path))
+
+    assert "error" in result
+
+
+def test_invalid_market_sidecar_encoding_returns_structured_error(tmp_path):
+    path = tmp_path / "planner.csv"
+    path.write_text("keyword,volume,cpc\nscented candles,5400,1.20\n", encoding="utf-8")
+    (tmp_path / "planner.csv.meta.json").write_bytes(b"\xff\xfe")
+    market = type("Market", (), {"market_id": "GB", "currency": "GBP"})()
+
+    result = keyword_csv.parse(str(path), keyword="scented candles", market=market)
+
+    assert "error" in result
+
+
+def test_gbp_cpc_symbol_is_parsed_with_market_metadata(tmp_path):
+    path = tmp_path / "planner.csv"
+    path.write_text("keyword,volume,cpc\nscented candles,5400,£1.20\n", encoding="utf-8")
+    (tmp_path / "planner.csv.meta.json").write_text(
+        json.dumps({"market_id": "GB", "currency": "GBP"}),
+        encoding="utf-8",
+    )
+    market = type("Market", (), {"market_id": "GB", "currency": "GBP"})()
+
+    result = keyword_csv.parse(str(path), keyword="scented candles", market=market)
+
+    assert result["cpc"] == 1.2
+    assert result["currency"] == "GBP"

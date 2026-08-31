@@ -67,8 +67,8 @@ def classified_ads_data(candidates: list[dict[str, Any]] | None = None, **overri
     base: dict[str, Any] = {
         "source": "Facebook Ad Library via Apify",
         "query": KEYWORD,
-        "evidence_scope": "global",
-        "query_country": "ALL",
+        "evidence_scope": "market",
+        "query_country": "PT",
         "sample_limit": 100,
         "sample_capped": False,
         "raw_ads_count": len(candidates),
@@ -111,6 +111,17 @@ def current_pack(**overrides: Any) -> dict[str, Any]:
         "landing_price": {"error": "sem dados"},
         "suggested_keywords": [],
         "product_id": PRODUCT_ID,
+        "market_id": "PT",
+        "market": {
+            "market_id": "PT",
+            "name": "Portugal",
+            "currency": "EUR",
+            "ads_country": "PT",
+            "trends_geo": "PT",
+            "serp_gl": "pt",
+            "serp_hl": "pt",
+            "serp_location": "Portugal",
+        },
         "product_name": "mochila personalizada",
         "research_keyword": KEYWORD,
         "run_id": RUN_ID,
@@ -134,6 +145,8 @@ def legacy_pack(**overrides: Any) -> dict[str, Any]:
     packs currently in ``data/`` predate classification)."""
     pack = current_pack()
     del pack["product_id"]
+    del pack["market_id"]
+    del pack["market"]
     del pack["product_name"]
     del pack["research_keyword"]
     del pack["matching_schema_version"]

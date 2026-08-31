@@ -346,9 +346,14 @@ class TestServeCli:
         metadata = build_metadata(str(db))
         db_meta = metadata["databases"]["ecom_research"]
         assert set(db_meta["queries"]) == {"latest_packs", "needs_review_candidates", "matched_advertisers"}
-        assert "FROM pack" in db_meta["queries"]["latest_packs"]["sql"]
-        assert "needs_review" in db_meta["queries"]["needs_review_candidates"]["sql"]
-        assert "matched" in db_meta["queries"]["matched_advertisers"]["sql"]
+        latest_sql = db_meta["queries"]["latest_packs"]["sql"]
+        review_sql = db_meta["queries"]["needs_review_candidates"]["sql"]
+        advertisers_sql = db_meta["queries"]["matched_advertisers"]["sql"]
+        assert "FROM pack" in latest_sql and "market_id" in latest_sql
+        assert "needs_review" in review_sql
+        assert "p.market_id = c.market_id" in review_sql
+        assert "matched" in advertisers_sql
+        assert "GROUP BY market_id, advertiser, page_id" in advertisers_sql
 
     def test_cmd_serve_invokes_immutable_subprocess(self, tmp_path, monkeypatch):
         db = tmp_path / "proj.db"

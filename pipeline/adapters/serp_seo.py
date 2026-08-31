@@ -39,14 +39,14 @@ CACHE_TTL = 30 * 24 * 3600  # 30 dias em segundos
 CLOCK_SKEW_TOLERANCE = 5 * 60
 REQUEST_TIMEOUT = 15
 
-# Domínios de marketplaces conhecidos (PT/ES/BR)
+# Domínios de marketplaces conhecidos (PT/GB/ES/BR)
 MARKETPLACE_DOMAINS: set[str] = {
-    "amazon.es", "amazon.com.br", "amazon.com",
+    "amazon.co.uk", "amazon.es", "amazon.com.br", "amazon.com",
     "elcorteingles.pt", "elcorteingles.es",
     "worten.pt", "fnac.pt", "fnac.es",
     "continente.pt", "pcdiga.pt", "radio-popular.pt",
     "mercadolivre.com.br", "shopee.com.br",
-    "aliexpress.com", "ebay.com", "temu.com",
+    "aliexpress.com", "ebay.co.uk", "ebay.com", "temu.com",
     "leroymerlin.pt", "ikea.com",
 }
 
@@ -60,9 +60,10 @@ def _slugify(keyword: str) -> str:
     return hashlib.md5(keyword.encode()).hexdigest()[:12]
 
 
-def _cache_path(keyword: str) -> str:
+def _cache_path(keyword: str, market: Any | None = None) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{_slugify(keyword)}_serp.json")
+    scoped_keyword = keyword if market is None else f"{market.market_id}:{keyword}"
+    return os.path.join(CACHE_DIR, f"{_slugify(scoped_keyword)}_serp.json")
 
 
 def _valid_organic_item(item: Any) -> bool:
@@ -109,14 +110,14 @@ def _valid_payload(data: dict[str, Any]) -> bool:
     return True
 
 
-def _read_cache(keyword: str) -> dict[str, Any] | None:
+def _read_cache(keyword: str, market: Any | None = None) -> dict[str, Any] | None:
     """Lê cache se existir e for válida (< 30 dias).
 
     JSON válido que não seja um dict, com ``_cached_at`` não numérico/não
     finito, com payload de erro, ou com forma inválida é tratado como miss
     — nunca crash, nunca refresh suprimido.  Payloads de erro são removidos.
     """
-    path = _cache_path(keyword)
+    path = _cache_path(keyword, market)
     if not os.path.exists(path):
         return None
     try:
@@ -150,16 +151,24 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
     if not _valid_payload(data):
         logger.warning("SERP cache: payload com forma inválida para keyword=%s; miss", keyword)
         return None
+    if market is not None and (
+        data.get("market_id") != market.market_id
+        or data.get("query_gl") != market.serp_gl
+        or data.get("query_hl") != market.serp_hl
+        or data.get("query_location") != market.serp_location
+    ):
+        logger.warning("SERP cache: scope de mercado inválido para keyword=%s; miss", keyword)
+        return None
 
     logger.info("SERP cache: HIT para keyword=%s (idade=%ds)", keyword, int(time.time() - cached_ts))
     return data
 
 
-def _write_cache(keyword: str, data: dict[str, Any]) -> None:
+def _write_cache(keyword: str, data: dict[str, Any], market: Any | None = None) -> None:
     """Escreve dados na cache com timestamp sem mutar o resultado fresco."""
     data_to_write = dict(data)
     data_to_write["_cached_at"] = time.time()
-    path = _cache_path(keyword)
+    path = _cache_path(keyword, market)
     try:
         with open(path, "w") as f:
             json.dump(data_to_write, f, ensure_ascii=False, indent=2)
@@ -264,7 +273,7 @@ def _parse_serp_response(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def fetch(keyword: str) -> dict[str, Any]:
+def fetch(keyword: str, market: Any | None = None) -> dict[str, Any]:
     """
     Dado uma keyword, consulta Google SERP via SerpAPI (com cache 30 dias) e devolve:
     {
@@ -279,7 +288,7 @@ def fetch(keyword: str) -> dict[str, Any]:
     }
     """
     # 1. Tentar cache
-    cached = _read_cache(keyword)
+    cached = _read_cache(keyword, market)
     if cached is not None:
         result = {k: v for k, v in cached.items() if k != "_cached_at"}
         return result
@@ -297,9 +306,9 @@ def fetch(keyword: str) -> dict[str, Any]:
         params = {
             "engine": "google",
             "q": keyword,
-            "gl": "pt",
-            "hl": "pt",
-            "location": "Portugal",
+            "gl": market.serp_gl if market is not None else "pt",
+            "hl": market.serp_hl if market is not None else "pt",
+            "location": market.serp_location if market is not None else "Portugal",
             "api_key": api_key,
         }
 
@@ -342,5 +351,10 @@ def fetch(keyword: str) -> dict[str, Any]:
             return {"error": f"SerpAPI SERP: {message or 'erro reportado pelo fornecedor'}"}
 
         result = _parse_serp_response(raw)
-        _write_cache(keyword, result)
+        if market is not None:
+            result["market_id"] = market.market_id
+            result["query_gl"] = market.serp_gl
+            result["query_hl"] = market.serp_hl
+            result["query_location"] = market.serp_location
+        _write_cache(keyword, result, market)
         return result

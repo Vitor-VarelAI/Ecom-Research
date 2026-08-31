@@ -5,7 +5,8 @@ This module is deliberately tiny and dependency-free.  It provides:
 
 * ``compute_run_id`` — a deterministic identity for one logical action.
   Inputs are the logical date, the resolved action mode, the ordered
-  product descriptors (each ``product_id`` + ``research_keyword``), the
+  product descriptors (each ``product_id`` + ``market_id`` +
+  ``research_keyword``), the
   CSV content hash (when the mode consumes CSV), the scoring version and
   the matcher version.  Credentials, wall-clock timestamps and ``--digest``
   are intentionally excluded so that a rerun of the same action reuses the
@@ -115,12 +116,10 @@ def compute_run_id(
     """
     Deterministic identity for one logical action.
 
-    ``products`` is an ordered list of canonical descriptors, each
-    ``{"product_id": ..., "research_keyword": ...}`` — the structure is
-    explicit JSON, never delimiter-packed strings.  A research-query
-    rename (different ``research_keyword`` on the same ``product_id``)
-    changes the identity and creates a new run; a product name-only or
-    alias-only change does not participate and keeps the identity.
+    ``products`` is an ordered list of canonical descriptors, each carrying
+    ``product_id``, ``market_id`` and ``research_keyword``.  A market or
+    research-query change creates a new run; a product name-only or alias-only
+    change does not participate and keeps the identity.
 
     ``scoring_version`` and ``matcher_version`` participate in the identity:
     a new scoring cohort or a new matcher classification never reuses the
@@ -131,7 +130,11 @@ def compute_run_id(
     run therefore resolves to the same manifest and is short-circuited.
     """
     canonical_products = [
-        {"product_id": item["product_id"], "research_keyword": item["research_keyword"]}
+        {
+            "product_id": item["product_id"],
+            "market_id": item.get("market_id", "PT"),
+            "research_keyword": item["research_keyword"],
+        }
         for item in products
     ]
     canonical = json.dumps(

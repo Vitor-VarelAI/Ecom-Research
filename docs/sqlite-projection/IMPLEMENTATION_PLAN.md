@@ -1,4 +1,6 @@
-# Plano — projeção SQLite idempotente + explorer Datasette read-only
+# Implementação — projeção SQLite idempotente + explorer Datasette read-only
+
+Estado: integrada na `main` até `bcd3d50` e verificada em 2026-08-30. Este documento regista o contrato implementado e o runbook; não é trabalho pendente.
 
 ## Âmbito desta entrega
 
@@ -6,7 +8,7 @@ Adicionar uma projeção SQLite descartável e idempotente dos packs JSON
 classificados atuais, mais um explorer Datasette read-only. Os packs
 (`data/*.json`) permanecem evidência canónica e **nunca são reescritos**:
 a projeção importa-os transacionalmente, chaveados por `(run_id,
-product_id)`, e não substitui a prova. Não há chamadas Apify/Telegram live,
+product_id, market_id)`, e não substitui a prova. Não há chamadas Apify/Telegram live,
 não há rescoring/reclassificação e nenhum pack/JSON histórico muda.
 
 ## Contrato decidido
@@ -15,7 +17,7 @@ não há rescoring/reclassificação e nenhum pack/JSON histórico muda.
    CLI) + CLI raiz separada `explore.py`; **sem** acoplamento a `run.py` ou
    `config/products.json`.
 2. Só são importados packs completos classificados **atuais**:
-   - `run_id` e `product_id` top-level não vazios;
+   - `run_id`, `product_id` e `market_id` top-level não vazios, com snapshot `market` consistente;
    - `artifact_complete == true`;
    - `date` ISO válida e `score.label` num dos labels advisory
      (`AVANÇAR`/`OBSERVAR`/`DESCARTAR`/`DADOS INSUFICIENTES`);
@@ -27,16 +29,20 @@ não há rescoring/reclassificação e nenhum pack/JSON histórico muda.
    antiga) são **saltados read-only** e reportados com razão clara. JSON
    malformado, ou um pack que reivindica a schema atual mas viola a shape
    exigida, **falha fechado** com erro acionável — nunca é rotulado legado.
-4. Chave de pack `(run_id, product_id)`; fingerprint SHA-256 sobre o JSON
+   Números projetados respeitam o intervalo integer signed 64-bit do SQLite;
+   erros de shape mostram campo, posição e tipo, nunca o valor cru do pack.
+4. Chave de pack `(run_id, product_id, market_id)`; fingerprint SHA-256 sobre o JSON
    canónico completo do pack (`sort_keys`, separadores compactos,
    `ensure_ascii=False`). Reimportar conteúdo idêntico é no-op; mesma
    identidade com hash diferente levanta `PackConflictError` específico e
    deixa as linhas existentes intactas.
 5. Importação atómica por pack: linha do pack + todas as linhas candidato
    numa única transação SQLite, `PRAGMA foreign_keys = ON` e schema version
-   fixada via `PRAGMA user_version`. Schema incompatível instrui o operador
-   a apagar/reconstruir a base descartável. Chave de candidato inclui a
-   posição na lista (`ad_archive_id` pode faltar).
+   fixada via `PRAGMA user_version`. A validação partilhada por import e serve
+   rejeita versão, integridade, tipos/afinidades, `NOT NULL`, chaves compostas
+   ou `ON DELETE CASCADE` incompatíveis e instrui o operador a reconstruir a
+   base descartável. Chave de candidato inclui a posição na lista
+   (`ad_archive_id` pode faltar).
 6. Projeção copia valores já sanitizados verbatim (sem sanitizadores de URL,
    sem derivar score ou decisões de match). Campos JSON guardados como texto
    JSON canónico.
@@ -71,15 +77,14 @@ importados normalmente.
 ## Testes
 
 - `tests/test_projection_validation.py` — classificação atual vs legado,
-  skip de não-pack, JSON malformado falha fechado, claims-current-invalid
-  falha fechado, fingerprint canónico estável.
-- `tests/test_projection_store.py` — schema/user_version e instrução de
-  rebuild, projeção verbatim, JSON canónico, chave por posição, no-op
-  idêntico, conflito com linhas intactas, rollback de inserção de candidato,
-  bytes da fonte inalterados.
-- `tests/test_projection_cli.py` — import/report/conflito, argv serve
-  imutável, recusa de base ausente/schema errado, metadados com canned
-  queries.
+  skip de não-pack, JSON malformado/claims-current-invalid fail-closed,
+  fingerprint canónico, integer signed 64-bit e razões sem valores crus.
+- `tests/test_projection_store.py` — `user_version`, integridade, tipos,
+  nulabilidade, chaves e ação FK, projeção verbatim, JSON canónico, chave por
+  posição, no-op, conflito, rollback e classificação interna forjada.
+- `tests/test_projection_cli.py` — import/report/conflito, inteiro gigante
+  sem traceback, redação de valores, argv serve imutável, base ausente/schema
+  errado e metadados com canned queries.
 
 ## Verificação
 
@@ -89,5 +94,9 @@ importados normalmente.
 git diff --check
 ```
 
-Nenhuma chamada de rede/Apify/Telegram; nenhum servidor Datasette
-persistente é lançado na verificação.
+Fecho de 2026-08-30: **138 testes da projeção** e **932 testes totais**
+verdes; `compileall`, `pip check` e `git diff --check` limpos. Um smoke com
+base temporária leu 50 JSON, importou 16 packs/973 candidatos, saltou 34
+ficheiros read-only e executou uma query HTTP real pelo Datasette com
+`--immutable`. O servidor local foi terminado e a base removida. Não houve
+chamadas Apify/Telegram nem alteração dos packs canónicos.

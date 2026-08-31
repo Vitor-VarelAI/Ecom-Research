@@ -3,7 +3,8 @@
 A pack file is classified into exactly one of:
 
 * ``current`` — a complete current classified pack: non-empty top-level
-  ``run_id`` and ``product_id``, ``artifact_complete == true``, a strict
+  ``run_id``, ``product_id`` and ``market_id``, a matching market snapshot,
+  ``artifact_complete == true``, a strict
   ``YYYY-MM-DD`` date and advisory score label, ``facebook_ads.
   matching_schema_version`` equal to the live matcher schema version (an
   actual int — ``true`` and ``1.0`` do not count) and a ``candidates`` list
@@ -213,6 +214,14 @@ def _validate_current_shape(pack: dict[str, Any]) -> list[str]:
     product_id = pack.get("product_id")
     if not isinstance(product_id, str) or not product_id.strip():
         problems.append(f"product_id ausente ou vazio (recebido tipo {type(product_id).__name__})")
+    market_id = pack.get("market_id")
+    if not isinstance(market_id, str) or not re.fullmatch(r"[A-Z]{2}", market_id):
+        problems.append(f"market_id ausente ou inválido (recebido tipo {type(market_id).__name__})")
+    market = pack.get("market")
+    if not isinstance(market, dict):
+        problems.append(f"market esperado objeto, recebido tipo {type(market).__name__}")
+    elif market.get("market_id") != market_id or not isinstance(market.get("currency"), str):
+        problems.append("market não prova market_id/currency consistentes")
     if pack.get("artifact_complete") is not True:
         problems.append(
             f"artifact_complete inválido (recebido tipo {type(pack.get('artifact_complete')).__name__}; esperado true)"
@@ -281,11 +290,18 @@ class Classification:
     fingerprint: str | None = None
     run_id: str | None = None
     product_id: str | None = None
+    market_id: str | None = None
 
 
 def classify_pack(pack: dict[str, Any], source_path: str) -> Classification:
     """Classify one parsed pack dict (fail closed for malformed/claims-
     current-but-invalid)."""
+    if _claims_current_schema(pack) and not pack.get("market_id"):
+        return Classification(
+            kind="legacy",
+            source_path=source_path,
+            reason="pack classificado anterior ao scope obrigatório de mercado",
+        )
     if _claims_current_schema(pack):
         problems = _validate_current_shape(pack)
         if problems:
@@ -307,6 +323,7 @@ def classify_pack(pack: dict[str, Any], source_path: str) -> Classification:
             fingerprint=fingerprint,
             run_id=pack["run_id"],
             product_id=pack["product_id"],
+            market_id=pack["market_id"],
         )
     if _looks_like_pack(pack):
         version = _facebook_ads(pack).get("matching_schema_version")

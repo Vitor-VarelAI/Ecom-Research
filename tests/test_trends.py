@@ -310,8 +310,53 @@ class TestTrendsForceRefresh:
         assert call_count == 4  # +2 (timeseries + related)
 
 
+def test_parser_exposes_30d_and_90d_slopes_for_market_signals():
+    values = [50] * 8 + [50, 60, 70, 80]
+    raw = {
+        "interest_over_time": {
+            "timeline_data": [
+                {"date": f"week-{index}", "values": [{"extracted_value": value}]}
+                for index, value in enumerate(values)
+            ]
+        },
+        "interest_by_region": [],
+    }
+
+    result = trends._parse_serpapi_response(raw)
+
+    assert result["slope_pct"] == 20.0
+    assert result["slope_90d_pct"] == 20.0
+    assert result["slope_30d_pct"] == 36.4
+
+
 class TestTrendsRequestContract:
     """Asserts the exact SerpAPI request for the Trends timeseries call."""
+
+    def test_same_query_uses_separate_market_geo_and_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+        monkeypatch.setattr(trends, "CACHE_DIR", str(tmp_path))
+        calls = []
+
+        class MockResp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return SERPAPI_RESPONSE_JSON
+
+        def mock_get(url, params=None, timeout=None, **kwargs):
+            calls.append(params)
+            return MockResp()
+
+        monkeypatch.setattr(trends.requests, "get", mock_get)
+        _isolate_quota(monkeypatch, tmp_path)
+        pt = type("Market", (), {"market_id": "PT", "trends_geo": "PT"})()
+        gb = type("Market", (), {"market_id": "GB", "trends_geo": "GB"})()
+
+        trends.fetch("scented candles", market=pt, timeseries_only=True)
+        trends.fetch("scented candles", market=gb, timeseries_only=True)
+
+        assert [call["geo"] for call in calls] == ["PT", "GB"]
 
     def test_timeseries_request_url_params_and_timeout(self, monkeypatch, tmp_path):
         """Regression: the corrected ``date=today 3-m`` request needs the 60s

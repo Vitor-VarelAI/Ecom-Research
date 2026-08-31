@@ -78,6 +78,40 @@ def _isolate_quota(monkeypatch, tmp_path):
     return quota_file
 
 
+def test_same_query_uses_separate_market_params_and_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_KEY", "fake-key")
+    monkeypatch.setattr(serp_seo, "CACHE_DIR", str(tmp_path))
+    calls = []
+
+    class MockResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return SERPAPI_SEO_JSON
+
+    def mock_get(url, params=None, timeout=None):
+        calls.append(params)
+        return MockResponse()
+
+    monkeypatch.setattr(serp_seo.requests, "get", mock_get)
+    _isolate_quota(monkeypatch, tmp_path)
+    pt = type("Market", (), {
+        "market_id": "PT", "serp_gl": "pt", "serp_hl": "pt", "serp_location": "Portugal",
+    })()
+    gb = type("Market", (), {
+        "market_id": "GB", "serp_gl": "uk", "serp_hl": "en", "serp_location": "United Kingdom",
+    })()
+
+    serp_seo.fetch("scented candles", market=pt)
+    serp_seo.fetch("scented candles", market=gb)
+
+    assert [(call["gl"], call["hl"], call["location"]) for call in calls] == [
+        ("pt", "pt", "Portugal"),
+        ("uk", "en", "United Kingdom"),
+    ]
+
+
 class TestSerpSEOParse:
     """Testa o parsing da resposta JSON da SerpAPI Google SERP."""
 

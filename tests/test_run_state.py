@@ -58,8 +58,8 @@ def test_run_id_uses_explicit_product_descriptors_not_delimited_strings():
         {
             "date": "2026-08-02",
             "mode": "sunday",
-            "products": [{"product_id": "p1", "research_keyword": "a"},
-                          {"product_id": "p2", "research_keyword": "b"}],
+            "products": [{"product_id": "p1", "market_id": "PT", "research_keyword": "a"},
+                          {"product_id": "p2", "market_id": "PT", "research_keyword": "b"}],
             "csv_sha256": None,
             "scoring_version": "1.0.0",
             "matcher_version": "1.0.0",
@@ -67,8 +67,8 @@ def test_run_id_uses_explicit_product_descriptors_not_delimited_strings():
         sort_keys=True, ensure_ascii=False, separators=(",", ":"),
     )
     assert run_state.compute_run_id(**{
-        **base, "products": [{"product_id": "p1", "research_keyword": "a"},
-                              {"product_id": "p2", "research_keyword": "b"}],
+        **base, "products": [{"product_id": "p1", "market_id": "PT", "research_keyword": "a"},
+                              {"product_id": "p2", "market_id": "PT", "research_keyword": "b"}],
     }) == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

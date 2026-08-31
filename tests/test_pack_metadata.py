@@ -23,7 +23,7 @@ def _temp_paths(tmp_path):
     packs_dir.mkdir(exist_ok=True)
     data_dir.mkdir(exist_ok=True)
 
-    def paths(keyword, run_date=None, mode=None, run_id=None, product_id=None):
+    def paths(keyword, run_date=None, mode=None, run_id=None, product_id=None, market_id=None):
         run_date = run_date or date.today()
         slug = pack._slugify(keyword)
         base = f"{run_date.isoformat()}--{slug}"
@@ -48,6 +48,11 @@ def test_json_metadata_and_legacy_aliases_coexist(tmp_path, monkeypatch):
         scoring_config={"weights": {"trend": 0.3}, "thresholds": {"AVANÇAR": 70}},
         matcher_version="1.0.0",
         matching_schema_version=1,
+        market={
+            "market_id": "PT", "name": "Portugal", "currency": "EUR",
+            "ads_country": "PT", "trends_geo": "PT", "serp_gl": "pt",
+            "serp_hl": "pt", "serp_location": "Portugal",
+        },
     )
     json_path = md_path.replace("/packs/", "/data/").replace(".md", ".json")
     raw = json.load(open(json_path, encoding="utf-8"))
@@ -62,6 +67,8 @@ def test_json_metadata_and_legacy_aliases_coexist(tmp_path, monkeypatch):
     assert raw["source_states"] == STATES
     assert raw["source_policies"]["apify_ads"]["retries"] == 0
     assert raw["generated_at"] and raw["completed_at"]
+    assert raw["market_id"] == "PT"
+    assert raw["market"]["currency"] == "EUR"
 
     # Legacy top-level keys are preserved as compatibility aliases.
     assert raw["keyword"] == "mochila"
@@ -78,9 +85,11 @@ def test_json_metadata_and_legacy_aliases_coexist(tmp_path, monkeypatch):
     assert "run run123" in content
     assert "matcher v1.0.0" in content
     assert "Fontes: apify_ads=valid" in content
-    # Recommendation content is untouched by the additive provenance.
     assert "## DECISÃO" in content
-    assert "Mercado:   decisão manual" in content
+    assert "Sinal advisory: OBSERVAR PT" in content
+    assert "Mercado:   PT" in content
+    assert "Prova PT:" in content
+    assert "## Sinais PT" in content
 
 
 def test_generate_without_metadata_omits_provenance(tmp_path, monkeypatch):

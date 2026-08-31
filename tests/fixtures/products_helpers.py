@@ -41,12 +41,34 @@ def product_entries(items: Iterable[str | dict[str, Any]]) -> list[dict[str, Any
 
 
 def write_registry(root: str | Path, items: Iterable[str | dict[str, Any]]) -> ProductRegistry:
-    """Write ``config/products.json`` under ``root`` and load it back fail-closed."""
+    """Write a complete PT-scoped product/market registry under ``root``."""
     config_dir = Path(root) / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     path = config_dir / "products.json"
-    payload = {"schema_version": 1, "products": product_entries(items)}
+    entries = product_entries(items)
+    payload = {"schema_version": 1, "products": entries}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    markets = {
+        "schema_version": 1,
+        "markets": [
+            {
+                "market_id": "PT",
+                "name": "Portugal",
+                "currency": "EUR",
+                "ads_country": "PT",
+                "trends_geo": "PT",
+                "serp_gl": "pt",
+                "serp_hl": "pt",
+                "serp_location": "Portugal",
+                "product_queries": {
+                    entry["product_id"]: entry["research_keyword"] for entry in entries
+                },
+            }
+        ],
+    }
+    (config_dir / "markets.json").write_text(
+        json.dumps(markets, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return load_registry(path)
 
 

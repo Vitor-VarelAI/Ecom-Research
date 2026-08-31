@@ -218,6 +218,38 @@ class TestImport:
 
 
 class TestIdempotencyAndConflict:
+    def test_same_run_and_product_imports_once_per_market(self, tmp_path):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        pt = current_pack(
+            market_id="PT",
+            market={"market_id": "PT", "currency": "EUR"},
+        )
+        gb = current_pack(
+            keyword="scented candles",
+            research_keyword="scented candles",
+            market_id="GB",
+            market={"market_id": "GB", "currency": "GBP"},
+        )
+        pt_path = data_dir / "pt.json"
+        gb_path = data_dir / "gb.json"
+        pt_path.write_text(json.dumps(pt), encoding="utf-8")
+        gb_path.write_text(json.dumps(gb), encoding="utf-8")
+        pt_classification = classify_pack(pt, str(pt_path))
+        gb_classification = classify_pack(gb, str(gb_path))
+
+        store = ProjectionStore(str(tmp_path / "projection.db"))
+        assert store.import_pack(pt_classification) == "imported"
+        assert store.import_pack(gb_classification) == "imported"
+
+        assert _query(
+            store,
+            "SELECT market_id FROM pack ORDER BY market_id",
+        ) == [("GB",), ("PT",)]
+        assert store.count_packs() == 2
+        assert store.count_candidates() == 2
+        store.close()
+
     def test_identical_reimport_is_noop(self, tmp_path):
         store, db_path, classification = _import(tmp_path)
         imported_at = _query(store, "SELECT imported_at FROM pack")[0][0]

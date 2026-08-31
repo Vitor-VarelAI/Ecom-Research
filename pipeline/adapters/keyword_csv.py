@@ -12,6 +12,7 @@ Em caso de erro, devolve {"error": "razão"} — nunca levanta excepção.
 import codecs
 import csv
 import io
+import json
 import logging
 import os
 import unicodedata
@@ -147,7 +148,25 @@ def _looks_like_keyword_planner(rows: list[dict[str, str]]) -> bool:
     return keywords_found >= max(1, len(rows) * 0.8)
 
 
-def parse(filepath: str, keyword: str | None = None) -> dict[str, Any]:
+def _market_metadata(filepath: str, market: Any) -> dict[str, str] | None:
+    metadata_path = f"{filepath}.meta.json"
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as source:
+            metadata = json.load(source)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict) or set(metadata) != {"market_id", "currency"}:
+        return None
+    if metadata.get("market_id") != market.market_id or metadata.get("currency") != market.currency:
+        return None
+    return {"market_id": market.market_id, "currency": market.currency}
+
+
+def parse(
+    filepath: str,
+    keyword: str | None = None,
+    market: Any | None = None,
+) -> dict[str, Any]:
     """
     Faz parse de um CSV exportado do Google Keyword Planner.
 
@@ -174,7 +193,7 @@ def parse(filepath: str, keyword: str | None = None) -> dict[str, Any]:
     Devolve:
     {
         "volume": int | None,             # volume mensal da keyword principal
-        "cpc": float | None,              # CPC médio em EUR
+        "cpc": float | None,              # CPC médio na moeda comprovada pelo sidecar
         "competition": str | None,        # nível textual de competição (ex.: High)
         "matched_keyword": str,           # só em modo keyword-aware: texto exacto no CSV
         "related_keywords": [             # top 5 keywords relacionadas com volume
@@ -190,12 +209,22 @@ def parse(filepath: str, keyword: str | None = None) -> dict[str, Any]:
     """
     if not os.path.exists(filepath):
         return {"error": f"Ficheiro CSV não encontrado: {filepath}"}
+    market_metadata = None
+    if market is not None:
+        market_metadata = _market_metadata(filepath, market)
+        if market_metadata is None:
+            return {
+                "error": (
+                    "CSV Keyword Planner sem metadata de mercado válida; "
+                    f"esperado {filepath}.meta.json para {market.market_id}/{market.currency}"
+                )
+            }
 
     try:
         text = _read_text(filepath)
         parsed = _parse_candidates(text)
-    except OSError as e:
-        return {"error": f"Erro de ficheiro: {e}"}
+    except (OSError, UnicodeError) as e:
+        return {"error": f"Erro de ficheiro/encoding: {type(e).__name__}"}
 
     if parsed is None:
         first = _first_nonempty_line(text)
@@ -227,7 +256,13 @@ def parse(filepath: str, keyword: str | None = None) -> dict[str, Any]:
                     row[canon_key] = 0
             elif canon_key in ("cpc", "cpc_high"):
                 try:
-                    row[canon_key] = float(val.replace(",", ".").replace("€", "").replace("R$", "").strip())
+                    row[canon_key] = float(
+                        val.replace(",", ".")
+                        .replace("€", "")
+                        .replace("£", "")
+                        .replace("R$", "")
+                        .strip()
+                    )
                 except (ValueError, TypeError):
                     row[canon_key] = None
             elif canon_key == "competition_indexed":
@@ -304,4 +339,6 @@ def parse(filepath: str, keyword: str | None = None) -> dict[str, Any]:
     if wanted is not None:
         # Prova de ligação linha-resultado: o texto exacto da linha do CSV.
         result["matched_keyword"] = (main.get("keyword") or "").strip()
+    if market_metadata is not None:
+        result.update(market_metadata)
     return result

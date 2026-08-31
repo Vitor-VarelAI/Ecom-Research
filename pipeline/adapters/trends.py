@@ -54,14 +54,18 @@ def _slugify(keyword: str) -> str:
     return hashlib.md5(keyword.encode()).hexdigest()[:12]
 
 
-def _cache_path(keyword: str) -> str:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{_slugify(keyword)}.json")
+def _cache_keyword(keyword: str, market: Any | None) -> str:
+    return keyword if market is None else f"{market.market_id}:{keyword}"
 
 
-def _related_cache_path(keyword: str) -> str:
+def _cache_path(keyword: str, market: Any | None = None) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{_slugify(keyword)}_related.json")
+    return os.path.join(CACHE_DIR, f"{_slugify(_cache_keyword(keyword, market))}.json")
+
+
+def _related_cache_path(keyword: str, market: Any | None = None) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"{_slugify(_cache_keyword(keyword, market))}_related.json")
 
 
 def _valid_full_payload(data: dict[str, Any]) -> bool:
@@ -82,7 +86,7 @@ def _valid_full_payload(data: dict[str, Any]) -> bool:
     return True
 
 
-def _read_cache(keyword: str) -> dict[str, Any] | None:
+def _read_cache(keyword: str, market: Any | None = None) -> dict[str, Any] | None:
     """Lê cache se existir e for válida (< 30 dias).
 
     Entradas com payload de erro são tratadas como miss e removidas: um erro
@@ -92,7 +96,7 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
     (``direction``/``slope_pct``/``related_queries`` ausentes ou errados) é
     tratado como miss — nunca crash, nunca refresh suprimido.
     """
-    path = _cache_path(keyword)
+    path = _cache_path(keyword, market)
     if not os.path.exists(path):
         return None
     try:
@@ -124,6 +128,12 @@ def _read_cache(keyword: str) -> dict[str, Any] | None:
     if not _valid_full_payload(data):
         logger.warning("Trends cache: payload com forma inválida para keyword=%s; miss", keyword)
         return None
+    if market is not None and (
+        data.get("market_id") != market.market_id
+        or data.get("query_geo") != market.trends_geo
+    ):
+        logger.warning("Trends cache: scope de mercado inválido para keyword=%s; miss", keyword)
+        return None
 
     logger.info("Trends cache: HIT para keyword=%s (idade=%ds)", keyword, int(time.time() - cached_ts))
     return data
@@ -145,7 +155,7 @@ def _cached_at_value(data: dict[str, Any]) -> float | None:
     return timestamp
 
 
-def _write_cache(keyword: str, data: dict[str, Any]) -> None:
+def _write_cache(keyword: str, data: dict[str, Any], market: Any | None = None) -> None:
     """Escreve dados na cache com timestamp.
 
     Payloads com erro nunca são cacheados: uma falha de parse é transitória e
@@ -156,7 +166,7 @@ def _write_cache(keyword: str, data: dict[str, Any]) -> None:
         return
     data_to_write = dict(data)
     data_to_write["_cached_at"] = time.time()
-    path = _cache_path(keyword)
+    path = _cache_path(keyword, market)
     try:
         with open(path, "w") as f:
             json.dump(data_to_write, f, ensure_ascii=False, indent=2)
@@ -165,8 +175,8 @@ def _write_cache(keyword: str, data: dict[str, Any]) -> None:
         logger.warning("Trends cache: erro ao escrever — %s", e)
 
 
-def _read_related_cache(keyword: str) -> dict[str, Any] | None:
-    path = _related_cache_path(keyword)
+def _read_related_cache(keyword: str, market: Any | None = None) -> dict[str, Any] | None:
+    path = _related_cache_path(keyword, market)
     if not os.path.exists(path):
         return None
     try:
@@ -196,14 +206,20 @@ def _read_related_cache(keyword: str) -> dict[str, Any] | None:
     if not isinstance(data.get("related_queries"), list):
         logger.warning("Trends related cache: payload sem lista de related queries para keyword=%s; miss", keyword)
         return None
+    if market is not None and (
+        data.get("market_id") != market.market_id
+        or data.get("query_geo") != market.trends_geo
+    ):
+        logger.warning("Trends related cache: scope de mercado inválido para keyword=%s; miss", keyword)
+        return None
     return {key: value for key, value in data.items() if key != "_cached_at"}
 
 
-def _write_related_cache(keyword: str, data: dict[str, Any]) -> None:
+def _write_related_cache(keyword: str, data: dict[str, Any], market: Any | None = None) -> None:
     data_to_write = dict(data)
     data_to_write["_cached_at"] = time.time()
     try:
-        with open(_related_cache_path(keyword), "w") as f:
+        with open(_related_cache_path(keyword, market), "w") as f:
             json.dump(data_to_write, f, ensure_ascii=False, indent=2)
     except OSError as exc:
         logger.warning("Trends related cache: erro ao escrever — %s", exc)
@@ -291,6 +307,16 @@ def _timeline_value(point: Any) -> float | None:
     return _finite_number(item.get("extracted_value", 0))
 
 
+def _slope_percent(values: list[float]) -> float:
+    mid = len(values) // 2
+    first_avg = sum(values[:mid]) / mid if mid > 0 else values[0]
+    second_count = len(values) - mid
+    second_avg = sum(values[mid:]) / second_count if second_count > 0 else values[-1]
+    if first_avg > 0:
+        return ((second_avg - first_avg) / first_avg) * 100
+    return 0.0 if second_avg == 0 else 100.0
+
+
 def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
     """
     Extrai informação relevante da resposta raw da SerpAPI Google Trends.
@@ -340,15 +366,11 @@ def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
             "error": "Trends: não foi possível extrair valores do timeline",
         }
 
-    # Slope: compara média da primeira metade com média da segunda metade
-    mid = len(values) // 2
-    first_half_avg = sum(values[:mid]) / mid if mid > 0 else values[0]
-    second_half_avg = sum(values[mid:]) / (len(values) - mid) if (len(values) - mid) > 0 else values[-1]
-
-    if first_half_avg > 0:
-        slope_pct = ((second_half_avg - first_half_avg) / first_half_avg) * 100
-    else:
-        slope_pct = 0.0 if second_half_avg == 0 else 100.0
+    # 90d preserves the existing full-series score input.  The final third
+    # approximates the last 30 days of the requested 3-month series.
+    slope_pct = _slope_percent(values)
+    window_30d = values[-max(2, round(len(values) / 3)):]
+    slope_30d_pct = _slope_percent(window_30d)
 
     # Direção
     if slope_pct > 5:
@@ -390,13 +412,20 @@ def _parse_serpapi_response(data: dict[str, Any]) -> dict[str, Any]:
     return {
         "direction": direction,
         "slope_pct": round(slope_pct, 1),
+        "slope_30d_pct": round(slope_30d_pct, 1),
+        "slope_90d_pct": round(slope_pct, 1),
         "seasonal": seasonal,
         "peak": peak_label,
         "top_geos": top_geos,
     }
 
 
-def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = False) -> dict[str, Any]:
+def fetch(
+    keyword: str,
+    timeseries_only: bool = False,
+    force_refresh: bool = False,
+    market: Any | None = None,
+) -> dict[str, Any]:
     """
     Dado uma keyword, consulta Google Trends via SerpAPI (com cache 30 dias) e devolve:
     {
@@ -420,7 +449,7 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
     """
     # 1. Tentar cache (a menos que force_refresh)
     if not force_refresh:
-        cached = _read_cache(keyword)
+        cached = _read_cache(keyword, market)
         if cached is not None:
             # Remove metadados internos antes de devolver
             result = {k: v for k, v in cached.items() if k != "_cached_at"}
@@ -443,6 +472,8 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
             "date": "today 3-m",  # últimos 90 dias (forma documentada da SerpAPI)
             "api_key": api_key,
         }
+        if market is not None:
+            params_ts["geo"] = market.trends_geo
 
         try:
             resp_ts = requests.get(SERPAPI_URL, params=params_ts, timeout=REQUEST_TIMEOUT)
@@ -488,6 +519,8 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
                 "data_type": "RELATED_QUERIES",
                 "api_key": api_key,
             }
+            if market is not None:
+                params_rq["geo"] = market.trends_geo
 
             try:
                 resp_rq = requests.get(SERPAPI_URL, params=params_rq, timeout=REQUEST_TIMEOUT)
@@ -527,11 +560,18 @@ def fetch(keyword: str, timeseries_only: bool = False, force_refresh: bool = Fal
         # Parse e cache (sempre reescrever, mesmo em force_refresh)
         result = _parse_serpapi_response(raw_ts)
         result["related_queries"] = related_queries
-        _write_cache(keyword, result)
+        if market is not None:
+            result["market_id"] = market.market_id
+            result["query_geo"] = market.trends_geo
+        _write_cache(keyword, result, market)
         return result
 
 
-def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
+def fetch_related(
+    keyword: str,
+    force_refresh: bool = False,
+    market: Any | None = None,
+) -> dict[str, Any]:
     """Fetch only related queries, with the same 30-day disk cache.
 
     This is used after a successful zero-ad result: it costs one SerpAPI
@@ -539,7 +579,7 @@ def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
     timeseries or SEO calls.
     """
     if not force_refresh:
-        cached = _read_related_cache(keyword)
+        cached = _read_related_cache(keyword, market)
         if cached is not None:
             return cached
 
@@ -557,6 +597,8 @@ def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
             "data_type": "RELATED_QUERIES",
             "api_key": api_key,
         }
+        if market is not None:
+            params["geo"] = market.trends_geo
         try:
             response = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as exc:
@@ -579,5 +621,8 @@ def fetch_related(keyword: str, force_refresh: bool = False) -> dict[str, Any]:
             return {"error": f"SerpAPI RELATED_QUERIES: {message or 'erro reportado pelo fornecedor'}"}
 
         result = {"related_queries": _parse_related_queries(raw)}
-        _write_related_cache(keyword, result)
+        if market is not None:
+            result["market_id"] = market.market_id
+            result["query_geo"] = market.trends_geo
+        _write_related_cache(keyword, result, market)
         return result

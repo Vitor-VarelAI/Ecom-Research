@@ -282,6 +282,26 @@ def test_request_json_uses_object_url_shape(monkeypatch):
     assert "error" not in result
 
 
+def test_market_fetch_scopes_ads_to_the_requested_country(monkeypatch):
+    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
+    captured = {}
+
+    def post(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return Response(201, [ad("1", copy="Scented candles for your home")])
+
+    monkeypatch.setattr(apify_ads.requests, "post", post)
+    market = type("Market", (), {"ads_country": "GB"})()
+
+    result = apify_ads.fetch("scented candles", market=market)
+
+    request_url = captured["json"]["urls"][0]["url"]
+    assert "country=GB" in request_url
+    assert "is_targeted_country=true" in request_url
+    assert result["evidence_scope"] == "market"
+    assert result["query_country"] == "GB"
+
+
 def test_filters_relevance_inactive_and_deduplicates(monkeypatch):
     rows = [
         ad("1", copy="Mochila personalizada com nome"),

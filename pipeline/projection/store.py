@@ -7,10 +7,11 @@ back together, foreign keys are enabled and the schema version is pinned
 via ``PRAGMA user_version``.  A schema mismatch (a foreign or stale DB)
 fails closed with an instruction to delete/rebuild the disposable file.
 
-Identity is ``(run_id, product_id)``.  Reimporting identical content is a
-no-op; the same identity with different content raises ``PackConflictError``
-and leaves existing rows untouched.  Candidate rows are keyed by
-``(run_id, product_id, position)`` because ``ad_archive_id`` may be absent.
+Identity is ``(run_id, product_id, market_id)``. Reimporting identical
+content is a no-op; the same identity with different content raises
+``PackConflictError`` and leaves existing rows untouched. Candidate rows are
+keyed by ``(run_id, product_id, market_id, position)`` because
+``ad_archive_id`` may be absent.
 
 Projection copies already-sanitized persisted values verbatim: no URL
 sanitizer is called and no score or match decision is derived.  JSON-valued
@@ -27,12 +28,15 @@ from typing import Any
 from pipeline.projection.validation import Classification, _valid_finite_sqlite_number, canonical_json
 from pipeline.run_state import utc_now_iso
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pack (
     run_id TEXT NOT NULL,
     product_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    market_json TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     source_path TEXT NOT NULL,
     keyword TEXT,
@@ -56,12 +60,13 @@ CREATE TABLE IF NOT EXISTS pack (
     scoring_config_json TEXT,
     pack_json TEXT NOT NULL,
     imported_at TEXT NOT NULL,
-    PRIMARY KEY (run_id, product_id)
+    PRIMARY KEY (run_id, product_id, market_id)
 );
 
 CREATE TABLE IF NOT EXISTS candidate (
     run_id TEXT NOT NULL,
     product_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
     position INTEGER NOT NULL,
     ad_archive_id TEXT,
     advertiser TEXT,
@@ -80,13 +85,14 @@ CREATE TABLE IF NOT EXISTS candidate (
     match_head_token TEXT,
     match_json TEXT,
     candidate_json TEXT NOT NULL,
-    PRIMARY KEY (run_id, product_id, position),
-    FOREIGN KEY (run_id, product_id) REFERENCES pack(run_id, product_id) ON DELETE CASCADE
+    PRIMARY KEY (run_id, product_id, market_id, position),
+    FOREIGN KEY (run_id, product_id, market_id) REFERENCES pack(run_id, product_id, market_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_candidate_match_label ON candidate(match_label);
 CREATE INDEX IF NOT EXISTS idx_candidate_advertiser ON candidate(advertiser);
 CREATE INDEX IF NOT EXISTS idx_pack_date ON pack(pack_date);
+CREATE INDEX IF NOT EXISTS idx_pack_product_market ON pack(product_id, market_id);
 """
 
 
@@ -99,14 +105,18 @@ class SchemaMismatchError(ProjectionError):
 
 
 class PackConflictError(ProjectionError):
-    """Same (run_id, product_id) already imported with different content."""
+    """Same (run_id, product_id, market_id) imported with different content."""
 
 
 # Expected structural contract for ``validate_projection_schema`` (mirrors
 # ``_SCHEMA`` above — the projection's one source of truth).
-_PACK_PRIMARY_KEY = ("run_id", "product_id")
-_CANDIDATE_PRIMARY_KEY = ("run_id", "product_id", "position")
-_CANDIDATE_FOREIGN_KEY = (("run_id", "run_id"), ("product_id", "product_id"))
+_PACK_PRIMARY_KEY = ("run_id", "product_id", "market_id")
+_CANDIDATE_PRIMARY_KEY = ("run_id", "product_id", "market_id", "position")
+_CANDIDATE_FOREIGN_KEY = (
+    ("run_id", "run_id"),
+    ("product_id", "product_id"),
+    ("market_id", "market_id"),
+)
 _CANDIDATE_FOREIGN_KEY_ACTION = "CASCADE"
 
 
@@ -277,10 +287,10 @@ class ProjectionStore:
 
     # ── queries ──────────────────────────────────────────────────────────
 
-    def fingerprint_for(self, run_id: str, product_id: str) -> str | None:
+    def fingerprint_for(self, run_id: str, product_id: str, market_id: str = "PT") -> str | None:
         row = self._conn.execute(
-            "SELECT fingerprint FROM pack WHERE run_id=? AND product_id=?",
-            (run_id, product_id),
+            "SELECT fingerprint FROM pack WHERE run_id=? AND product_id=? AND market_id=?",
+            (run_id, product_id, market_id),
         ).fetchone()
         return row[0] if row else None
 
@@ -304,12 +314,13 @@ class ProjectionStore:
         assert classification.pack is not None and classification.fingerprint is not None
         run_id = classification.run_id
         product_id = classification.product_id
-        existing = self.fingerprint_for(run_id, product_id)
+        market_id = classification.market_id or classification.pack["market_id"]
+        existing = self.fingerprint_for(run_id, product_id, market_id)
         if existing is not None:
             if existing == classification.fingerprint:
                 return "unchanged"
             raise PackConflictError(
-                f"conflito: {classification.source_path}: (run_id={run_id}, product_id={product_id}) já importado "
+                f"conflito: {classification.source_path}: (run_id={run_id}, product_id={product_id}, market_id={market_id}) já importado "
                 f"com conteúdo diferente (fingerprint {existing[:12]}... ≠ {classification.fingerprint[:12]}...). "
                 "Nenhuma linha foi alterada; apaga a base descartável se quiseres reimportar o conteúdo novo."
             )
@@ -322,12 +333,12 @@ class ProjectionStore:
         conn.execute("BEGIN")
         try:
             conn.execute(
-                "INSERT INTO pack (run_id, product_id, fingerprint, source_path, keyword, product_name, "
-                "research_keyword, mode, pack_date, score_label, score_value, scoring_version, matcher_version, "
-                "matching_schema_version, generated_at, completed_at, candidate_count, matched_count, "
-                "needs_review_count, rejected_count, total_ads, source_states_json, scoring_config_json, "
-                "pack_json, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?, ?)",
+                "INSERT INTO pack (run_id, product_id, market_id, currency, market_json, fingerprint, source_path, "
+                "keyword, product_name, research_keyword, mode, pack_date, score_label, score_value, "
+                "scoring_version, matcher_version, matching_schema_version, generated_at, completed_at, "
+                "candidate_count, matched_count, needs_review_count, rejected_count, total_ads, source_states_json, "
+                "scoring_config_json, pack_json, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 tuple(pack_row[column] for column in _PACK_COLUMNS),
             )
             for row in candidate_rows:
@@ -342,6 +353,9 @@ class ProjectionStore:
 _PACK_COLUMN_CONTRACT = (
     ("run_id", "TEXT", True),
     ("product_id", "TEXT", True),
+    ("market_id", "TEXT", True),
+    ("currency", "TEXT", True),
+    ("market_json", "TEXT", True),
     ("fingerprint", "TEXT", True),
     ("source_path", "TEXT", True),
     ("keyword", "TEXT", False),
@@ -385,6 +399,9 @@ def _project_pack_row(pack: dict[str, Any], fingerprint: str, source_path: str) 
     return {
         "run_id": pack["run_id"],
         "product_id": pack["product_id"],
+        "market_id": pack["market_id"],
+        "currency": pack["market"]["currency"],
+        "market_json": canonical_json(pack["market"]),
         "fingerprint": fingerprint,
         "source_path": source_path,
         "keyword": pack.get("keyword"),
@@ -414,6 +431,7 @@ def _project_pack_row(pack: dict[str, Any], fingerprint: str, source_path: str) 
 _CANDIDATE_COLUMN_CONTRACT = (
     ("run_id", "TEXT", True),
     ("product_id", "TEXT", True),
+    ("market_id", "TEXT", True),
     ("position", "INTEGER", True),
     ("ad_archive_id", "TEXT", False),
     ("advertiser", "TEXT", False),
@@ -443,6 +461,7 @@ def _project_candidate_row(pack: dict[str, Any], candidate: dict[str, Any], posi
     return {
         "run_id": pack["run_id"],
         "product_id": pack["product_id"],
+        "market_id": pack["market_id"],
         "position": position,
         "ad_archive_id": candidate.get("ad_archive_id"),
         "advertiser": candidate.get("advertiser"),
@@ -466,10 +485,10 @@ def _project_candidate_row(pack: dict[str, Any], candidate: dict[str, Any], posi
 
 def _insert_candidate_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     conn.execute(
-        "INSERT INTO candidate (run_id, product_id, position, ad_archive_id, advertiser, page_id, days_active, "
-        "reported_active_time, link, landing_url, copy, publisher_platforms_json, countries_json, "
+        "INSERT INTO candidate (run_id, product_id, market_id, position, ad_archive_id, advertiser, page_id, "
+        "days_active, reported_active_time, link, landing_url, copy, publisher_platforms_json, countries_json, "
         "match_evidence_json, match_label, match_confidence, match_reasons_json, match_head_token, match_json, "
-        "candidate_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "candidate_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         tuple(row[column] for column in _CANDIDATE_COLUMNS),
     )
 

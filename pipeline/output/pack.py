@@ -119,6 +119,7 @@ def _pack_paths(
     mode: str | None = None,
     run_id: str | None = None,
     product_id: str | None = None,
+    market_id: str | None = None,
 ) -> tuple[str, str]:
     """Resolve the deterministic paths for a pack.
 
@@ -149,9 +150,11 @@ def _pack_paths(
         mode_part = mode or "manual"
         id_part = product_id or _keyword_hash(keyword)
         rid = run_id[:12]
-        base = f"{date_str}--{mode_part}--{id_part}--{slug}--{rid}"
+        market_part = f"--{market_id.lower()}" if market_id else ""
+        base = f"{date_str}--{mode_part}--{id_part}{market_part}--{slug}--{rid}"
     else:
-        base = f"{date_str}--{slug}"
+        market_part = f"--{market_id.lower()}" if market_id else ""
+        base = f"{date_str}{market_part}--{slug}"
         if mode in SCHEDULED_MODES:
             base = f"{base}--{mode}"
     return (
@@ -197,8 +200,13 @@ def _format_volume_section(csv_data: dict[str, Any]) -> str:
         return f"- sem dados: {csv_data['error']}"
     volume = csv_data.get("volume")
     cpc = csv_data.get("cpc")
+    currency = csv_data.get("currency") or "EUR"
     volume_text = f"{volume:,}".replace(",", ".") if volume is not None else "?"
-    cpc_text = f"€{cpc:.2f}".replace(".", ",") if cpc is not None else "?"
+    if cpc is None:
+        cpc_text = "?"
+    else:
+        amount = f"{cpc:.2f}".replace(".", ",")
+        cpc_text = f"€{amount}" if currency == "EUR" else f"£{amount}" if currency == "GBP" else f"{currency} {amount}"
     lines = [f"- Volume mensal: {volume_text} | CPC médio: {cpc_text}"]
     related = csv_data.get("related_keywords", [])
     if related:
@@ -215,9 +223,13 @@ def _format_volume_section(csv_data: dict[str, Any]) -> str:
 def _format_ads_section(ads_data: dict[str, Any]) -> str:
     if "error" in ads_data:
         return f"- sem dados: {ads_data['error']}"
+    if ads_data.get("evidence_scope") == "market":
+        evidence_label = f"Evidência local ({ads_data.get('query_country', '?')})"
+    else:
+        evidence_label = "Evidência global"
     lines = [
         f"- Fonte: {ads_data.get('source', 'Facebook Ad Library via Apify')}",
-        f"- Evidência global de ads ativos para o nicho: {ads_data.get('total_ads', 0)} (matched)",
+        f"- {evidence_label} de ads ativos para o nicho: {ads_data.get('total_ads', 0)} (matched)",
     ]
     top_ads = ads_data.get("top_ads", [])
     if top_ads:
@@ -393,17 +405,19 @@ def _format_decision(
     ads_data: dict[str, Any],
     landing_price_data: dict[str, Any] | None,
     run_date: date,
+    market_id: str | None = None,
 ) -> str:
     label = score_result.get("label", "DADOS INSUFICIENTES")
+    display_label = f"{label} {market_id}" if market_id else label
 
     seasonal = ""
     deadline = _launch_deadline(trends_data, run_date)
     if deadline:
         seasonal = f" — {deadline}"
     lines = [
-        f"{keyword} — DECISÃO",
-        f"Sinal advisory: {label}{seasonal}",
-        "Mercado:   decisão manual",
+        f"{keyword}{f' · {market_id}' if market_id else ''} — DECISÃO",
+        f"Sinal advisory: {display_label}{seasonal}",
+        f"Mercado:   {market_id}" if market_id else "Mercado:   decisão manual",
         "Validação: revisão manual obrigatória antes de qualquer ação (produto, mercado, margem, campanha)",
     ]
 
@@ -432,13 +446,14 @@ def _format_decision(
     advertisers = ads_data.get("advertisers", []) if "error" not in ads_data else []
     if advertisers:
         top = advertisers[0]
+        proof_scope = market_id or "global"
         lines.append(
-            f"Prova global: {top.get('page_name', '?')}: "
-            f"{top.get('active_ads', 0)} variantes ativas na coorte global, "
+            f"Prova {proof_scope}: {top.get('page_name', '?')}: "
+            f"{top.get('active_ads', 0)} variantes ativas na coorte {proof_scope}, "
             f"anúncio mais antigo com {top.get('oldest_ad_days', 0)} dias"
         )
     else:
-        lines.append("Prova global: sem escala detetada")
+        lines.append(f"Prova {market_id or 'global'}: sem escala detetada")
 
     if label == "DADOS INSUFICIENTES" or "error" in ads_data:
         risk = score_result.get("reason") or "repetir quando o Apify estiver disponível"
@@ -533,6 +548,8 @@ def generate(
     product_id: str | None = None,
     product_name: str | None = None,
     research_keyword: str | None = None,
+    market: dict[str, str] | None = None,
+    market_signals: list[str] | None = None,
     source_states: dict[str, Any] | None = None,
     source_policies: dict[str, Any] | None = None,
     scoring_version: str | None = None,
@@ -546,14 +563,33 @@ def generate(
         run_date = date.today()
     seo_data = seo_data or {"error": "SEO não executado — modo reduzido"}
     suggested_keywords = suggested_keywords or []
-    if mode is None:
-        md_path, json_path = _pack_paths(keyword, run_date)
+    if market is None:
+        if mode is None:
+            md_path, json_path = _pack_paths(keyword, run_date)
+        else:
+            md_path, json_path = _pack_paths(keyword, run_date, mode, run_id, product_id=product_id)
     else:
-        md_path, json_path = _pack_paths(keyword, run_date, mode, run_id, product_id=product_id)
+        md_path, json_path = _pack_paths(
+            keyword,
+            run_date,
+            mode,
+            run_id,
+            product_id=product_id,
+            market_id=market["market_id"],
+        )
     rows = _build_market_rows(trends_data, ads_data)
     breakdown = score_result.get("breakdown", {})
     now = generated_at or utc_now_iso()
     done_at = completed_at or now
+
+    market_id = market.get("market_id") if market else None
+    title_market = f" — {market_id}" if market_id else ""
+    seo_market = market_id or "PT"
+    if market_id:
+        signal_text = ", ".join(market_signals or []) or "nenhum sinal adicional confirmado"
+        market_section = f"## Sinais {market_id}\n{signal_text}"
+    else:
+        market_section = "## Sinais por mercado — decisão manual\n" + _format_market_signals(rows)
 
     provenance = _format_provenance_section(
         mode=mode,
@@ -565,10 +601,18 @@ def generate(
         source_states=source_states,
     )
 
-    md_content = f"""# RESEARCH PACK — {keyword} — {run_date.isoformat()}
+    md_content = f"""# RESEARCH PACK — {keyword}{title_market} — {run_date.isoformat()}
 
 ## DECISÃO
-{_format_decision(keyword, score_result, trends_data, ads_data, landing_price_data, run_date)}
+{_format_decision(
+    keyword,
+    score_result,
+    trends_data,
+    ads_data,
+    landing_price_data,
+    run_date,
+    market_id=market_id,
+)}
 
 ## Trend Signal (Google Trends via SerpAPI)
 {_format_trends_section(trends_data, run_date)}
@@ -585,10 +629,9 @@ def generate(
 ## Persistência de mercado — pulse quarta (advisory)
 {_format_cohort_section(ad_cohort)}
 
-## Sinais por mercado — decisão manual
-{_format_market_signals(rows)}
+{market_section}
 
-## SEO snapshot (SerpAPI engine google, PT)
+## SEO snapshot (SerpAPI engine google, {seo_market})
 {_format_seo_section(seo_data)}
 
 ## Feedback (Fase 2 — Reddit/YouTube)
@@ -625,6 +668,11 @@ Fórmula determinística. Sem LLM no score.
         raw_pack["product_name"] = product_name
     if research_keyword is not None:
         raw_pack["research_keyword"] = research_keyword
+    if market is not None:
+        raw_pack["market_id"] = market["market_id"]
+        raw_pack["market"] = market
+    if market_signals is not None:
+        raw_pack["market_signals"] = market_signals
     if ad_cohort is not None:
         raw_pack["ad_cohort"] = ad_cohort
     # Additive run/provenance metadata; legacy top-level keys stay as aliases.
@@ -661,6 +709,7 @@ def generate_digest_line(
     landing_price_data: dict[str, Any] | None = None,
     trends_data: dict[str, Any] | None = None,
     run_date: date | None = None,
+    market_id: str | None = None,
 ) -> str:
     if run_date is None:
         run_date = date.today()
@@ -674,8 +723,11 @@ def generate_digest_line(
     deadline = _launch_deadline(trends_data, run_date)
     if deadline:
         seasonal = f" ({deadline})"
+    market_text = market_id or "decisão manual"
+    proof_scope = market_id or "global"
     return (
         f"{keyword} — Score: {score_value}/100 ({label})\n"
         f"Sinal advisory: {label}{seasonal} | "
-        f"Mercado: decisão manual | Prova global: {proof} (coorte global) | Ação: validação manual"
+        f"Mercado: {market_text} | Prova {proof_scope}: {proof} "
+        f"(coorte {proof_scope}) | Ação: validação manual"
     )

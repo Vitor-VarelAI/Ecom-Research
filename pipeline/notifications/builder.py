@@ -81,7 +81,7 @@ def notification_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     # rebuild the exact batch identity from a persisted compact result
     # without any source call.  Absent in historical results, so legacy
     # snapshots are byte-unchanged.
-    for key in ("product_id", "product_name", "research_keyword"):
+    for key in ("product_id", "market_id", "product_name", "research_keyword"):
         value = result.get(key)
         if isinstance(value, str) and value:
             snapshot[key] = value
@@ -103,6 +103,9 @@ def notification_snapshot(result: dict[str, Any]) -> dict[str, Any]:
                 safe_ads[key] = value
         if safe_ads:
             snapshot["ads_data"] = safe_ads
+    signals = result.get("market_signals")
+    if isinstance(signals, list) and all(isinstance(signal, str) for signal in signals):
+        snapshot["market_signals"] = signals
     trends = result.get("trends_data")
     if isinstance(trends, dict) and "error" not in trends:
         safe_trends = {
@@ -126,6 +129,11 @@ def _normalize_result(result: dict[str, Any]) -> dict[str, Any]:
         normalized["ads_data"] = snapshot.get("ads_data")
     if not isinstance(normalized.get("trends_data"), dict):
         normalized["trends_data"] = snapshot.get("trends_data")
+    for key in ("product_id", "market_id", "product_name", "research_keyword"):
+        if not normalized.get(key) and snapshot.get(key):
+            normalized[key] = snapshot[key]
+    if not isinstance(normalized.get("market_signals"), list):
+        normalized["market_signals"] = snapshot.get("market_signals")
     return normalized
 
 
@@ -140,25 +148,41 @@ def _proof_text(ads_data: Any) -> str:
     return f"{first.get('page_name', '?')} ({first.get('active_ads', 0)} variantes)"
 
 
+def _display_keyword(result: dict[str, Any]) -> str:
+    keyword = result.get("keyword") or "?"
+    market_id = result.get("market_id")
+    return f"{keyword} · {market_id}" if market_id else keyword
+
+
+def _market_label(result: dict[str, Any], label: str) -> str:
+    market_id = result.get("market_id")
+    return f"{label} {market_id}" if market_id else label
+
+
 def _full_item_audit(result: dict[str, Any], run_date: date, *, with_suggestions: bool) -> str:
     """Exact per-result digest contribution of the legacy full modes.
 
     ``with_suggestions`` mirrors the legacy behaviour: the sunday/all/monthly
     digests append the suggestions line, the keyword digest is the bare
     ``generate_digest_line`` output."""
+    display_keyword = _display_keyword(result)
     if result.get("error") and result.get("preserved"):
-        return f"{result.get('keyword', '?')} — fonte falhou; pack anterior preservado ({result.get('error', '')})"
-    keyword = result.get("keyword", "?")
-    score_result = result.get("score_result") or {"score": 0, "label": "DADOS INSUFICIENTES"}
+        return f"{display_keyword} — fonte falhou; pack anterior preservado ({result.get('error', '')})"
+    score_result = dict(result.get("score_result") or {"score": 0, "label": "DADOS INSUFICIENTES"})
+    score_result["label"] = _market_label(result, score_result.get("label", "DADOS INSUFICIENTES"))
     lines = [
         pack.generate_digest_line(
-            keyword,
+            display_keyword,
             score_result,
             result.get("ads_data") or {},
             trends_data=result.get("trends_data") or {},
             run_date=run_date,
+            market_id=result.get("market_id"),
         )
     ]
+    market_signals = result.get("market_signals") or []
+    if market_signals:
+        lines.append("Sinais de mercado: " + ", ".join(str(signal) for signal in market_signals))
     if with_suggestions:
         suggestions = (result.get("suggested_keywords") or [])[:3]
         if suggestions:
@@ -168,13 +192,13 @@ def _full_item_audit(result: dict[str, Any], run_date: date, *, with_suggestions
 
 def _wednesday_item_audit(result: dict[str, Any]) -> str:
     """Exact per-result digest contribution of the legacy pulse digest."""
+    display_keyword = _display_keyword(result)
     if result.get("preserved"):
         error = result.get("error", "")
         if error:
-            return f"{result.get('keyword', '?')} — pack anterior preservado ({error})"
-        return f"{result.get('keyword', '?')} — Apify falhou; pack anterior preservado"
-    keyword = result.get("keyword", "?")
-    line = f"{keyword}: {', '.join(result.get('changes', []))}"
+            return f"{display_keyword} — pack anterior preservado ({error})"
+        return f"{display_keyword} — Apify falhou; pack anterior preservado"
+    line = f"{display_keyword}: {', '.join(result.get('changes', []))}"
     cohort = result.get("ad_cohort")
     if cohort:
         retention = cohort.get("ad_retention_pct")
@@ -227,7 +251,10 @@ def _score_header(result: dict[str, Any]) -> tuple[NotificationField, ...]:
     if score_result.get("score") is not None:
         header.append(NotificationField(value=f"{score_result['score']}/100", label="Score"))
     if score_result.get("label"):
-        header.append(NotificationField(value=score_result["label"], label="Sinal advisory"))
+        header.append(NotificationField(
+            value=_market_label(result, score_result["label"]),
+            label="Sinal advisory",
+        ))
     return tuple(header)
 
 
@@ -248,23 +275,27 @@ def _product_identity(result: dict[str, Any]) -> str:
     fallback that never rewrites anything.
     """
     keyword = result.get("keyword") or "?"
-    return result.get("product_id") or stable_product_id(keyword)
+    product_id = result.get("product_id") or stable_product_id(keyword)
+    market_id = result.get("market_id")
+    return f"{product_id}:{market_id}" if market_id else product_id
 
 
 def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestions: bool) -> NotificationItem:
-    keyword = result.get("keyword") or "?"
+    market_id = result.get("market_id")
     sections: list[NotificationSection] = []
     if result.get("preserved"):
         sections.append(_preserved_section(result))
     else:
         ads = result.get("ads_data") or {}
-        evidence = [NotificationField(value=_proof_text(ads), label="Prova global")]
+        proof_label = f"Prova {market_id}" if market_id else "Prova global"
+        evidence = [NotificationField(value=_proof_text(ads), label=proof_label)]
         if isinstance(ads, dict) and "error" not in ads:
             if ads.get("total_ads") is not None:
                 evidence.append(NotificationField(value=str(ads["total_ads"]), label="Ads ativos"))
             if ads.get("saturation") is not None:
                 evidence.append(NotificationField(value=str(ads["saturation"]), label="Saturação"))
-        sections.append(NotificationSection(heading="Evidência global", fields=tuple(evidence)))
+        evidence_heading = f"Evidência {market_id}" if market_id else "Evidência global"
+        sections.append(NotificationSection(heading=evidence_heading, fields=tuple(evidence)))
         trends = result.get("trends_data") or {}
         trend_fields: list[NotificationField] = []
         if isinstance(trends, dict) and "error" not in trends:
@@ -280,6 +311,13 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
                 trend_fields.append(NotificationField(value=value, label="Sazonalidade"))
         if trend_fields:
             sections.append(NotificationSection(heading="Tendência", fields=tuple(trend_fields)))
+    signals = [signal for signal in (result.get("market_signals") or []) if isinstance(signal, str)]
+    if signals:
+        heading = f"Sinais {market_id}" if market_id else "Sinais de mercado"
+        sections.append(NotificationSection(
+            heading=heading,
+            fields=(NotificationField(value=", ".join(signals), label="Estado"),),
+        ))
     suggestions = [s for s in (result.get("suggested_keywords") or []) if isinstance(s, dict)][:3]
     suggestions_text = ", ".join(str(s.get("keyword", "")) for s in suggestions) or MISSING
     sections.append(NotificationSection(
@@ -290,7 +328,7 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
     sections.append(_legal_section())
     return NotificationItem(
         kind=KIND_PRODUCT,
-        title=keyword,
+        title=_display_keyword(result),
         product=_product_identity(result),
         header_fields=_score_header(result),
         sections=tuple(sections),
@@ -300,7 +338,6 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
 
 
 def _wednesday_product_item(result: dict[str, Any], run_date: date) -> NotificationItem:
-    keyword = result.get("keyword") or "?"
     sections: list[NotificationSection] = []
     if result.get("preserved"):
         sections.append(_preserved_section(result))
@@ -332,7 +369,7 @@ def _wednesday_product_item(result: dict[str, Any], run_date: date) -> Notificat
     sections.append(_legal_section())
     return NotificationItem(
         kind=KIND_PRODUCT,
-        title=keyword,
+        title=_display_keyword(result),
         product=_product_identity(result),
         header_fields=_score_header(result),
         sections=tuple(sections),

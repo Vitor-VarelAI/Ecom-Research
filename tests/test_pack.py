@@ -502,3 +502,15 @@ class TestLandingPricePresentation:
             "price_range": {"min": 29.99, "max": 59.99, "currency": "EUR", "sources": 2},
         })
         assert "Preço:     €29.99–€59.99" in content
+
+
+def test_volume_section_renders_gbp_cpc_without_euro_label():
+    content = pack._format_volume_section({
+        "volume": 5400,
+        "cpc": 1.2,
+        "currency": "GBP",
+        "related_keywords": [],
+    })
+
+    assert "CPC médio: £1,20" in content
+    assert "€" not in content

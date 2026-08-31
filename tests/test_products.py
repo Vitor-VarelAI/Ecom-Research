@@ -372,7 +372,13 @@ def test_committed_products_json_has_exact_bootstrap_content():
         "camisola de portugal",
         "camisola portugal preta",
     ]
-    assert all(p["aliases"] == [] for p in data["products"] if p["product_id"] != camisola["product_id"])
+    candles = data["products"][4]
+    assert candles["aliases"] == ["velas", "velas perfumadas"]
+    assert all(
+        p["aliases"] == []
+        for p in data["products"]
+        if p["product_id"] not in {camisola["product_id"], candles["product_id"]}
+    )
 
 
 def test_load_does_not_change_keywords_txt_bytes():

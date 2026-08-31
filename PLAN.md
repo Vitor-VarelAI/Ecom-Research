@@ -2,32 +2,32 @@
 
 ## Objetivo
 
-Manter um pipeline CLI reproduzível em que anúncios ativos globais fornecem evidência de procura. O utilizador decide produto, mercado, margem e campanha; score, sugestões e recomendações são advisory.
+Manter um pipeline CLI reproduzível em que cada execução combina produto, mercado e keyword local. Ads, Trends, SERP e Keyword Planner têm de provar o mesmo mercado antes de existir uma recomendação; score, sinais e recomendações continuam advisory.
 
 ## Fluxo Full
 
-1. Fazer uma chamada ao actor Apify `curious_coder~facebook-ads-library-scraper`, com uma URL global da Facebook Ad Library por keyword e `count=100`.
-2. Normalizar localmente, retirar anúncios inativos e gate-1-irrelevantes (accent-folding, token product-head da keyword — primeiro token não stopword/não geográfico, equivalência exacta ou plural de um só `s` — em qualquer parte do copy/texto do anunciante) e deduplicar por ID, URL ou página+copy+data. Cada anúncio ativo, gate-1-relevante e deduplicado torna-se um candidato canónico (máx. 100).
-3. Classificar cada candidato com `pipeline/matching/product_ads.py` (`matched`/`needs_review`/`rejected`). Se houver `matched`, executar Trends, SEO, CSV e preços de landing sobre os top ads matched. Se não houver candidatos (ou zero matched com todos rejeitados), forçar `DESCARTAR`, saltar SEO/landing e fazer apenas a call Related Queries cacheada para sugestões; zero matched com qualquer `needs_review` produz `DADOS INSUFICIENTES`.
-4. Se a fonte Apify falhar, continuar Trends/SEO/CSV, marcar `DADOS INSUFICIENTES` e não produzir uma decisão negativa.
-5. Persistir Markdown e JSON, incluindo `facebook_ads` (candidatos classificados + contagens + `matcher_version` + `matching_schema_version`) e `suggested_keywords`.
+1. Resolver um target canónico a partir de `config/products.json` + `config/markets.json`; a matriz inicial contém PT para os cinco produtos e GB apenas para velas.
+2. Fazer uma chamada ao actor Apify `curious_coder~facebook-ads-library-scraper` com a keyword e o país do target (`PT` ou `GB`), `is_targeted_country=true` e `count=100`.
+3. Normalizar localmente, retirar anúncios inativos e gate-1-irrelevantes, deduplicar e classificar cada candidato com `pipeline/matching/product_ads.py` (`matched`/`needs_review`/`rejected`). SEO e landing usam apenas `top_ads` matched; evidência ambígua nunca entra no score.
+4. Recolher Trends, Related Queries e SERP com os parâmetros do mesmo mercado e ler apenas um export Keyword Planner cujo sidecar prove `market_id` e moeda. Qualquer scope ausente ou incompatível força `DADOS INSUFICIENTES`; zero matched inequívoco pode produzir `DESCARTAR`.
+5. Persistir Markdown e JSON separados por mercado, incluindo snapshot `market`, `market_signals`, fontes scoped, candidatos classificados, `matcher_version` e `matching_schema_version`.
 
 ## Contrato Apify
 
-A evidência da Ad Library é global (`country=ALL`) e não escolhe mercado. A requisição usa POST para o endpoint `run-sync-get-dataset-items`, `Authorization: Bearer APIFY_API_TOKEN`, `Content-Type: application/json`, query `clean=true&format=json`, timeout `(10,135)` e nenhum retry. O payload contém uma URL global com `active_status=active`, `ad_type=all`, `country=ALL`, `is_targeted_country=false`, `media_type=all`, `q` URL-encoded, `search_type=keyword_unordered`, e `count=100`.
+A requisição usa POST para o endpoint `run-sync-get-dataset-items`, `Authorization: Bearer APIFY_API_TOKEN`, `Content-Type: application/json`, query `clean=true&format=json`, timeout `(10,135)` e nenhum retry. O payload contém uma URL com `active_status=active`, `ad_type=all`, `country=<market.ads_country>`, `is_targeted_country=true`, `media_type=all`, `q` URL-encoded, `search_type=keyword_unordered`, e `count=100`. `country=ALL` fica reservado a descoberta global fora deste scoring.
 
-O resultado do adapter tem `source`, `query`, `sample_limit`, `sample_capped`, `raw_ads_count`, `filtered_out_count`, `filtered_inactive_count`, `filtered_irrelevant_count`, `candidate_count`, `duplicates_removed`, `relevance_policy`, `matching_schema_version` e `candidates` (até 100 candidatos canónicos ativos, gate-1-relevantes e deduplicados, cada um com `match_evidence` folded commercial/geo/weak). O adapter não decide fit de produto: `pipeline/matching/product_ads.py` classifica cada candidato (`matched` / `needs_review` / `rejected`) com confiança categórica, reason codes ordenados e `matcher_version`, e deriva `total_ads` (contagem matched), `matched_count`/`needs_review_count`/`rejected_count`, `ad_ids`, `top_ads`, `advertisers`, `global_market_proven`, `copy_examples` e `saturation` **apenas dos candidatos matched**. Como a query usa `country=ALL`, `global_market_proven` descreve apenas prova global; nunca é prova de mercado local. Cada candidato/top ad tem `ad_archive_id`, advertiser, page ID, longevidade, link da Ad Library, `landing_url` (sanitizada na persistência), copy, plataformas, países e `match_evidence`. A classificação exige o product-head e todos os tokens significativos (incluindo modificadores como `personalizada`/`aromáticas`) em campos comerciais fortes e os qualificadores geográficos em campos geo-proof estritos; prova parcial é `needs_review`, ausência do head é `rejected`.
+O resultado do adapter persiste `market_id` e `query_country`, além das contagens, política de relevância, versão de matching e até 100 candidatos canónicos. O adapter não decide fit de produto: `pipeline/matching/product_ads.py` classifica cada candidato (`matched` / `needs_review` / `rejected`) e deriva score inputs apenas dos candidatos matched. O gate geográfico valida que o payload corresponde ao mercado esperado antes de aceitar a evidência. Cada candidato/top ad mantém identidade, anunciante, longevidade, links sanitizados na persistência, copy, países e `match_evidence`; prova parcial é `needs_review` e ausência do product-head é `rejected`.
 
 ## Cadência e limites
 
 | Ação | Comportamento |
 |---|---|
-| Full/domingo | Um Apify por keyword; Trends/SEO/landing só conforme o resultado; Related Queries cacheada quando zero candidatos ou zero matched (todos rejeitados) |
-| Quarta | Uma chamada paga e bounded de Apify por keyword elegível; zero SerpAPI, Firecrawl ou landing; reutiliza todos os outros campos; compara IDs e advertisers (matched-only); saltada fail-closed se o pack anterior não tiver `matching_schema_version` |
-| Mensal | Uma timeseries Trends forçada por keyword OBSERVAR; zero Apify, SEO, landing ou Firecrawl; rescore com os dados reutilizados; saltado fail-closed se o pack anterior não tiver `matching_schema_version` |
+| Full/domingo | Um Apify por target; Trends/SEO/landing conforme o resultado; Related Queries e caches separados por mercado |
+| Quarta | Um Apify por target elegível; zero SerpAPI, Firecrawl ou landing; compara apenas o baseline `(product_id, market_id)` matched-only |
+| Mensal | Uma timeseries Trends forçada por target OBSERVAR; zero Apify, SEO, landing ou Firecrawl; rescore apenas com baseline do mesmo mercado |
 | Auto no dia 1 | Mensal primeiro; depois domingo ou quarta; cada ação conserva o próprio digest |
 
-Cache de Trends, SEO e Related Queries dura 30 dias; a timeseries do Trends usa timeout de 60s e a política de proveniência expõe o mesmo valor. A quota SerpAPI mantém hard stop local em 230 chamadas. O limite Apify por execução é uma invocação por keyword e o sample cap é 100.
+Cache de Trends, SEO e Related Queries dura 30 dias; a timeseries do Trends usa timeout de 60s e a política de proveniência expõe o mesmo valor. A quota SerpAPI mantém hard stop local em 230 chamadas. O limite Apify por execução é uma invocação por target e o sample cap é 100.
 
 ## Sugestões
 
@@ -37,12 +37,12 @@ Related Queries passa primeiro por relevância fail-closed do produto e depois p
 
 O score mantém os pesos `trend 0.3 + volume 0.2 + ad_longevity 0.3 + saturação_invertida 0.2`. A recomendação é:
 
-- `AVANÇAR`: preparar ad-machine depois de aprovação manual.
-- `OBSERVAR`: manter watchlist e voltar a verificar.
-- `DESCARTAR`: arquivar salvo nova evidência.
-- `DADOS INSUFICIENTES`: repetir quando Apify estiver disponível.
+- `AVANÇAR <mercado>`: preparar validação comercial nesse mercado depois de aprovação manual.
+- `OBSERVAR <mercado>`: manter a watchlist local e voltar a verificar.
+- `DESCARTAR <mercado>`: arquivar nesse mercado salvo nova evidência.
+- `DADOS INSUFICIENTES <mercado>`: corrigir ou repetir as fontes locais em falta.
 
-O pack não escolhe país. A evidência da Ad Library é global (`country=ALL`), e `global_market_proven` descreve apenas essa prova global. **Sinais por mercado — decisão manual** lista PT, ES, FR e os top geos de Trends nas colunas `country`, `Trends demand`, `advertisers observed (top-ad sample)` e `ads observed (top-ad sample)`; essas contagens vêm apenas de `top_ads`, não da coorte global retida, e `—` significa desconhecido. A selecção de mercado continua manual, sem ranking automático de país, e o digest usa `Mercado: decisão manual` e `Prova global`.
+O target escolhe o país antes da recolha, e o pack, o digest e o Telegram identificam explicitamente PT ou GB. Trends pode acrescentar os sinais advisory `EMERGENTE` e `DURÁVEL`, mas estes não mudam a fórmula do score. Não existe ranking automático entre países; apenas a matriz configurada é executada, e descoberta global nunca entra numa decisão local.
 
 ## Landing e Telegram
 
@@ -52,14 +52,14 @@ O outbound é determinístico e HTML multi-mensagem por omissão (`TELEGRAM_REND
 
 ## Projeção SQLite e explorer Datasette
 
-`pipeline/projection/` + `explore.py` adicionam uma projeção SQLite descartável e idempotente dos packs classificados e um explorer Datasette read-only, sem acoplamento a `run.py` ou `config/products.json`. Os packs (`data/*.json`) permanecem evidência canónica e nunca são reescritos; a projeção só importa packs completos classificados atuais (run_id/product_id não vazios, `artifact_complete=true`, data e score label válidos, `facebook_ads.matching_schema_version` atual, candidatos classificados presentes). Chave `(run_id, product_id)` + fingerprint SHA-256 do JSON canónico: reimport idêntico é no-op; identidade igual com conteúdo diferente levanta `PackConflictError` e deixa linhas intactas. Cada pack importa numa única transação (pack + candidatos), com foreign keys e `PRAGMA user_version`; schema incompatível manda apagar/reconstruir a base descartável. Candidatos usam a posição na lista como parte da chave (`ad_archive_id` pode faltar). A projeção copia valores já sanitizados verbatim — sem sanitizadores de URL, sem derivar score/decisões de match; campos JSON ficam como texto JSON canónico.
+`pipeline/projection/` + `explore.py` adicionam uma projeção SQLite descartável e idempotente dos packs classificados e um explorer Datasette read-only, sem acoplamento a `run.py` ou aos registries. Os packs (`data/*.json`) permanecem evidência canónica e nunca são reescritos; a projeção só importa packs completos classificados atuais com `run_id`, `product_id`, `market_id` e snapshot `market` coerentes. A chave é `(run_id, product_id, market_id)` + fingerprint SHA-256 do JSON canónico: reimport idêntico é no-op; identidade igual com conteúdo diferente levanta `PackConflictError` e deixa linhas intactas. Cada pack importa numa única transação com candidatos, foreign keys e `PRAGMA user_version=2`; schema incompatível falha fechado e deve ser reconstruído. A projeção copia valores já sanitizados verbatim, sem rescoring nem reclassificação.
 
 ```bash
 .venv/bin/python explore.py import [--db data/ecom_research.db] [--data-dir data]
 .venv/bin/python explore.py serve [--db data/ecom_research.db] [--host 127.0.0.1] [--port 8001]
 ```
 
-`import` descobre `data/*.json` deterministicamente; packs legados e ficheiros não-pack são saltados read-only e reportados, JSON malformado e packs que reivindicam a schema atual com shape inválida falham fechado. `serve` recusa base ausente e lança Datasette em modo imutável/read-only com queries read-only (últimos packs, needs_review, anunciantes matched), localhost por omissão. `data/*.db`, `-wal` e `-shm` estão no `.gitignore`. Se não existirem packs atuais, uma projeção vazia com os skips reportados continua a ser sucesso (exit 0); packs com `matching_schema_version` atual são importados normalmente. Detalhes em `docs/sqlite-projection/IMPLEMENTATION_PLAN.md`.
+`import` descobre `data/*.json` deterministicamente; packs legados e ficheiros não-pack são saltados read-only e reportados, JSON malformado e packs que reivindicam a schema atual com shape inválida falham fechado. `serve` valida e abre a base em `mode=ro`, depois lança Datasette com `--immutable`, queries read-only (últimos packs, needs_review, anunciantes matched) e localhost por omissão. `data/*.db`, `-wal` e `-shm` estão no `.gitignore`. Se não existirem packs atuais, uma projeção vazia com os skips reportados continua a ser sucesso (exit 0); packs com `matching_schema_version` atual são importados normalmente. O smoke de 2026-08-30 importou 16 packs/973 candidatos numa base temporária e respondeu a uma query HTTP real. Detalhes em `docs/sqlite-projection/IMPLEMENTATION_PLAN.md`.
 
 ## Estado atual
 
@@ -74,4 +74,4 @@ TZ=Europe/Lisbon
 
 O cron verifica a data diariamente, mas só atua ao domingo, à quarta-feira e no dia 1 do mês. O token Telegram exposto deve ainda ser rotacionado pelo utilizador.
 
-O identity store canónico de produtos está completo: `config/products.json` (`schema_version=1`) é o registo operado manualmente, com cinco produtos e `product_id` imutável (preservado do antigo hash de 12 hex da keyword); `config/keywords.txt` permanece intacto e já não é lido em runtime. Um `research_keyword` ativo por produto; aliases guardam keywords históricas (camisola portugal consolida camisolas portugal, camisola de portugal e camisola portugal preta). A identidade de run usa pares ordenados `(product_id, research_keyword)`: mudar a query ativa cria um run novo, enquanto o `product_id` estável preserva o histórico. Packs/manifestos novos carregam `product_id`/`product_name`/`research_keyword`; packs, manifestos e digests históricos são read-only e nunca reescritos; a migração apenas lê artefactos legados. Quarta/mensal selecionam por `product_id` com fallback read-only keyword-legada→alias, mantendo a watchlist e o baseline do pack anterior num produto renomeado. Token posicional desconhecido sai com exit 2 antes de qualquer chamada de fonte/rede; registo ausente ou inválido falha fechado. A idempotência de entrega e a segurança contra duplicação não mudaram.
+O identity store canónico usa `config/products.json` para os cinco produtos e `config/markets.json` para PT/GB. O mesmo `product_id` atravessa mercados; a identidade operacional e histórica é `(product_id, market_id)`, enquanto `research_keyword` mantém a query local. A identidade de run inclui `(product_id, market_id, research_keyword)`, packs atuais persistem o snapshot de mercado e quarta/mensal nunca usam um pack de outro mercado como baseline. Packs e manifestos históricos permanecem read-only, mas packs sem scope não contam como evidência local. Token ou mercado desconhecido sai com exit 2 antes de qualquer chamada externa; registry ausente ou inválido falha fechado.
