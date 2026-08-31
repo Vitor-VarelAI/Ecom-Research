@@ -26,6 +26,7 @@ from pipeline.notifications.limits import (
 from pipeline.notifications.model import (
     KIND_PRODUCT,
     KIND_SUMMARY,
+    NotificationAction,
     NotificationBatch,
     NotificationField,
     NotificationItem,
@@ -68,6 +69,7 @@ __all__ = [
     "SUPPLIER_MISSING",
     "PENDING_DOCUMENTATION",
     "NOT_APPLICABLE",
+    "NotificationAction",
     "NotificationBatch",
     "NotificationField",
     "NotificationItem",

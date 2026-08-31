@@ -6,9 +6,10 @@ endpoint: top-level ``chat_id`` (added by the delivery layer, never here),
 emit html only), and no ``reply_markup`` in this release.
 
 Only structural tags the official Bot API Rich HTML supports are used:
-``h1``/``h2``, ``p``, ``hr``, ``b``, ``table bordered`` with ``tr``/``th``/
-``td``, and ``details``/``summary``.  Every external string (title, subtitle,
-headings, labels, values, footer) is HTML-escaped.
+``h1``/``h2``, ``p``, ``hr``, ``b``, ``table bordered striped compact`` with
+``tr``/``th``/``td``, ``details``/``summary`` and URL-only ``tg-button`` /
+``tg-button-row``. Every external string (title, subtitle, headings, labels,
+values, action labels/URLs, footer) is HTML-escaped.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ def _section_html(section: NotificationSection) -> str:
                     f"<td>{_escape(field.value)}</td>",
                 ]
             rows.append("<tr>\n" + "\n".join(cells) + "\n</tr>")
-        table = "<table bordered>\n" + "\n".join(rows) + "\n</table>"
+        table = "<table bordered striped compact>\n" + "\n".join(rows) + "\n</table>"
         if section.heading:
             return f"<h2>{_escape(section.heading)}</h2>\n{table}"
         return table
@@ -71,14 +72,25 @@ def _section_html(section: NotificationSection) -> str:
     return "\n".join(parts)
 
 
+def _actions_html(item: NotificationItem) -> str:
+    buttons = "\n".join(
+        f'<tg-button type="url" url="{_escape(action.url)}">'
+        f"{_escape(action.label)}</tg-button>"
+        for action in item.actions
+    )
+    return f"<tg-button-row>\n{buttons}\n</tg-button-row>"
+
+
 def _rich_html(item: NotificationItem) -> str:
     parts: list[str] = [f"<h1>{_escape(item.title)}</h1>"]
     if item.subtitle:
         parts.append(f"<p>{_escape(item.subtitle)}</p>")
     parts.extend(_paragraph(field) for field in item.header_fields)
-    if item.sections or item.footer_fields or item.footer:
+    if item.sections or item.actions or item.footer_fields or item.footer:
         parts.append("<hr/>")
     parts.extend(_section_html(section) for section in item.sections)
+    if item.actions:
+        parts.append(_actions_html(item))
     parts.extend(_paragraph(field) for field in item.footer_fields)
     parts.extend(f"<p>{_escape(line)}</p>" for line in item.footer)
     # Newlines between blocks keep word boundaries in the visible text

@@ -19,11 +19,14 @@ Mode shapes (unchanged contract):
 Absence mapping: suppliers, shipping, margins and legal evidence do not exist
 in this pipeline stage, so the builder renders the canonical placeholders
 (FORNECEDOR EM FALTA / POR VALIDAR / DOCUMENTAÇÃO EM FALTA / PESQUISA
-NECESSÁRIA).  Nothing is invented here: no supplier, margin, legal
-conclusion, workflow gate, image, media, URL or button.
+NECESSÁRIA). Nothing is invented here: no supplier, margin, legal conclusion,
+workflow gate or media. Public investigation URLs come only from sanitized
+persisted evidence or deterministic searches on known hosts; there are no
+callbacks.
 
-:func:`notification_snapshot` extracts the minimal credential-free, URL-free
-projection of one result that the builder needs to rebuild the exact batch
+:func:`notification_snapshot` extracts the minimal credential-free projection
+of one result, including the safe public investigation links needed to rebuild
+the exact batch
 from a persisted (compact) manifest without rerunning any source.  Results
 without a snapshot degrade safely to placeholders.
 """
@@ -33,10 +36,14 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 from typing import Any, Sequence
+from urllib.parse import urlencode
+
+from pipeline.adapters.url_sanitize import sanitize_ad_library_link, sanitize_url
 
 from pipeline.notifications.model import (
     KIND_PRODUCT,
     KIND_SUMMARY,
+    NotificationAction,
     NotificationBatch,
     NotificationField,
     NotificationItem,
@@ -66,15 +73,107 @@ def mode_title(mode: str, run_date: date) -> str | None:
     return formatter(run_date) if formatter else None
 
 
+def _safe_action_data(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    label = value.get("label")
+    url = value.get("url")
+    if not isinstance(label, str) or not isinstance(url, str):
+        return None
+    try:
+        NotificationAction(label=label, url=url)
+    except ValueError:
+        return None
+    return {"label": label, "url": url}
+
+
+def _investigation_action_data(result: dict[str, Any]) -> list[dict[str, str]]:
+    persisted = result.get("investigation_actions")
+    if isinstance(persisted, list):
+        actions: list[dict[str, str]] = []
+        for item in persisted:
+            safe = _safe_action_data(item)
+            if safe is not None:
+                actions.append(safe)
+        return actions
+    # Historical compact manifests have no action snapshot. Do not change
+    # their durable payload on replay; only fresh results get the new actions.
+    if isinstance(result.get("notification_snapshot"), dict):
+        return []
+
+    actions: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    def add(label: str, url: str | None) -> None:
+        if url and url not in seen_urls:
+            actions.append({"label": label, "url": url})
+            seen_urls.add(url)
+
+    ads = result.get("ads_data")
+    if isinstance(ads, dict) and "error" not in ads:
+        top_ads = ads.get("top_ads")
+        if isinstance(top_ads, list) and top_ads:
+            top = top_ads[0] if isinstance(top_ads[0], dict) else {}
+            add("Ver anúncio", sanitize_ad_library_link(top.get("link")))
+            add("Abrir landing", sanitize_url(top.get("landing_url")))
+
+    keyword = result.get("research_keyword") or result.get("keyword")
+    market_id = result.get("market_id")
+    if not isinstance(keyword, str) or not keyword.strip() or not isinstance(market_id, str):
+        return actions
+    market = result.get("market") if isinstance(result.get("market"), dict) else {}
+    geo = str(market.get("trends_geo") or market_id)
+    gl = str(market.get("serp_gl") or ("uk" if market_id == "GB" else market_id.lower()))
+    hl = str(market.get("serp_hl") or ("en" if market_id == "GB" else "pt"))
+    ads_country = str(market.get("ads_country") or market_id)
+
+    add("Google Trends", "https://trends.google.com/trends/explore?" + urlencode({
+        "geo": geo,
+        "q": keyword,
+    }))
+    add("Google Shopping", "https://www.google.com/search?" + urlencode({
+        "tbm": "shop",
+        "gl": gl,
+        "hl": hl,
+        "q": keyword,
+    }))
+    add("Meta Ads Library", "https://www.facebook.com/ads/library/?" + urlencode({
+        "active_status": "active",
+        "ad_type": "all",
+        "country": ads_country,
+        "is_targeted_country": "true",
+        "media_type": "all",
+        "q": keyword,
+        "search_type": "keyword_unordered",
+    }))
+    supplier_terms = (
+        f"{keyword} fornecedor grossista dropshipping"
+        if hl == "pt" else f"{keyword} wholesale supplier dropshipping"
+    )
+    add("Pesquisar fornecedor", "https://www.google.com/search?" + urlencode({
+        "gl": gl,
+        "hl": hl,
+        "q": supplier_terms,
+    }))
+    return actions
+
+
+def _investigation_actions(result: dict[str, Any]) -> tuple[NotificationAction, ...]:
+    return tuple(
+        NotificationAction(label=item["label"], url=item["url"])
+        for item in _investigation_action_data(result)
+    )
+
+
 def notification_snapshot(result: dict[str, Any]) -> dict[str, Any]:
-    """Minimal credential-free, URL-free projection of one result.
+    """Minimal credential-free projection of one result.
 
     Only the safe scalar/list fields the builder reads survive: advertiser
     ``page_name``/``active_ads``, ``saturation``, ``total_ads`` and the
     trends scalars (``direction``/``slope_pct``/``seasonal``/``peak``).
-    Errors, raw payloads, tokens, chat ids, URLs and full adapter responses
-    never reach the snapshot; a result without evidence simply yields an
-    empty snapshot and rebuilds degrade to placeholders.
+    Errors, raw payloads, tokens, chat ids and full adapter responses never
+    reach the snapshot. The only URLs retained are sanitized evidence links
+    and deterministic searches on known public hosts.
     """
     snapshot: dict[str, Any] = {}
     # Canonical product identity (safe scalars): the builder needs it to
@@ -103,6 +202,9 @@ def notification_snapshot(result: dict[str, Any]) -> dict[str, Any]:
                 safe_ads[key] = value
         if safe_ads:
             snapshot["ads_data"] = safe_ads
+    actions = _investigation_action_data(result)
+    if actions:
+        snapshot["investigation_actions"] = actions
     signals = result.get("market_signals")
     if isinstance(signals, list) and all(isinstance(signal, str) for signal in signals):
         snapshot["market_signals"] = signals
@@ -134,6 +236,8 @@ def _normalize_result(result: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = snapshot[key]
     if not isinstance(normalized.get("market_signals"), list):
         normalized["market_signals"] = snapshot.get("market_signals")
+    if not isinstance(normalized.get("investigation_actions"), list):
+        normalized["investigation_actions"] = snapshot.get("investigation_actions")
     return normalized
 
 
@@ -295,7 +399,11 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
             if ads.get("saturation") is not None:
                 evidence.append(NotificationField(value=str(ads["saturation"]), label="Saturação"))
         evidence_heading = f"Evidência {market_id}" if market_id else "Evidência global"
-        sections.append(NotificationSection(heading=evidence_heading, fields=tuple(evidence)))
+        sections.append(NotificationSection(
+            heading=evidence_heading,
+            as_table=True,
+            fields=tuple(evidence),
+        ))
         trends = result.get("trends_data") or {}
         trend_fields: list[NotificationField] = []
         if isinstance(trends, dict) and "error" not in trends:
@@ -310,7 +418,11 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
                     value = f"sim (pico: {peak})"
                 trend_fields.append(NotificationField(value=value, label="Sazonalidade"))
         if trend_fields:
-            sections.append(NotificationSection(heading="Tendência", fields=tuple(trend_fields)))
+            sections.append(NotificationSection(
+                heading="Tendência",
+                as_table=True,
+                fields=tuple(trend_fields),
+            ))
     signals = [signal for signal in (result.get("market_signals") or []) if isinstance(signal, str)]
     if signals:
         heading = f"Sinais {market_id}" if market_id else "Sinais de mercado"
@@ -332,6 +444,7 @@ def _full_product_item(result: dict[str, Any], run_date: date, *, with_suggestio
         product=_product_identity(result),
         header_fields=_score_header(result),
         sections=tuple(sections),
+        actions=_investigation_actions(result),
         footer_fields=_footer_date(run_date),
         audit_text=_full_item_audit(result, run_date, with_suggestions=with_suggestions),
     )
@@ -364,7 +477,11 @@ def _wednesday_product_item(result: dict[str, Any], run_date: date) -> Notificat
             value=", ".join(str(d) for d in deltas[:2]) or MISSING,
             label="Deltas de anunciantes",
         ))
-        sections.append(NotificationSection(heading="Pulse (quarta)", fields=tuple(pulse)))
+        sections.append(NotificationSection(
+            heading="Pulse (quarta)",
+            as_table=True,
+            fields=tuple(pulse),
+        ))
     sections.append(_commercial_section())
     sections.append(_legal_section())
     return NotificationItem(
@@ -373,6 +490,7 @@ def _wednesday_product_item(result: dict[str, Any], run_date: date) -> Notificat
         product=_product_identity(result),
         header_fields=_score_header(result),
         sections=tuple(sections),
+        actions=_investigation_actions(result),
         footer_fields=_footer_date(run_date),
         audit_text=_wednesday_item_audit(result),
     )

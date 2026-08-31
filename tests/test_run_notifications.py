@@ -432,6 +432,47 @@ def test_builder_uses_result_product_id_not_keyword_hash():
     assert batch.items[0].product != stable_product_id("mochila")
 
 
+def test_builder_actions_and_metric_tables_replay_deterministically():
+    result = _result("mochila")
+    result.update({
+        "market_id": "PT",
+        "research_keyword": "mochila",
+        "market": {
+            "trends_geo": "PT",
+            "serp_gl": "pt",
+            "serp_hl": "pt",
+            "ads_country": "PT",
+        },
+    })
+    result["ads_data"] = {
+        **ADS,
+        "top_ads": [{
+            "ad_archive_id": "a1",
+            "link": "https://www.facebook.com/ads/library/?id=a1&active_status=active",
+            "landing_url": "https://shop.example/product?utm_source=ads",
+        }],
+    }
+    fresh = run.build_batch(mode="keyword", run_id="actions-1", results=[result], run_date=RUN_DATE)
+    item = fresh.items[0]
+    assert [action.label for action in item.actions] == [
+        "Ver anúncio", "Abrir landing", "Google Trends", "Google Shopping",
+        "Meta Ads Library", "Pesquisar fornecedor",
+    ]
+    assert any(section.heading == "Evidência PT" and section.as_table for section in item.sections)
+    assert any(section.heading == "Tendência" and section.as_table for section in item.sections)
+    assert '<tg-button type="url"' in render_rich(item)["payload"]["rich_message"]["html"]
+    assert '<a href="https://' in render_html(item)["payload"]["text"]
+    assert_semantic_parity(item)
+
+    compact = dict(result)
+    compact["notification_snapshot"] = notification_snapshot(result)
+    compact.pop("ads_data")
+    compact.pop("trends_data")
+    rebuilt = run.build_batch(mode="keyword", run_id="actions-1", results=[compact], run_date=RUN_DATE)
+    assert rebuilt.items == fresh.items
+    assert rebuilt.audit_text == fresh.audit_text
+
+
 def test_notification_snapshot_persists_product_identity():
     snapshot = notification_snapshot({
         "product_id": "e942e8bf7f30",
@@ -449,7 +490,7 @@ def test_notification_snapshot_persists_product_identity():
 # ── 6) Snapshot and manifest safety ───────────────────────────────────────
 
 
-def test_notification_snapshot_drops_urls_credentials_and_raw_payloads():
+def test_notification_snapshot_keeps_only_sanitized_public_actions_and_safe_fields():
     hostile = {
         "keyword": "mochila",
         "ads_data": {
@@ -473,13 +514,16 @@ def test_notification_snapshot_drops_urls_credentials_and_raw_payloads():
     blob = json.dumps(snapshot)
     for needle in (
         "TOPSECRET", "user:pass", "api_key", "#frag", "chat-SUPERSECRET-id",
-        "api.telegram.org", "/bot", "https://", "top_ads", "related_queries",
+        "api.telegram.org", "/bot", "top_ads", "related_queries",
         "private_url", "landing_url",
     ):
         assert needle not in blob, f"segredo/URL no snapshot: {needle!r}"
     assert snapshot == {
         "ads_data": {"advertisers": [{"page_name": "Loja", "active_ads": 2}],
                      "saturation": "alta", "total_ads": 3},
+        "investigation_actions": [
+            {"label": "Abrir landing", "url": "https://raw.example/secret"},
+        ],
         "trends_data": {"direction": "subida", "slope_pct": 10.0, "seasonal": True, "peak": "2026-12-01"},
     }
 
@@ -497,7 +541,7 @@ def test_completed_manifest_snapshot_and_delivery_state_are_safe(monkeypatch, tm
     for result in manifest["results"]:
         snapshot = result.get("notification_snapshot") or {}
         blob = json.dumps(snapshot)
-        for needle in ("https://", "api.telegram.org", "/bot", "chat_id", "token"):
+        for needle in ("api.telegram.org", "/bot", "chat_id", "token", "user:", "TOPSECRET"):
             assert needle not in blob, f"segredo no snapshot do manifesto: {needle!r}"
 
 

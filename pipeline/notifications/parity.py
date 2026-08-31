@@ -14,6 +14,7 @@ make parity verifiable without coupling tests to private markup details:
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 
@@ -25,6 +26,10 @@ from pipeline.notifications.render_rich import render_rich
 # Leading/trailing punctuation (colons after labels, hashtag '#' prefixes)
 # is presentation, not meaning: strip it before comparing tokens.
 _EDGE_PUNCTUATION = re.compile(r"^[^\w]+|[^\w]+$")
+_ACTION_URL = re.compile(
+    r'<(?:a|tg-button)\b[^>]*\b(?:href|url)=(?:"([^"]*)"|\'([^\']*)\')',
+    flags=re.IGNORECASE,
+)
 
 
 def _fragment_html(fragment: dict[str, Any]) -> str:
@@ -45,8 +50,19 @@ def _tokens(text: str) -> tuple[str, ...]:
 
 
 def semantic_tokens(fragment: dict[str, Any]) -> tuple[str, ...]:
-    """Ordered meaningful tokens of a rendered fragment, renderer-agnostic."""
-    return _tokens(visible_text(_fragment_html(fragment)))
+    """Ordered meaningful tokens of a rendered fragment, renderer-agnostic.
+
+    URL attributes are included immediately before their action label so a
+    Rich URL button and its HTML-link fallback prove the same action pair.
+    """
+    source = _fragment_html(fragment)
+
+    def include_url(match: re.Match[str]) -> str:
+        url = match.group(1) if match.group(1) is not None else match.group(2)
+        return f"{html.unescape(url)} "
+
+    source = _ACTION_URL.sub(include_url, source)
+    return _tokens(visible_text(source))
 
 
 def _field_text(field: Any) -> str:
@@ -66,6 +82,8 @@ def content_tokens(item: NotificationItem) -> tuple[str, ...]:
         if section.heading:
             parts.append(section.heading)
         parts.extend(_field_text(field) for field in section.fields)
+    for action in item.actions:
+        parts.append(f"{action.url} {action.label}")
     parts.extend(_field_text(field) for field in item.footer_fields)
     parts.extend(item.footer)
     return _tokens(" ".join(parts))
@@ -83,7 +101,7 @@ def semantic_parity(item: NotificationItem) -> bool:
 def assert_semantic_parity(item: NotificationItem) -> None:
     """Raise ``AssertionError`` (with the diverging token streams) when the
     Rich and HTML-fallback renderers do not preserve the model's meaningful
-    title/section/field/value text."""
+    title/section/field/value/action text."""
     expected = content_tokens(item)
     rich = semantic_tokens(render_rich(item))
     html_tokens = semantic_tokens(render_html(item))

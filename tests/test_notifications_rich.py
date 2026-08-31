@@ -1,5 +1,6 @@
 """Rich (sendRichMessage) renderer tests: payload shape, escaping, structural
-tags, absence of reply_markup/media/URLs, and the 32768-char size guard."""
+tags, public URL actions, absence of reply_markup/media, and the 32768-char
+size guard."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import pytest
 from pipeline.notifications import (
     KIND_PRODUCT,
     MAX_RICH_LENGTH,
+    NotificationAction,
     NotificationField,
     NotificationItem,
     NotificationSection,
@@ -124,6 +126,28 @@ def test_rich_escapes_angles_ampersands_and_quotes():
     assert 'alert("x")' in visible
 
 
+def test_rich_actions_are_external_url_buttons_and_escape_label_and_url():
+    item = _simple_item(
+        actions=(
+            NotificationAction(
+                label='Abrir <pesquisa> & "agora"',
+                url="https://research.example/search?q=mochila&market=PT",
+            ),
+        ),
+    )
+    fragment = render_rich(item)
+    html_text = fragment["payload"]["rich_message"]["html"]
+    assert '<tg-button-row>' in html_text
+    assert (
+        '<tg-button type="url" '
+        'url="https://research.example/search?q=mochila&amp;market=PT">'
+        'Abrir &lt;pesquisa&gt; &amp; &quot;agora&quot;</tg-button>'
+    ) in html_text
+    assert "callback_data" not in html_text
+    assert "reply_markup" not in html_text
+    assert "media" not in html_text
+
+
 # ── Structural tags ───────────────────────────────────────────────────────
 
 
@@ -131,6 +155,7 @@ def test_rich_uses_only_supported_structural_tags():
     batch = synthetic_batch()
     allowed = {
         "h1", "h2", "p", "b", "hr", "table", "tr", "th", "td", "details", "summary",
+        "tg-button", "tg-button-row",
     }
     for item in batch.items:
         html_text = render_rich(item)["payload"]["rich_message"]["html"]
@@ -143,7 +168,7 @@ def test_rich_emits_heading_divider_table_and_details():
     summary_html = render_rich(batch.items[0])["payload"]["rich_message"]["html"]
     assert "<h1>RESEARCH SEMANAL</h1>" in summary_html
     assert "<hr/>" in summary_html
-    assert "<table bordered>" in summary_html
+    assert "<table bordered striped compact>" in summary_html
     assert "<th>Estado</th>" in summary_html
     assert "<summary>ALTERAÇÕES LEGAIS</summary>" in summary_html
     product_html = render_rich(batch.items[1])["payload"]["rich_message"]["html"]

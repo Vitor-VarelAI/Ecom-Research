@@ -6,6 +6,7 @@ import pytest
 
 from pipeline.notifications import (
     KIND_PRODUCT,
+    NotificationAction,
     NotificationField,
     NotificationItem,
     NotificationSection,
@@ -95,6 +96,23 @@ def test_parity_survives_external_string_escaping():
     )
     assert semantic_parity(item) is True
     assert_semantic_parity(item)
+
+
+def test_parity_includes_each_action_url_and_label():
+    item = NotificationItem(
+        kind=KIND_PRODUCT,
+        title="caneca",
+        product="abc",
+        actions=(
+            NotificationAction(
+                label="Abrir pesquisa",
+                url="https://research.example/search?q=caneca&market=PT",
+            ),
+        ),
+    )
+    assert semantic_parity(item) is True
+    assert "https://research.example/search?q=caneca&market=pt" in content_tokens(item)
+    assert "abrir" in content_tokens(item)
 
 
 def test_parity_helper_detects_meaningful_divergence():

@@ -1,6 +1,6 @@
 """Normal HTML fallback (sendMessage) renderer tests: payload shape,
-escaping, no Rich-only tags, absence of reply_markup/media/URLs, and the
-4096-char size guard after entities parsing."""
+escaping, no Rich-only tags, public action links, absence of reply_markup/media,
+and the 4096-char size guard after entities parsing."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import pytest
 from pipeline.notifications import (
     KIND_PRODUCT,
     MAX_HTML_LENGTH,
+    NotificationAction,
     NotificationField,
     NotificationItem,
     NotificationSection,
@@ -57,9 +58,7 @@ def _assert_no_forbidden_content(fragment: dict) -> None:
     serialized = json.dumps(fragment)
     for needle in _FORBIDDEN:
         assert needle not in serialized, f"proibido no fragmento HTML: {needle!r}"
-    assert "<a " not in serialized
     assert "<img" not in serialized
-    assert '<a href' not in serialized
 
 
 # ── Payload shape ─────────────────────────────────────────────────────────
@@ -126,6 +125,28 @@ def test_html_escapes_angles_ampersands_and_quotes():
     assert 'caneca <"teste"> & \'apóstrofo\'' in visible
     assert '<b>bold</b> & "x"' in visible
     assert 'alert("x")' in visible
+
+
+def test_html_actions_are_normal_escaped_links_with_previews_disabled():
+    item = _simple_item(
+        actions=(
+            NotificationAction(
+                label='Abrir <pesquisa> & "agora"',
+                url="https://research.example/search?q=mochila&market=PT",
+            ),
+        ),
+    )
+    fragment = render_html(item)
+    text = fragment["payload"]["text"]
+    _assert_no_forbidden_content(fragment)
+    assert (
+        '<a href="https://research.example/search?q=mochila&amp;market=PT">'
+        'Abrir &lt;pesquisa&gt; &amp; &quot;agora&quot;</a>'
+    ) in text
+    assert fragment["payload"]["link_preview_options"] == {"is_disabled": True}
+    assert "reply_markup" not in text
+    assert "callback_data" not in text
+    assert "media" not in text
 
 
 # ── No Rich-only structural tags ──────────────────────────────────────────

@@ -1,8 +1,9 @@
 """Renderer-neutral notification models with deterministic identity.
 
 Slice 1 of the Telegram rich outbound: the weekly summary and the per-product
-messages are modelled here with no Telegram, credential or URL concern.
-Identity is deterministic — never random:
+messages are modelled here without Telegram credentials or transport concerns.
+Public investigation actions are explicit label/URL pairs; private Bot API URLs
+remain forbidden. Identity is deterministic — never random:
 
 * ``product`` (kind=product only) reuses the keyword-hash semantics of the
   pack writer (``pipeline.output.pack._keyword_hash``: SHA-256 of the raw
@@ -25,6 +26,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 KIND_SUMMARY = "summary"
 KIND_PRODUCT = "product"
@@ -87,8 +89,8 @@ class NotificationField:
 class NotificationSection:
     """A named block of fields shared by both renderers.
 
-    ``as_table`` renders as ``<table bordered>`` in Rich and flat
-    ``label: value`` lines in the fallback.  ``as_details`` renders as
+    ``as_table`` renders as a bordered, striped, compact table in Rich and
+    flat ``label: value`` lines in the fallback. ``as_details`` renders as
     ``<details><summary>…`` in Rich (requires a heading) and as a flat
     section in the fallback.
     """
@@ -117,10 +119,35 @@ def _field_line(field: NotificationField) -> str:
     return field.value
 
 
+@dataclass(frozen=True)
+class NotificationAction:
+    """One public external investigation link; never a callback or command."""
+
+    label: str
+    url: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("action label vazio")
+        if not isinstance(self.url, str) or not self.url.strip():
+            raise ValueError("action url vazio")
+        parsed = urlsplit(self.url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(f"action url inválido: {self.url!r}")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("action url não pode conter credenciais")
+        if (
+            parsed.hostname.casefold() == "api.telegram.org"
+            and parsed.path.casefold().startswith("/bot")
+        ):
+            raise ValueError("action url não pode conter endpoint privado da Bot API")
+
+
 def render_audit_text(item: "NotificationItem") -> str:
     """Complete plain-text rendering of one item — title, subtitle, header
-    fields, sections, footer fields and footer lines in order.  Deterministic
-    and renderer-neutral; this is the full audit text preserved per item."""
+    fields, sections, actions, footer fields and footer lines in order.
+    Deterministic and renderer-neutral; this is the full audit text preserved
+    per item."""
     lines = [item.title]
     if item.subtitle:
         lines.append(item.subtitle)
@@ -132,6 +159,10 @@ def render_audit_text(item: "NotificationItem") -> str:
         if section.heading:
             lines.append(section.heading)
         lines.extend(_field_line(field) for field in section.fields)
+    if item.actions:
+        lines.append("")
+        lines.append("Investigar")
+        lines.extend(f"{action.label}: {action.url}" for action in item.actions)
     if item.footer_fields:
         lines.append("")
         lines.extend(_field_line(field) for field in item.footer_fields)
@@ -163,6 +194,7 @@ class NotificationItem:
     subtitle: str | None = None
     header_fields: tuple[NotificationField, ...] = ()
     sections: tuple[NotificationSection, ...] = ()
+    actions: tuple[NotificationAction, ...] = ()
     footer_fields: tuple[NotificationField, ...] = ()
     footer: tuple[str, ...] = ()
     audit_text: str | None = None
@@ -184,10 +216,12 @@ class NotificationItem:
 
         header_fields = tuple(self.header_fields)
         sections = tuple(self.sections)
+        actions = tuple(self.actions)
         footer_fields = tuple(self.footer_fields)
         footer = tuple(self.footer)
         object.__setattr__(self, "header_fields", header_fields)
         object.__setattr__(self, "sections", sections)
+        object.__setattr__(self, "actions", actions)
         object.__setattr__(self, "footer_fields", footer_fields)
         object.__setattr__(self, "footer", footer)
         for field_ in (*header_fields, *footer_fields):
@@ -197,6 +231,9 @@ class NotificationItem:
         for section in sections:
             if not isinstance(section, NotificationSection):
                 raise ValueError(f"section inválida: {section!r}")
+        for action in actions:
+            if not isinstance(action, NotificationAction):
+                raise ValueError(f"action inválida: {action!r}")
         for line in footer:
             if not isinstance(line, str):
                 raise ValueError(f"footer inválido: {line!r}")

@@ -46,6 +46,11 @@ def _html_text(item: NotificationItem) -> str:
             block.append(f"<b>{_escape(section.heading.upper())}</b>")
         block.extend(_field_line(field) for field in section.fields)
         blocks.append("\n".join(block))
+    if item.actions:
+        blocks.append("\n".join(
+            f'<a href="{_escape(action.url)}">{_escape(action.label)}</a>'
+            for action in item.actions
+        ))
     if item.footer_fields:
         blocks.append("\n".join(_field_line(field) for field in item.footer_fields))
     if item.footer:

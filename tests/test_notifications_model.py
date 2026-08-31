@@ -7,6 +7,7 @@ import pytest
 from pipeline.notifications import (
     KIND_PRODUCT,
     KIND_SUMMARY,
+    NotificationAction,
     NotificationField,
     NotificationItem,
     NotificationSection,
@@ -96,6 +97,19 @@ def test_item_rejects_non_string_field_value():
 def test_item_rejects_non_string_footer_line():
     with pytest.raises(ValueError, match="footer"):
         NotificationItem(kind=KIND_PRODUCT, title="x", product="abc", footer=(42,))
+
+
+def test_action_accepts_public_http_url_and_rejects_private_or_invalid_urls():
+    action = NotificationAction(label="Investigar", url="https://example.com/search?q=mochila")
+    assert action.url == "https://example.com/search?q=mochila"
+    for url in (
+        "",
+        "javascript:alert(1)",
+        "https://user:pass@example.com/private",
+        "https://api.telegram.org/botSECRET/sendMessage",
+    ):
+        with pytest.raises(ValueError, match="action"):
+            NotificationAction(label="Investigar", url=url)
 
 
 def test_details_section_requires_heading():
