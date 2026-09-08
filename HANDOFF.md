@@ -8,9 +8,9 @@ A entrega de matching/evidência está integrada em `main`. A pesquisa WinningHu
 
 O gate de fonte exige o product-head em qualquer texto do anúncio, incluindo copy fraca, para que falsos positivos reais cheguem ao matcher em vez de desaparecerem antes da classificação. Assim, mochila personalizada genuína fica `matched`, mochila genérica/porta-bebé fica `needs_review` quando falta prova forte de `personalizada`, e concentrador de oxigénio que apenas menciona mochila no corpo fica `rejected`. Zero candidatos ou todos rejeitados produz `DESCARTAR`; zero matched com candidatos ambíguos produz `DADOS INSUFICIENTES`. Quarta e mensal não comparam nem re-scorizam packs legados sem `matching_schema_version`; preservam-nos e explicam o skip. URLs persistidas em `candidates` e `top_ads` são sanitizadas sem mutar as URLs cruas usadas no fetch.
 
-O outbound Telegram foi implementado e é agora HTML multi-mensagem determinístico por omissão: `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos (retenção, churn/sinais e deltas de anunciantes); `monthly` envia resumo seguido dos produtos afetados. O digest plain text integral continua impresso no stdout e guardado como audit text. O renderer resolve-se por `TELEGRAM_RENDERER` — documentado em `.env.example` e default de código `html`.
+O outbound Telegram foi implementado e é agora HTML multi-mensagem determinístico por omissão: `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos (retenção, churn/sinais e deltas de anunciantes); `monthly` envia resumo seguido dos produtos afetados. Rich pode ser selecionado explicitamente e usa tabelas compactas no resumo e nas métricas, mais botões URL externos para investigar anúncio, landing, Trends, Shopping, Meta Ads Library e fornecedores. O fallback HTML mostra os mesmos destinos como links normais. O digest plain text integral continua impresso no stdout e guardado como audit text. O renderer resolve-se por `TELEGRAM_RENDERER` — documentado em `.env.example` e default de código `html`.
 
-O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). O renderer Rich existe, implementado com TDD, mas permanece desativado. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). A assinatura de erro que dispara o fallback Rich→HTML está completa e baseada em evidência (envelope oficial da Bot API, integrações open-source/live-verificadas e allowlists exatas — ver `docs/telegram-research/08-rich-fallback-signature.md`); Rich só é reativado para uma coorte de clientes compatível.
+O estado de entrega v2 (`schema_version=2`) é durável e por item: impede reenvio de itens confirmados e falha fechado em entrega ambígua (timeout, 5xx, JSON ilegível ou resposta malformada). As ações externas são send-only, persistidas no snapshot para replay determinístico e não introduzem callbacks, `reply_markup`, inbound ou novas chamadas a providers. O renderer Rich permanece desativado para a coorte de clientes atual. A duplicação visual do smoke foi diagnosticada como incompatibilidade de renderização Rich específica do cliente, não um double-send da aplicação (evidência no follow-up de `docs/telegram-research/IMPLEMENTATION_STATUS.md`). A assinatura de erro que dispara o fallback Rich→HTML está completa e baseada em evidência (envelope oficial da Bot API, integrações open-source/live-verificadas e allowlists exatas — ver `docs/telegram-research/08-rich-fallback-signature.md`); Rich só é reativado para uma coorte de clientes compatível.
 
 A investigação técnica e comercial está em [`docs/telegram-research/`](docs/telegram-research/), com os 22 entregáveis em [`REPORT.md`](docs/telegram-research/REPORT.md) e o registo da implementação/smoke em [`IMPLEMENTATION_STATUS.md`](docs/telegram-research/IMPLEMENTATION_STATUS.md). O identity store canónico está dividido entre `config/products.json` (`schema_version=1`), com cinco produtos e `product_id` imutável, e `config/markets.json`, com os parâmetros locais de PT e GB. A matriz operacional é PT para os cinco produtos e GB apenas para velas; o mesmo produto mantém o mesmo `product_id` nos dois mercados e usa `scented candles` como query GB. A identidade de run usa descritores ordenados `(product_id, market_id, research_keyword)`, e packs/manifestos atuais carregam o target e o snapshot de mercado. Packs, manifestos e digests históricos permanecem read-only; packs sem `market_id` não servem como baseline de decisões locais. Quarta e mensal selecionam por `(product_id, market_id)`, evitando mistura de histórico PT/GB.
 
@@ -23,7 +23,7 @@ Fora do âmbito continuam callbacks, long polling, Mini App, fornecedores/margen
 A Bot API oficial confirma Rich Messages e `sendRichMessage` (10.1) e blocos estruturados, tabelas, `details` e media (10.2). A recomendação de planeamento previa `sendRichMessage` como renderer principal com HTML como fallback; o smoke autorizado inverteu a decisão operacional:
 
 1. `sendMessage` com HTML é o renderer operacional e default (código e `.env.example`): `TELEGRAM_RENDERER=html`;
-2. `sendRichMessage` está implementado (`pipeline/notifications/render_rich.py`) mas desativado — a API aceitou as mensagens e o retry fez zero chamadas de rede; o diagnóstico concluiu que a duplicação visual é uma incompatibilidade de renderização específica do cliente, não um reenvio da aplicação (Rich mantém-se desativado para a coorte de clientes atual);
+2. `sendRichMessage` está implementado (`pipeline/notifications/render_rich.py`) com tabelas compactas e botões URL externos, mas desativado — a API aceitou as mensagens e o retry fez zero chamadas de rede; o diagnóstico concluiu que a duplicação visual é uma incompatibilidade de renderização específica do cliente, não um reenvio da aplicação (Rich mantém-se desativado para a coorte de clientes atual);
 3. resumo separado seguido de uma mensagem por produto nos modos agregados;
 4. `keyword` envia uma única mensagem de produto;
 5. long polling e decisões (callbacks) ficam fora do âmbito desta release;
@@ -141,3 +141,27 @@ git diff --check
 - `security-review` — antes de ativar callbacks, URL/media externos ou armazenamento de decisões.
 - `assess-impact` — antes de alterar `telegram.py`, `run_state.py` e o manifesto.
 - `request-review` — depois de cada release executável.
+
+## Offer + Creative Arbitrage — estado verificado em 2026-09-08
+
+Foi acrescentado um engine isolado em `pipeline/arbitrage/`, com configuração fail-closed em `config/offers.json`. O ficheiro está actualmente vazio (`"offers": []`): a fundação está pronta, mas ainda não existe uma oferta real operacional para testar.
+
+O fluxo local não usa rede: carrega as ofertas, resolve a evidência disponível, aplica os gates, calcula `Commercial Score` e `48H Score`, toma a decisão de readiness e constrói a shortlist. Os buckets são `TEST_NOW`, `RESEARCH_FURTHER`, `WATCHLIST` e `REJECT`; os estados de readiness são `REJECT`, `RESEARCH_ONLY`, `INSUFFICIENT_DATA`, `NEEDS_VERIFICATION`, `TESTABLE_48H` e `WATCHLIST`.
+
+O `budget_fit` usa compromisso absoluto em EUR: `<=€20 = 100`, `<=€50 = 75`, `<=€100 = 50`, `<=€250 = 25` e `>€250 = 0`. Como `TESTABLE_48H` exige pelo menos 75, qualquer compromisso acima de €50 não chega a `TESTABLE_48H`.
+
+O comando local é:
+
+```bash
+python run.py --offer-shortlist
+```
+
+Com a configuração actual, o resultado tem as quatro secções vazias. A integração OpenSEO/DataForSEO só pode ser accionada explicitamente com `python run.py --validate-offer <offer_id> --openseo-project-id <project_id>` e só passa depois de a decisão local ser `TESTABLE_48H / TEST_NOW`. A validação limita-se a `get_keyword_metrics` e `get_serp_results`, com uma keyword/query, clickstream desligado e sem backlinks, domain overview ou rank tracking.
+
+O ledger é idempotente em `data/offer-validations/YYYY-MM-DD/`: uma execução retomada não repete uma ferramenta já concluída e nenhuma credencial é persistida. `OPENSEO_PROJECT_ID` e `OPENSEO_MCP_URL` estão documentadas em `.env.example`; o endpoint local por omissão é `http://127.0.0.1:3001/mcp`. A validação pode gerar custo DataForSEO. Nenhuma chamada OpenSEO/DataForSEO live foi executada nesta implementação.
+
+### Próximos passos objectivos
+
+1. Preencher a primeira oferta em `config/offers.json` com evidência real e verificável.
+2. Correr `python run.py --offer-shortlist` e rever a decisão local.
+3. Só se a oferta chegar a `TESTABLE_48H / TEST_NOW`, correr a validação explícita via DataForSEO.

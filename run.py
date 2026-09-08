@@ -1560,6 +1560,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv", help="Caminho para CSV do Keyword Planner")
     parser.add_argument("--market", default="PT", help="Mercado explícito (default: PT)")
     parser.add_argument("--digest", action="store_true", help="Enviar digest para Telegram, com fallback stdout")
+    parser.add_argument(
+        "--offer-shortlist",
+        action="store_true",
+        help="Avaliar config/offers.json localmente e imprimir a shortlist JSON",
+    )
+    parser.add_argument(
+        "--validate-offer",
+        metavar="OFFER_ID",
+        help="Validar uma oferta TEST_NOW autorizada via OpenSEO MCP",
+    )
+    parser.add_argument("--openseo-project-id", help="Project ID do OpenSEO")
+    parser.add_argument("--openseo-mcp-url", help="Endpoint MCP do OpenSEO")
     return parser
 
 
@@ -1664,9 +1676,89 @@ def _run_keyword_action(product: Product | MarketTarget, csv_path: str | None = 
             raise
 
 
+def _run_offer_shortlist(parser: argparse.ArgumentParser) -> None:
+    from pipeline.arbitrage import (
+        ArbitrageConfigError,
+        load_offer_shortlist,
+        shortlist_to_json,
+    )
+
+    try:
+        shortlist = load_offer_shortlist(
+            os.path.join(REPO_ROOT, "config", "offers.json"),
+            _data_dir(),
+            as_of=date.today(),
+        )
+    except ArbitrageConfigError as exc:
+        parser.error(str(exc))
+    print(shortlist_to_json(shortlist))
+
+
+def _run_validate_offer(
+    parser: argparse.ArgumentParser,
+    offer_id: str,
+    *,
+    project_id: str | None,
+    endpoint: str | None,
+) -> None:
+    from pipeline.arbitrage import (
+        ArbitrageConfigError,
+        ValidationError,
+        validate_offer,
+        validation_to_json,
+    )
+
+    try:
+        artifact = validate_offer(
+            offer_id,
+            config_path=os.path.join(REPO_ROOT, "config", "offers.json"),
+            data_dir=_data_dir(),
+            artifact_dir=os.path.join(_data_dir(), "offer-validations"),
+            project_id=project_id,
+            endpoint=endpoint,
+            as_of=date.today(),
+        )
+    except (ArbitrageConfigError, ValidationError) as exc:
+        parser.error(str(exc))
+    print(validation_to_json(artifact))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.offer_shortlist and args.validate_offer:
+        parser.error("--offer-shortlist e --validate-offer são ações exclusivas")
+    if args.offer_shortlist:
+        conflicts = [
+            flag
+            for flag in ("auto", "sunday", "wednesday", "monthly", "all", "keyword", "csv", "digest")
+            if getattr(args, flag, None)
+        ]
+        if conflicts:
+            parser.error(
+                "--offer-shortlist não pode ser combinado com: "
+                + ", ".join(f"--{flag}" for flag in conflicts)
+            )
+        _run_offer_shortlist(parser)
+        return
+    if args.validate_offer:
+        conflicts = [
+            flag
+            for flag in ("auto", "sunday", "wednesday", "monthly", "all", "keyword", "csv", "digest")
+            if getattr(args, flag, None)
+        ]
+        if conflicts:
+            parser.error(
+                "--validate-offer não pode ser combinado com: "
+                + ", ".join(f"--{flag}" for flag in conflicts)
+            )
+        _run_validate_offer(
+            parser,
+            args.validate_offer,
+            project_id=args.openseo_project_id,
+            endpoint=args.openseo_mcp_url,
+        )
+        return
     resolved = resolve_mode(args)
     for warning in resolved["warnings"]:
         print(warning, file=sys.stderr)

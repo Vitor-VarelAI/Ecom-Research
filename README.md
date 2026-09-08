@@ -142,7 +142,9 @@ Ads, Trends, SERP, caches e Keyword Planner são scoped ao mesmo `market_id`. Tr
 
 Preços usam exclusivamente `top_ads[].landing_url`; links da Ad Library são rejeitados. A moeda é sempre derivada da fonte (`priceCurrency` ou símbolo/código explícito), nunca é assumida sem evidência, e preços de moedas diferentes nunca são combinados num range. São tentadas no máximo três landings, primeiro por HTTP e depois por Firecrawl, com falhas isoladas e sem retries. Quarta e mensal reutilizam o resultado anterior.
 
-Telegram é send-only e determinístico: o outbound é HTML multi-mensagem por omissão (`TELEGRAM_RENDERER=html`, default de código e documentado em `.env.example`). `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos; `monthly` envia resumo seguido dos produtos afetados. Rich está implementado mas desativado. O fallback Rich→HTML é baseado em evidência: um classificador estreito (4xx definitivo consistente + token simbólico exato da allowlist ou descrição completa normalizada exata) tenta no máximo uma vez, e um item que caiba nos 32768 caracteres Rich mas não nos 4096 do HTML falha fechado (`render_failed`) sem truncar. O diagnóstico da duplicação visual do smoke concluiu que não há double-send: o estado retido (`/tmp/ecom-telegram-smoke-state`) prova dois itens Rich enviados uma única vez (`message_id` 17/18 consecutivos), o retry fez zero chamadas de rede, a inspeção offline encontrou um `sendRichMessage` por item, sem campo de texto irmão nem conteúdo duplicado, e as mesmas mensagens 17/18 aparecem uma única vez num segundo cliente Telegram — a duplicação é específica do cliente que a exibiu, não da aplicação. Sem correção de produção justificada, `TELEGRAM_RENDERER=html` mantém-se e Rich fica desativado para a coorte de clientes atual. Não existem callbacks, botões, media nem long polling. O digest plain text integral é impresso no stdout e guardado como audit text no estado de entrega. Falta de credenciais ou qualquer erro não interrompe o pipeline; o token nunca é escrito em logs; o token Telegram exposto deve ainda ser rotacionado pelo utilizador.
+Telegram é send-only e determinístico: o outbound é HTML multi-mensagem por omissão (`TELEGRAM_RENDERER=html`, default de código e documentado em `.env.example`). `keyword` envia uma mensagem de produto; `sunday`/`all` enviam resumo seguido de uma mensagem por produto; `wednesday` envia resumo pulse seguido de itens compactos; `monthly` envia resumo seguido dos produtos afetados. Rich está implementado, mas desativado para a coorte de clientes atual. Quando selecionado explicitamente, usa tabelas `bordered striped compact` no resumo e nas métricas e botões URL externos para abrir o anúncio, a landing e pesquisas determinísticas em Google Trends, Google Shopping, Meta Ads Library e fornecedores. O fallback HTML preserva os mesmos destinos como links normais. As ações não usam callbacks, `reply_markup`, media, long polling nem novas chamadas a providers; links de evidência são sanitizados e o snapshot do resultado permite reconstruir o mesmo batch num retry.
+
+O fallback Rich→HTML é baseado em evidência: um classificador estreito (4xx definitivo consistente + token simbólico exato da allowlist ou descrição completa normalizada exata) tenta no máximo uma vez, e um item que caiba nos 32768 caracteres Rich mas não nos 4096 do HTML falha fechado (`render_failed`) sem truncar. O diagnóstico da duplicação visual do smoke concluiu que não há double-send: o estado retido (`/tmp/ecom-telegram-smoke-state`) prova dois itens Rich enviados uma única vez (`message_id` 17/18 consecutivos), o retry fez zero chamadas de rede, a inspeção offline encontrou um `sendRichMessage` por item, sem campo de texto irmão nem conteúdo duplicado, e as mesmas mensagens 17/18 aparecem uma única vez num segundo cliente Telegram — a duplicação é específica do cliente que a exibiu, não da aplicação. Sem correção de produção justificada, `TELEGRAM_RENDERER=html` mantém-se. O digest plain text integral é impresso no stdout e guardado como audit text no estado de entrega. Falta de credenciais ou qualquer erro não interrompe o pipeline; o token nunca é escrito em logs; o token Telegram exposto deve ainda ser rotacionado pelo utilizador.
 
 O progresso de entrega é persistido em `data/digests/<state_id>.json` com `schema_version=2` e estado por item: `item_id`, ordem, renderer durável, hash do payload, `in_flight`, `sent_at`, `message_id`, fallback e erro sanitizado, mais o audit text do digest. Antes de cada envio, o marcador `in_flight` é escrito atomicamente; se a persistência falhar, nada é enviado. Um item só fica `sent` depois de `ok=true` com resposta válida e `message_id` guardado; timeout, transporte, 5xx, JSON ilegível ou resposta malformada deixam o item ambíguo e qualquer rerun recusa reenviar até resolução manual, evitando duplicações automáticas. Itens confirmados nunca são reenviados; estados ilegíveis ou inconsistentes falham fechado (`state_corrupt`). O renderer de um batch já persistido é deliberadamente durável e não muda com a variável de ambiente. O token e o chat ID nunca são persistidos.
 
@@ -191,3 +193,34 @@ TZ=Europe/Lisbon
 ```
 
 O cron verifica a data diariamente, mas só atua ao domingo, à quarta-feira e no dia 1 do mês. O token Telegram exposto deve ainda ser rotacionado pelo utilizador.
+
+## Offer + Creative Arbitrage
+
+O engine isolado em `pipeline/arbitrage/` avalia ofertas a partir de evidência local e configuração fail-closed em `config/offers.json`. O fluxo não usa rede: `load offers → resolve evidence → gates → Commercial Score + 48H Score → readiness decision → shortlist`. Os buckets são `TEST_NOW`, `RESEARCH_FURTHER`, `WATCHLIST` e `REJECT`; os estados de readiness são `REJECT`, `RESEARCH_ONLY`, `INSUFFICIENT_DATA`, `NEEDS_VERIFICATION`, `TESTABLE_48H` e `WATCHLIST`.
+
+Neste estado verificado em 2026-09-08, `config/offers.json` está vazio. A fundação está pronta, mas ainda não existe uma oferta real operacional. A shortlist local:
+
+```bash
+python run.py --offer-shortlist
+```
+
+produz actualmente:
+
+```json
+{
+  "TEST_NOW": [],
+  "RESEARCH_FURTHER": [],
+  "WATCHLIST": [],
+  "REJECT": []
+}
+```
+
+O `budget_fit` é absoluto em EUR: `<=€20 = 100`, `<=€50 = 75`, `<=€100 = 50`, `<=€250 = 25` e `>€250 = 0`; acima de €50 não é possível chegar a `TESTABLE_48H`. OpenSEO/DataForSEO só é usado por acção explícita:
+
+```bash
+python run.py --validate-offer <offer_id> --openseo-project-id <project_id>
+```
+
+Esse comando só autoriza a chamada se a decisão local for `TESTABLE_48H / TEST_NOW`. A validação fica limitada a `get_keyword_metrics` e `get_serp_results`, uma keyword/query, clickstream desligado e sem backlinks, domain overview ou rank tracking. O ledger idempotente fica em `data/offer-validations/YYYY-MM-DD/`, retoma sem repetir uma ferramenta concluída e não persiste credenciais. `OPENSEO_MCP_URL` usa `http://127.0.0.1:3001/mcp` por omissão; a validação pode gerar custo DataForSEO. Nenhuma chamada OpenSEO/DataForSEO live foi executada nesta implementação.
+
+O estado detalhado, os ficheiros principais e os guardrails estão em [`docs/offer-arbitrage/IMPLEMENTATION_STATUS.md`](docs/offer-arbitrage/IMPLEMENTATION_STATUS.md). A verificação final fica adiada por pedido do utilizador e nenhum teste adicional será executado neste fecho.

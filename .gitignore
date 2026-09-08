@@ -42,6 +42,7 @@ data/cron.log
 data/*.csv
 data/runs/
 data/digests/
+data/offer-validations/
 
 # SQLite projection (disposable, rebuilt from packs via explore.py import)
 data/*.db

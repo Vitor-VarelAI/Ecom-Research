@@ -289,3 +289,25 @@ Sem chamadas live Telegram/providers. Token posicional desconhecido confirmado c
 - Resolvido: a identidade de produto deixou de depender do hash da keyword — o item "A identidade de produto continua baseada no hash da keyword e não sobrevive a renomeações" do registo histórico está fechado por esta release.
 - Próxima prioridade: long polling e decisões (callbacks), num spike entre `python-telegram-bot` e uma implementação mínima; depois fornecedores/margens e Legal Gate executável em releases separados.
 - Mantidos: token Telegram exposto a rotacionar pelo operador; Rich desativado para a coorte de clientes atual; limitação 4096 do HTML no fallback; itens com entrega ambígua exigem reconciliação manual.
+
+## Follow-up — tabelas Rich e ações externas de investigação
+
+Data: 2026-08-31. Implementação publicada em `main` no commit `6544d7c` (`feat(telegram): add rich research tables and links`). Sem ativação do renderer Rich e sem chamada Telegram live neste slice.
+
+### Resultado funcional
+
+- O resumo e as métricas de produto/pulse usam tabelas Rich `bordered striped compact`; o fallback HTML mantém a mesma informação em linhas legíveis.
+- `NotificationAction` representa apenas uma ação externa `label + URL`. Aceita HTTP(S) com hostname, rejeita credenciais embutidas e endpoints privados `api.telegram.org/bot…`.
+- Resultados frescos podem incluir `Ver anúncio` e `Abrir landing` a partir dos links sanitizados existentes, mais pesquisas determinísticas em Google Trends, Google Shopping, Meta Ads Library e fornecedores. Não há nova chamada a provider para construir estas ações.
+- Rich renderiza as ações como `tg-button` URL-only. HTML renderiza os mesmos destinos como `<a href>` e mantém previews desativados. Não existem callbacks, `callback_data`, `reply_markup`, media ou inbound.
+- O snapshot compacto persiste apenas labels e URLs seguras necessárias para reconstruir o mesmo batch num retry. Manifestos históricos sem snapshot de ações continuam sem ações; não são reescritos.
+- A paridade semântica passou a verificar também label e URL de cada ação entre o modelo, Rich e HTML.
+
+### Verificação deste slice
+
+```text
+207 passed (testes de notifications, delivery e Telegram relacionados)
+git diff --check: exit 0
+```
+
+Sem alterações a `schema_version=2`, protocolo de entrega, idempotência, defaults ou `.env`. `TELEGRAM_RENDERER=html` continua a ser o default operacional; Rich só deve ser reativado depois de validação numa coorte de clientes compatível.
