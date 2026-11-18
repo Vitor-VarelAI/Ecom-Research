@@ -14,6 +14,7 @@ from typing import Any
 from pipeline.arbitrage.config import ArbitrageConfigError, load_config
 from pipeline.arbitrage.decision import TESTABLE_48H, decide_offer
 from pipeline.arbitrage.evidence import build_offer_evidence
+from pipeline.arbitrage.goto_urls import resolve_goto_links
 from pipeline.arbitrage.models import Offer
 from pipeline.arbitrage.openseo import (
     DATAFORSEO_MARKETS,
@@ -375,6 +376,12 @@ def validate_offer(
                 raise
             raise ValidationError(f"OpenSEO tool failed for {tool}") from None
 
+        goto_links = None
+        if tool == SERP_TOOL:
+            # Live SERP reads can carry google.com/goto links instead of page
+            # URLs. Best effort: a failure keeps the raw content.
+            structured_content, goto_links = resolve_goto_links(structured_content)
+
         completed_at = _timestamp(now)
         tool_state.clear()
         tool_state.update(
@@ -385,6 +392,8 @@ def validate_offer(
                 "structured_content": _json_safe(structured_content),
             }
         )
+        if goto_links is not None:
+            tool_state["goto_links"] = goto_links
         _append_ledger(artifact, tool, "completed", now)
         artifact["updated_at"] = completed_at
         _write_artifact(path, artifact)
